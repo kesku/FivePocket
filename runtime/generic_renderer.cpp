@@ -7316,6 +7316,8 @@ public:
     };
     PipelineState pipelineState;
     VkPipeline pipeline(const PipelineState& s,const PackEntry& vs,const PackEntry& ps,const Bound& b) {
+        // Stencil reference is dynamic; only compare/write masks belong to the pipeline.
+        const std::uint32_t stencilMasks=s.stencilMasks&0x00FFFF00u,stencilMasksBack=s.stencilMasksBack&0x00FFFF00u;
         std::uint64_t key;
         if(wordKeys) { // v78: the same fields as v71's key, as 64-bit words (with the two list lengths)
             auto& w=pipelineWords;w.clear();
@@ -7326,7 +7328,7 @@ public:
             for(const auto& x:s.bindings)w.push_back(std::uint64_t(x.first)|(std::uint64_t(x.second)<<32));
             w.push_back(std::uint64_t(s.depthControl)|(std::uint64_t(s.colorMask)<<32));
             w.push_back(std::uint64_t(s.blend[0])|(std::uint64_t(s.blend[1])<<32));w.push_back(std::uint64_t(s.blend[2])|(std::uint64_t(s.blend[3])<<32));
-            w.push_back(std::uint64_t(s.spec)|(std::uint64_t(s.stencilMasks)<<32));w.push_back(std::uint64_t(s.stencilMasksBack)|(std::uint64_t(s.raster)<<32));
+            w.push_back(std::uint64_t(s.spec)|(std::uint64_t(stencilMasks)<<32));w.push_back(std::uint64_t(stencilMasksBack)|(std::uint64_t(s.raster)<<32));
             w.push_back(passKeyOf(b));
             // v102: v100's key parts: v77's vertex variant, v76's pixel entry, v85's pixel variant and blend guard.
             w.push_back(s.variant);w.push_back(std::uint64_t(reinterpret_cast<std::uintptr_t>(&ps)));
@@ -7338,7 +7340,7 @@ public:
             for(const auto& a:s.attributes){key=fnvOf(a.location,key);key=fnvOf(a.binding,key);key=fnvOf(a.offset,key);key=fnvOf(a.format,key);}
             for(const auto& x:s.bindings){key=fnvOf(x,key);}
             key=fnvOf(s.depthControl,key);key=fnvOf(s.colorMask,key);key=fnvOf(s.blend,key);key=fnvOf(s.spec,key);
-            key=fnvOf(s.stencilMasks,key);key=fnvOf(s.stencilMasksBack,key);key=fnvOf(passKeyOf(b),key);key=fnvOf(s.raster,key);
+            key=fnvOf(stencilMasks,key);key=fnvOf(stencilMasksBack,key);key=fnvOf(passKeyOf(b),key);key=fnvOf(s.raster,key);
             key=fnvOf(reinterpret_cast<std::uintptr_t>(&ps),key); // v76: which entry of a hash (gradient override or the pack's)
             if(s.psVariant)key=fnvOf(s.psVariant,key); // v85 (v71 keys unchanged without a variant)
             if(!blendGuard)key=fnvOf(0xB1E9Du,key);

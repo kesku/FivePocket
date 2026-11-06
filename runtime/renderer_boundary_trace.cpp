@@ -3021,8 +3021,12 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             nativeDrawCompleted=completed;
             if(completed){live->valid=true;++liveDraws;++live->contentSerial;latestLiveDevice=device;recordCompletedTextures(*live,*captured);nativeUiDevice.store(device);
                 ++completedTranslatedTextures.at(captured->textures.size());}
-            rendererLog("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
-                pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
+            if(completed)
+                rendererLogQuiet("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
+                    pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
+            else
+                rendererLog("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
+                    pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
             if(!completed) {
                 if(textured) {
                 const auto fetch=submittedFetch(additional->textureSlot);
