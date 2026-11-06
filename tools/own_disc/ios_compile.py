@@ -30,6 +30,8 @@ def main(argv=None) -> int:
     ap.add_argument('--work', type=Path, required=True)
     ap.add_argument('--xcode', type=Path)
     ap.add_argument('--jobs', type=int, default=8)
+    ap.add_argument('--development-toolchain', action='store_true')
+    ap.add_argument('--emit-dependencies', action='store_true')
     a = ap.parse_args(argv)
     if a.work.exists():
         print(f'refused: {a.work} exists', file=sys.stderr)
@@ -39,6 +41,10 @@ def main(argv=None) -> int:
     args = ['--manifest', str(tree / 'frozen.json'), '--out', str(a.work / 'replay'), '--from-snapshot', '--jobs', str(a.jobs)]
     if a.xcode:
         args += ['--xcode', str(a.xcode)]
+    if a.development_toolchain:
+        args += ['--development-toolchain']
+    if a.emit_dependencies:
+        args += ['--emit-dependencies']
     for item in a.library:
         args += ['--link-library', item]
     for item in a.define_from:

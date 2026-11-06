@@ -80,6 +80,9 @@ def main(argv=None) -> int:
     ap.add_argument('--xcode', type=Path)
     ap.add_argument('--jobs', type=int, default=8)
     ap.add_argument('--from-snapshot', action='store_true')
+    ap.add_argument('--development-toolchain', action='store_true',
+                    help='compile with the selected Xcode and report identity differences; never certify a release replay')
+    ap.add_argument('--emit-dependencies', action='store_true', help='record the headers actually read for each compiled unit')
     ap.add_argument('--define', action='append', default=[], metavar='OBJECT:NAME=VALUE',
                     help='in the unit whose object has this file name, the existing -DNAME=... becomes -DNAME=VALUE')
     ap.add_argument('--link-library', action='append', default=[], metavar='NAME=PATH',
@@ -120,10 +123,14 @@ def main(argv=None) -> int:
                 problems.append(f'input missing or changed: {p}')
         elif not p.is_file() or p.stat().st_size != rec['size'] or sha256(p) != rec['sha256']:
             problems.append(f'input missing or changed: {p}')
+    toolchain_differences = []
     for name, rec in m['toolchain_inputs'].items():
         p = Path(xcode) / name
-        if not p.is_file() or sha256(p) != rec['sha256']:
-            problems.append(f'toolchain file missing or changed (another Xcode?): {name}')
+        actual = sha256(p) if p.is_file() else None
+        if actual != rec['sha256']:
+            toolchain_differences.append({'path': name, 'expected': rec['sha256'], 'actual': actual})
+            if not a.development_toolchain:
+                problems.append(f'toolchain file missing or changed (another Xcode?): {name}')
     for u in m['units']:
         for i, w in enumerate(u['command']):
             for flag in ('-I', '-iquote', '-isystem', '-F'):
@@ -144,7 +151,11 @@ def main(argv=None) -> int:
         i, u = item
         obj = objects / object_name(i, u['object'])
         t = time.time()
-        r = subprocess.run(compile_argv(u['command'], obj, remap), capture_output=True, text=True, env=env)
+        command = compile_argv(u['command'], obj, remap)
+        dependency = obj.with_suffix('.d') if a.emit_dependencies else None
+        if dependency:
+            command += ['-MD', '-MF', str(dependency)]
+        r = subprocess.run(command, capture_output=True, text=True, env=env)
         got = sha256(obj) if r.returncode == 0 and obj.is_file() else None
         equal = got == u['object_sha256']
         # the same code and data, other debug information (another working directory, other include spellings); a kit
@@ -157,6 +168,7 @@ def main(argv=None) -> int:
             code = equal or (Path(u['object']).is_file()
                              and macho_sections.code_identity(obj) == macho_sections.code_identity(Path(u['object'])))
         return {'object': u['object'], 'replayed': str(obj), 'origin': u['origin'], 'seconds': round(time.time() - t, 1),
+                **({'dependency_file': str(dependency)} if dependency else {}),
                 'equal': equal, 'code_equal': code, 'sha256': got, 'error': r.stderr[-800:] if r.returncode else ''}
 
     started = time.time()
@@ -165,6 +177,8 @@ def main(argv=None) -> int:
     for u in units:
         by_object[os.path.realpath(u['object'])] = u['replayed']
     report = {'manifest': str(a.manifest), 'manifest_sha256': sha256(a.manifest), 'xcode': xcode, 'map': pairs,
+              'verification': 'development' if a.development_toolchain else 'release',
+              'toolchain_differences': toolchain_differences,
               'units': units, 'compile_seconds': round(time.time() - started, 1)}
     link_ok = False
     if all(u['sha256'] for u in units):
@@ -215,16 +229,21 @@ def main(argv=None) -> int:
             code = link_ok or (got is not None and wanted is not None and macho_sections.executable_identity(exe) == wanted)
         report['link'] = {'argv': new, 'seconds': round(time.time() - t, 1), 'sha256': got, 'equal': link_ok,
                           'code_equal': code, 'error': r.stderr[-1500:] if r.returncode else ''}
-    (a.out / 'report.json').write_text(json.dumps(report, indent=1) + '\n', encoding='utf-8', newline='\n')
     differ = [u for u in units if not u['code_equal']]
     same = sum(u['equal'] for u in units)
     link = report.get('link')
+    report['release_equivalent'] = not toolchain_differences and not differ and bool(link and link['code_equal'])
+    (a.out / 'report.json').write_text(json.dumps(report, indent=1) + '\n', encoding='utf-8', newline='\n')
+    if a.development_toolchain:
+        print('DEVELOPMENT BUILD: source inputs verified; release code identity is not certified.', flush=True)
     print(f'REPLAY {same}/{len(units)} objects byte-equal, {len(units) - len(differ)}/{len(units)} code-equal '
           f'({report["compile_seconds"]} s); link '
           + ('not run' if not link else 'byte-equal' if link['equal'] else 'code-equal' if link['code_equal'] else 'differs')
           + (f' ({link["seconds"]} s)' if link else ''), flush=True)
     for u in differ[:10]:
         print('  differs:', u['object'], (u['error'] or '')[-300:], file=sys.stderr)
+    if a.development_toolchain:
+        return 0 if all(u['sha256'] for u in units) and link and link['sha256'] else 1
     return 0 if not differ and link and link['code_equal'] else 1
 
 
