@@ -15,7 +15,7 @@ must be clean
 - application and bundle ids (applicationId, the manifest package, CFBundleIdentifier, PRODUCT_BUNDLE_IDENTIFIER);
 - folder names the app shows the player, written as text in any file ("Pictures/..." and the like);
 allowed
-- internal source file and folder names deeper inside (android/app/src/main/cpp/gta5_*.h, runtime headers);
+- internal source file and folder names deeper inside (runtime/host/gta5_*.h, runtime headers);
 - descriptive text such as "an Xbox 360 disc of the game" inside docs and messages: it is not a name.
 Also fails on an unfilled release placeholder (a word ending in -TO-BE-SET).
 Exit 0: PASS. 1: FAIL (each failing name is printed). 2: ROOT missing.

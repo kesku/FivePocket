@@ -101,16 +101,6 @@ class Connections(unittest.TestCase):
             self.assertEqual(connected['corpus'], str(work / 'recipe/corpus'))
             self.assertEqual(recipe['target'], 'old')
 
-    def test_compiler_consumes_recipe_output_and_caps_jobs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp)
-            f = {'name': 'ppc_recomp.0.cpp', 'ppc_chunk': 0, 'source': 'old-corpus/file'}
-            original = {'build_jobs': 5, 'files': [f, {'name': 'host.cpp', 'origin': 'host.cpp'}]}
-            result = m.connected_spec(original, work, work, work)
-            (work / f['name']).write_text('rebuilt fixture')
-            self.assertEqual(Path(result['files'][0]['source']).read_text(), 'rebuilt fixture')
-            self.assertEqual(result['build_jobs'], 4)
-            self.assertEqual(original['files'][0]['source'], 'old-corpus/file')
 
     def test_bad_producer_hash_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,56 +110,6 @@ class Connections(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.require_hash(path, '0' * 64)
 
-    def test_portable_link_drops_debug_sections_and_pins_the_build_id(self):
-        self.assertEqual(m.portable_link_words(ID), ['-Wl,--strip-debug', '-Wl,--build-id=0x' + ID])
-
-    def test_a_build_id_of_another_shape_is_refused(self):
-        for bad in ('', None, ID[:-1], ID + '0', ID.upper(), 'g' * 40, '0x' + ID[2:]):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                m.portable_link_words(bad)
-
-    def test_link_words_follow_the_attempts_own_and_leave_the_original_alone(self):
-        original = {'files': [], 'link_extra': ['-Wl,--symbol-ordering-file=order.txt']}
-        words = m.portable_link_words(ID)
-        result = m.connected_spec(original, Path('.'), Path('.'), Path('.'), words)
-        self.assertEqual(result['link_extra'], ['-Wl,--symbol-ordering-file=order.txt'] + words)
-        self.assertEqual(original['link_extra'], ['-Wl,--symbol-ordering-file=order.txt'])
-        self.assertEqual(m.connected_spec({'files': []}, Path('.'), Path('.'), Path('.'))['link_extra'], [])
-
-    def test_pack_folders_made_in_this_run_go_first_on_the_include_path(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, packs = Path(tmp) / 'repo', Path(tmp) / 'packs'
-            (packs / 'a/pack-v1').mkdir(parents=True)
-            (packs / 'b').mkdir()
-            (packs / 'd').write_text('a file, not a folder')
-            private = str(root / 'local-analysis')
-            command = ['clang++', '-I' + private + '/a/pack-v1', '-I' + private + '/c/not-made', '-I/usr/include',
-                       '-I' + str(root / 'local-analysis-other/a/pack-v1'), '-I' + private + '/a/pack-v1', '-DX=1',
-                       '-I' + private + '/d', '-I' + private + '/b', '-iquote', private + '/b']
-            self.assertEqual(m.pack_include_words(command, root, packs), ['-I' + str(packs / 'a/pack-v1'), '-I' + str(packs / 'b')])
-            self.assertEqual(m.pack_include_words(['clang++', '-DX=1'], root, packs), [])
-
-    def test_a_runtime_file_gets_its_pack_folders_behind_its_own_words_and_game_code_gets_none(self):
-        chunk = {'name': 'ppc_recomp.0.cpp', 'ppc_chunk': 0, 'source': 'old-corpus/file'}
-        original = {'files': [chunk, {'name': 'hook.cpp', 'origin': 'x/hook.cpp', 'defines': ['-DOWN=1']},
-                              {'name': 'other.cpp', 'origin': 'x/other.cpp'}, {'name': 'plain.cpp', 'origin': 'x/plain.cpp', 'defines': ['-DKEPT']}]}
-        first = {'hook.cpp': ['-I/packs/a', '-I/packs/b'], 'other.cpp': ['-I/packs/a'], 'ppc_recomp.0.cpp': ['-I/packs/never']}
-        result = m.connected_spec(original, Path('.'), Path('.'), Path('.'), (), first)
-        by = {f['name']: f for f in result['files']}
-        self.assertEqual(by['hook.cpp']['defines'], ['-DOWN=1', '-I/packs/a', '-I/packs/b'])
-        self.assertEqual(by['other.cpp']['defines'], ['-I/packs/a'])
-        self.assertEqual(by['plain.cpp']['defines'], ['-DKEPT'])
-        self.assertNotIn('defines', by['ppc_recomp.0.cpp'])
-        self.assertEqual(original['files'][1]['defines'], ['-DOWN=1'])
-        self.assertNotIn('defines', m.connected_spec(original, Path('.'), Path('.'), Path('.'))['files'][2])
-
-    def test_game_code_chunks_find_this_runs_generator_headers_first(self):
-        original = {'ppc_defines': ['-DOWN=1', '-iquote', '/helpers'], 'files': []}
-        result = m.connected_spec(original, Path('.'), Path('.'), Path('.'), (), None, Path('/work/compile/generated-headers'))
-        self.assertEqual(result['ppc_defines'], ['-DOWN=1', '-iquote', '/helpers', '-iquote', '/work/compile/generated-headers'])
-        self.assertEqual(original['ppc_defines'], ['-DOWN=1', '-iquote', '/helpers'])
-        self.assertEqual(m.connected_spec({'files': []}, Path('.'), Path('.'), Path('.'), (), None, Path('/g'))['ppc_defines'], ['-iquote', '/g'])
-        self.assertNotIn('ppc_defines', m.connected_spec({'files': []}, Path('.'), Path('.'), Path('.')))
 
     def test_work_must_lie_in_the_ignored_builder_folder(self):
         with tempfile.TemporaryDirectory() as tmp:

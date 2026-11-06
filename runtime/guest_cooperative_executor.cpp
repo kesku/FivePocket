@@ -37,7 +37,6 @@ extern "C" const void* recomp_v362_guard_active_slot() noexcept; // v362 (guest_
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include "diag_timeline.inc" // v159: the timeline probe (defined here, used by other TUs through diag_timeline.h)
-#include "diag_native_stacks.h" // v199: native stacks at a stall (stallWatchdogMain)
 #include <unistd.h>
 #endif
 
@@ -2318,51 +2317,7 @@ void dumpTasksForFreeze(ParallelState& S) {
     executorLog("RENDER_DIAG_FREEZE_DUMP tasks=%zu", rows.size());
 }
 
-// v199: native stacks at a stall, independent of the supervisor (which needs the scheduler lock to run at all).
-// Every 5 s it samples the live tasks' guest entry counts, taking S.sched only by try_lock (up to 1 s). Three samples
-// (10 s) without any task making an entry, or two samples in a row without the scheduler lock, dump every thread's
-// native stack (diag_native_stacks.h) once per stall; progress re-arms it. files/private-trace/diag-native-stacks-now
-// forces one dump per appearance (the file is left in place; remove it to re-arm). No effect while tasks progress.
-void stallWatchdogMain(ParallelState& S, const std::atomic<bool>& stop) {
-#if defined(__aarch64__) && defined(__linux__)
-    std::uint64_t lastEntries = ~std::uint64_t{0};
-    unsigned sameSamples = 0, lockMisses = 0;
-    bool dumped = false, forcedSeen = false;
-    const auto dump = [](const char* why, unsigned long long entries) {
-        executorLog("RENDER_DIAG_NATIVE_STACKS_BEGIN reason=%s entries=%llu", why, entries);
-        const int captured = recomp::diag::nativestacks::dumpAll([](const char* line) { executorLog("%s", line); });
-        executorLog("RENDER_DIAG_NATIVE_STACKS_END captured=%d", captured);
-    };
-    while (!stop.load(std::memory_order_acquire)) {
-        for (int i = 0; i < 50 && !stop.load(std::memory_order_acquire); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (stop.load(std::memory_order_acquire)) return;
-        const bool forced = diagSwitchPresent(RECOMP_DIAG_SWITCH("diag-native-stacks-now"));
-        if (forced && !forcedSeen) dump("forced", 0);
-        forcedSeen = forced;
-        bool locked = false;
-        for (int i = 0; i < 100 && !(locked = S.sched.try_lock()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (!locked) {
-            sameSamples = 0;
-            if (++lockMisses >= 2 && !dumped) { dumped = true; dump("sched-lock", 0); }
-            continue;
-        }
-        std::uint64_t entries = 0;
-        for (const auto& task : S.tasks) if (task && !task->finished) entries += task->entries;
-        S.sched.unlock();
-        lockMisses = 0;
-        if (entries != lastEntries) { lastEntries = entries; sameSamples = 0; dumped = false; continue; }
-        if (++sameSamples >= 2 && !dumped) { dumped = true; dump("no-entries", static_cast<unsigned long long>(entries)); }
-    }
-#else
-    (void)S; (void)stop;
-#endif
-}
-
 void supervisorMain(ParallelState& S) {
-    std::atomic<bool> watchdogStop{false};
-    std::thread watchdog([&S, &watchdogStop] { stallWatchdogMain(S, watchdogStop); });
-    struct JoinWatchdog { std::atomic<bool>& stop; std::thread& thread;
-        ~JoinWatchdog() { stop.store(true, std::memory_order_release); if (thread.joinable()) thread.join(); } } joinWatchdog{watchdogStop, watchdog};
     RECOMP_SCHED_LOCK(lock);
     Clock::time_point lastFreezeDump{};
     for (;;) {

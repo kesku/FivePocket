@@ -93,7 +93,6 @@
 #include <sched.h> // latency-path (lat2): the watcher's little-core mask
 #include <unistd.h>
 #include <dlfcn.h> // display-rate vote (v522): ANativeWindow_setFrameRate is looked up at run time (API 30)
-#include "fr_vote.h"
 #include <vulkan/vulkan_android.h>
 #include "direct_present_spirv.h"
 #include "fg_gen_spirv.h" // framegen-1b: the generator's five passes
@@ -316,8 +315,6 @@ private:
     // run); the first entry into each filtered mode audits the next GPU frame. Pass timestamps (when the queue family has them)
     // give the presenter's GPU time per mode, reported per 256 presents.
     Filter filter=Filter::Nearest,auditFilter=Filter::Nearest;bool filterFailed=false,auditCompute=false;unsigned filterPolls=0,filterAudited=0;
-    // display-rate vote (v522, see pollFrameRate): the vote in force (0 none, 120, 60), the window generation it was given to
-    recomp::frv::Vote frVote;
     std::uint64_t filterChanges=0;
     static constexpr unsigned MaxTimed=32;
     VkQueryPool timePool=VK_NULL_HANDLE;double tsNs=0;std::uint64_t tsMask=0;std::array<std::uint8_t,MaxTimed> slotTimed{};
@@ -2015,32 +2012,8 @@ private:
     }
     double passMean(unsigned m) const noexcept {return passN[m]?passNs[m]/1e3/double(passN[m]):0.0;} // v411 (us)
     double mapMean(unsigned m) const noexcept {return mapN[m]?mapNs[m]/1e3/double(mapN[m]):0.0;} // v42x (us)
-    // display-rate vote (v522). Found on the Fold (runs 21 and 22): when the game's frame rate falls, Android lowers the rate at
-    // which this window's pictures are shown (the display's render rate: 60 or 24 a second), while the pacer and the pair planner
-    // go on planning on the 120 Hz grid the swapchain reported when it was made. With files/private-trace/diag-fr-120 the window
-    // tells Android that its content wants 120 pictures a second (ANativeWindow_setFrameRate, compatibility "default": a
-    // preference, the system decides); diag-fr-60 asks for 60 (v515's measuring aid; 120 wins when both are present); without
-    // either the vote is withdrawn (0 = no preference, the state of every build before). Asked with the presenter's other
-    // switches (every 120 presents) and again when the app's window was replaced. The refresh length the swapchain reports now
-    // goes into the log line only (refreshNow). Changes no picture. Out of line and noexcept: pollFilter keeps its control flow.
-    [[gnu::noinline]] void pollFrameRate() noexcept {
-        using SetFrameRate=std::int32_t(*)(ANativeWindow*,float,std::int8_t);
-        static const SetFrameRate set=[]()->SetFrameRate {
-            void* lib=dlopen("libnativewindow.so",RTLD_NOW);
-            return lib?reinterpret_cast<SetFrameRate>(dlsym(lib,"ANativeWindow_setFrameRate")):nullptr;
-        }();
-        const unsigned want=recomp::frv::want(access(RECOMP_APP_PATH("/private-trace/diag-fr-120"),F_OK)==0,access(RECOMP_APP_PATH("/private-trace/diag-fr-60"),F_OK)==0);
-        int result=-1;
-        if(set && nw && frVote.due(want,gen)) {
-            result=set(nw,float(want),0);
-            frVote.told(want,gen,result);
-        }
-        const std::uint64_t refresh=dev && swapchain?refreshNow(dev->device,swapchain):0;
-        RECOMP_DIRECT_LOG("RENDER_GENERIC_V210Z fr_120=%u fr_60=%u fr_api=%u fr_result=%d refresh_now_us=%.2f",frVote.rate==120u?1u:0u,frVote.rate==60u?1u:0u,set?1u:0u,result,double(refresh)/1e3);
-    }
     void pollFilter() { // v409
         if(filterPolls++%120)return;
-        pollFrameRate(); // display-rate vote (v522)
         const std::string sw(Switches);
         // lane fsr-sharpness: the decision is settings::poll (scaler_settings.h, host-tested). With no files/settings/scaler.txt and
         // no files/settings/fsr-sharpness.txt it asks the same switch files in the same order as v458 did here and returns v458's

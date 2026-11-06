@@ -32,12 +32,16 @@ def main(argv=None) -> int:
     ap.add_argument('--jobs', type=int, default=8)
     ap.add_argument('--development-toolchain', action='store_true')
     ap.add_argument('--emit-dependencies', action='store_true')
+    ap.add_argument('--source-root', type=Path,
+                    help='use relocated runtime dependencies from this source checkout')
     a = ap.parse_args(argv)
+    if a.source_root and not a.development_toolchain:
+        ap.error('--source-root requires --development-toolchain')
     if a.work.exists():
         print(f'refused: {a.work} exists', file=sys.stderr)
         return 2
     a.work.mkdir(parents=True)
-    tree = ios_kit.assemble(a.kit, dict(ios_kit.pairs(a.stage)), a.work / 'tree')
+    tree = ios_kit.assemble(a.kit, dict(ios_kit.pairs(a.stage)), a.work / 'tree', a.source_root)
     args = ['--manifest', str(tree / 'frozen.json'), '--out', str(a.work / 'replay'), '--from-snapshot', '--jobs', str(a.jobs)]
     if a.xcode:
         args += ['--xcode', str(a.xcode)]

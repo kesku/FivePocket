@@ -1,67 +1,25 @@
-# Building FivePocket from source
+# Building for iPhone Duo
 
-Nothing here needs the game. You need your own discs only to *run* the builder.
+The only application target in this fork is `duo`. The host is an Apple-silicon Mac with Xcode and Python 3.12 or later. A complete build also needs the matching Duo source kit from the upstream Mac builder release and your own Install and Play disc images.
 
-## Layout
+The repository contains source and build tooling, not a ready-to-run frozen kit. Keep the kit, generated code, shader packs, signing material and disc images outside Git.
 
-| Folder | What |
-|---|---|
-| `android/` | the Android app (Java + C++ loader), its Gradle project and host tests (`android/tests`) |
-| `tools/own_disc/` | the builder: `builder.py` (player front end: check, fetch, build, verify), `disc_builder.py` (the stages), packaging, notices, tests |
-| `runtime/` | the game library's runtime and shader sources, compiled by the builder with the code translated from your discs (see `runtime/README.md`) |
-| `tools/host_guest_trace/`, `tools/vulkan_probe/`, `tools/rpf7_inventory/` | runtime and archive sources the builder compiles or runs |
-| `tools/xex_image/`, `tools/xmem_lzx/`, `tools/xex_info/` | small host programs: executable image decoder, LZX decompressor, header reader |
-| `patches/xenonrecomp/`, `patches/xenosrecomp/` and `tools/*recomp_patches/` | our patch queues for the two upstream translators, with their managers and tests |
-| `third_party/` | vendored FSR 1, GSR 1 and Nunito Sans with their licences |
-| `tools/release/` | release checks and packaging |
+From a prepared Duo builder payload:
 
-## Toolchains
-
-- Python 3.12 (the Windows builder download carries its own).
-- CMake 3.24+ and Ninja; a C++20 compiler (Apple clang on macOS, llvm-mingw on Windows).
-- JDK 17 and the Android SDK (API 35) for the app; the builder fetches Android NDK r27c itself.
-- Windows only: Microsoft's DirectX Shader Compiler v1.9.2607 (fetched by the builder).
-
-## Upstream sources
-
-The builder compiles two upstream translators with our changes:
-
-| Project | Upstream | Our changes |
-|---|---|---|
-| XenonRecomp (PowerPC to C++) | https://github.com/hedge-dev/XenonRecomp | `patches/xenonrecomp/` |
-| XenosRecomp (Xbox 360 shaders) | https://github.com/hedge-dev/XenosRecomp | `patches/xenosrecomp/` |
-| FFmpeg (XMA decoder) | https://github.com/xenia-project/FFmpeg at 15ece0882e8d | configuration in `tools/own_disc/xma_decoder/` |
-
-The exact revisions a release was built from, and the complete changed source, are in that release's source archive
-(`FivePocket-<version>-source.tar.xz`, file `SOURCES.txt`) and in each builder download's `builder/sources/` folder.
-
-## The app
-
-```
-cd android
-./gradlew assemblePublic        # unsigned public APK: loader and menus only, no game code
-python3 ../android/scripts/validate_project.py
+```sh
+./builder fetch --accept-ndk-license
+./builder check
+./builder build --duo --bundle-id com.example.fivepocket.duo --play-disc PLAY.iso --install-disc INSTALL.iso
 ```
 
-The public build refuses any asset other than its two text records (`prePublicBuild`). Sign it with your own key.
+Use the existing installed bundle identifier when rebuilding an app you already use. Sign with your own Apple development identity and install over the app to preserve its storage.
 
-## The builder
+The pipeline retains NDK host shader tools and its intermediate XMA decoder build. These are dependencies of the Duo build, not Android application targets. PowerPC and shader translation, FFmpeg, FSR and GSR code remain for the same reason.
 
-Run the builder's own tests first:
+`ios_compile.py --source-root CHECKOUT --development-toolchain` uses the relocated dependencies in `runtime/host`, `runtime/bridge` and `runtime/gpu`. It verifies the original kit inputs, records the selected source hashes and compiles the assembled tree. Development mode reports toolchain/code-identity differences; it does not certify an exact upstream release replay.
 
-```
-python3 -m unittest discover -s tools/own_disc/tests
-```
+## Checks and logs
 
-A builder download is a folder with the tools, the host programs, a profile and an inventory (`release.json`) that
-`builder.py check` verifies before it runs. `tools/own_disc/make_release.py` writes that inventory;
-`tools/own_disc/make_notices.py` and `make_sources.py` write its notices and corresponding source.
+Run the native tests shown in the root README and `python3 tools/release/run_checks.py`. Before publishing source changes, also run `tools/release/taint_scan.py` against your local discs and generated inputs.
 
-## Release checks
-
-```
-python3 tools/release/run_checks.py
-```
-
-Before a release the maintainer also runs `tools/release/taint_scan.py` against their own discs and builder outputs,
-and `tools/release/package_release.py` to make the downloads; see [RELEASING.md](RELEASING.md).
+Keep device logs local unless they have been checked for personal details and memory dumps. Never attach builds, imported game files, caches or saves to an issue.

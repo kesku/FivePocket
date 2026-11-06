@@ -3,7 +3,7 @@
 
 The validated corpus was generated with a context header that lacks the vector pack/unpack helpers which the full
 XenonRecomp patch queue (0015-0019) embeds in ppc_context.h; its repaired chunks instead include the incremental headers
-from android/app/src/main/cpp. Rule (derived from the text, no parameters): a chunk that calls
+from runtime/host. Rule (derived from the text, no parameters): a chunk that calls
   recomp::vmx::packNormShort4 / unpackNormShort4   includes "guest_vmx_short.h",
   recomp::vmx::packNormPacked32 / unpackNormPacked32  "guest_vmx_packed.h",
   recomp::vmx::packHalf / unpackHalf                "guest_vmx_half.h",

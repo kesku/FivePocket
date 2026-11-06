@@ -1054,7 +1054,6 @@ static std::atomic<unsigned> v560BurdenCount{0};static std::atomic<unsigned long
     GLOG("RENDER_GENERIC_CEXEC enabled=%u entries=%u applied=%u why=%s",unsigned(r.enabled),r.entries,r.applied,r.why);
 }
 #include "gpu_cost_glue.inc" // gpu-cost: diag-gc-index-fold / diag-gc-profile (out of line, state outside Renderer)
-#include "gpu_filler.h" // v568 (MEASUREMENT ONLY): diag-measure-gpu-filler, a low-priority keep-warm GPU filler on its own device
 // frame-gen (lane B, fg_pair.h; stage 1a = the pair dry run): files/private-trace/diag-fg-pair-between / diag-fg-pair-ahead (a GPU
 // frame is shown as two pictures two refreshes apart while lane A's 30 fps cap paces it) and the modifiers diag-fg-hold /
 // diag-fg-nocap, polled at the 60-present window boundary; the presenter reads the word at its next GPU frame. RENDER_GENERIC_V210Z
@@ -3900,7 +3899,6 @@ public:
         const auto own=probeDedicatedQueue(device.device);
         queue=own?own:device.queue;
         GLOG("RENDER_GENERIC_QUEUE own=%u",unsigned(own!=VK_NULL_HANDLE));
-        recomp_filler::start(); // v568: its thread idles on one access() a second until diag-measure-gpu-filler exists
     }
     void note(const char* what,const char* detail="") {
         const auto key=std::string(what)+"/"+detail;

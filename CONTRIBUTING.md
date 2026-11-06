@@ -34,14 +34,6 @@ python3 tools/release/taint_scan.py --published <changed files> --retail <your d
 
 ## Reporting a bug
 
-Post in the `#bug-reports` forum on the [FivePocket Discord](https://discord.gg/mZvqCsxgxT) (pick your edition's tag) or use the
-[bug report form](https://github.com/marcm0de/FivePocket/issues/new/choose) here. Say which edition, version and
-device you use and what you did before the problem, and add the log:
+Use this fork's issue tracker for iPhone Duo problems. Include the app version, iOS version and steps to reproduce. Check logs for personal details and memory dumps before sharing them.
 
-- **Builder:** the report from `builder build ... --report report.json`;
-- **Android, Thor:** `adb logcat -d > fivepocket-log.txt` right after the problem (USB debugging on);
-- **iOS, Duo:** after a crash, Settings → Privacy & Security → Analytics & Improvements → Analytics Data, the
-  entry with the app's name; otherwise a description and a screenshot.
-
-**Never attach built files**: disc images, bundles, the `.apk`/`.ipa` you built, the app's game folder, caches,
-saves or memory dumps. Details: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#logs).
+Never attach disc images, generated code, builds, imported assets, caches or saves. See [LEGAL.md](LEGAL.md) and [build notes](docs/BUILDING.md#checks-and-logs).

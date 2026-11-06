@@ -10,6 +10,7 @@ Run: python3 tools/own_disc/tests/test_ios_app_kit.py
 import hashlib
 import json
 import plistlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -31,7 +32,8 @@ class App(unittest.TestCase):
         self.root = Path(tmp.name)
         self.files = self.root / 'app-files'; self.files.mkdir()
         with (self.files / 'Info.plist').open('wb') as f:
-            plistlib.dump({'CFBundleExecutable': 'Game', 'CFBundleIdentifier': 'owner.private.id', 'BuildMachineOSBuild': 'X'}, f)
+            plistlib.dump({'CFBundleExecutable': 'Game', 'CFBundleIdentifier': 'owner.private.id', 'BuildMachineOSBuild': 'X',
+                          'UIDeviceFamily': [1, 2], 'UISupportedInterfaceOrientations~ipad': ['portrait']}, f)
         (self.files / 'Font.ttf').write_bytes(b'font')
         self.exe = self.root / 'exe'; self.exe.write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
         self.stage = self.root / 'decode'; self.stage.mkdir(); (self.stage / 'image.bin').write_bytes(b'IMAGE')
@@ -69,6 +71,8 @@ class App(unittest.TestCase):
         self.assertEqual(info['CFBundleIdentifier'], 'org.example.player')
         self.assertEqual(info['DTSDKName'], 'iphoneos26.5')
         self.assertNotIn('BuildMachineOSBuild', info)
+        self.assertEqual(info['UIDeviceFamily'], [1])
+        self.assertNotIn('UISupportedInterfaceOrientations~ipad', info)
         self.assertEqual((app / 'Game').read_bytes(), self.exe.read_bytes())
         self.assertEqual((app / 'payload/r/private-trace/run-1/decoded.image.bin').read_bytes(), b'IMAGE')
         self.assertEqual((app / 'payload/manifest.txt').read_bytes(), (self.root / 'payload/manifest.txt').read_bytes())
@@ -86,6 +90,67 @@ class App(unittest.TestCase):
 
 
 class Kit(unittest.TestCase):
+    def test_relocated_sources_are_pinned_without_changing_the_original_kit(self):
+        self.assertIn('repo/android/app/src/main/cpp/', ios_kit.SOURCE_ROOTS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit, source = root / 'kit', root / 'source'
+            places, inputs = {}, {}
+            for old, new in ios_kit.SOURCE_ROOTS.items():
+                rel = old + 'shared.h'
+                original = kit / 'files' / rel
+                original.parent.mkdir(parents=True)
+                original.write_bytes(b'original source')
+                local = source / new / 'shared.h'
+                local.parent.mkdir(parents=True)
+                local.write_bytes(b'local source')
+                places[rel] = {'kit': rel, 'sha256': sha(b'original source')}
+                inputs['/r/' + rel.removeprefix('repo/')] = {'size': 15, 'sha256': sha(b'original source')}
+            record = {'stages': [], 'snapshot_dir': '/old/tree', 'places': places,
+                      'frozen': {'inputs': inputs, 'snapshot': {'map': [['/r', '@TREE/repo']], 'rewritten': {}}}}
+            (kit / 'kit.json').write_text(json.dumps(record))
+            with mock.patch.object(ios_kit, 'clone', side_effect=shutil.copyfile):
+                tree = ios_kit.assemble(kit, {}, root / 'tree', source)
+            frozen = json.loads((tree / 'frozen.json').read_text())
+            self.assertEqual(len(frozen['source_overrides']), 3)
+            for rel in places:
+                self.assertEqual((tree / rel).read_bytes(), b'local source')
+                self.assertEqual((kit / 'files' / rel).read_bytes(), b'original source')
+            self.assertTrue(all(r == {'size': 12, 'sha256': sha(b'local source')}
+                                for r in frozen['inputs'].values()))
+
+    def test_source_override_refuses_missing_local_or_changed_kit_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit, source = root / 'kit', root / 'source'
+            rel = 'repo/android/app/src/main/cpp/shared.h'
+            original = kit / 'files' / rel
+            original.parent.mkdir(parents=True)
+            original.write_bytes(b'original')
+            record = {'stages': [], 'places': {rel: {'kit': rel, 'sha256': sha(b'original')}},
+                      'frozen': {'inputs': {'/r/android/app/src/main/cpp/shared.h': {}},
+                                 'snapshot': {'map': [['/r', '@TREE/repo']]}}}
+            (kit / 'kit.json').write_text(json.dumps(record))
+            with self.assertRaisesRegex(SystemExit, 'relocated source missing'):
+                ios_kit.assemble(kit, {}, root / 'missing', source)
+            self.assertFalse((root / 'missing').exists())
+            local = source / 'runtime/host/shared.h'
+            local.parent.mkdir(parents=True)
+            local.write_bytes(b'local')
+            original.write_bytes(b'changed')
+            with self.assertRaisesRegex(SystemExit, 'source-kit input changed'):
+                ios_kit.assemble(kit, {}, root / 'changed', source)
+            self.assertFalse((root / 'changed').exists())
+
+    def test_unused_kit_copies_are_not_required_from_the_source_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kit = root / 'kit'; kit.mkdir()
+            rel = 'repo/tools/host_guest_trace/unused.inc'
+            record = {'places': {rel: {'kit': rel}},
+                      'frozen': {'inputs': {}, 'snapshot': {'map': []}}}
+            self.assertEqual(ios_kit.local_sources(kit, record, root / 'source'), {})
+
     def test_stage_files_stay_out_of_the_kit_and_come_back_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)

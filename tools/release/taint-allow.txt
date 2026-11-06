@@ -306,3 +306,8 @@ deb977e0949b7c84c5e71abebed9fbb1a110d55634691d5304c1005d9855a958 path=rpf7_inven
 d1d5938d6ec06a890871274dbcb4ca9ba0e7e7a53fdd4b8f3ca37bd4757b8160 path=rpf7_inventory/rectangle_vertex_stage.py our GLSL template (the 'regular' float check) written by the boot-shaders stage into its generated shader (154 bytes)
 3dfcfd7843693321de186fb5fbb304810c3ee00a096b1054116cc4b2094de039 path=rpf7_inventory/pixel_sample_dataflow.py our GLSL template (the readBE byte-swap helper) written by the boot-shaders stage into its generated shader (251 bytes)
 32d93a5e0356871dd6a947393e75006aa55bec4053229cc9d15951cff10097c9 path=rpf7_inventory/rectangle_vertex_stage.py the same approved GLSL template text as d1d5938d (the 'regular' float check): its last 147 bytes, where the list-d rescan put the run's start (147 bytes)
+
+# Standard metadata in the unchanged upstream FivePocket icon.
+81c4aa4e9f08f8471f666a4510bcaaece7802e4f610a8b09c85ca0868bdbea1a path=resources/duo/AppIcon.png Standard Adobe XMP namespace declaration in the PNG iTXt metadata.
+8eba51e51de1bd1167bb3cf6d8d497ab9a589b015190209fb215e831ecd2bfd6 path=resources/duo/AppIcon.png Standard RDF namespace declaration in the PNG iTXt metadata.
+483c4c14074a6356757041eef2ca7bbf66993b616bc4de271fe75f8e042de1b4 path=resources/duo/AppIcon.png Standard Adobe Exif namespace declaration in the PNG iTXt metadata.

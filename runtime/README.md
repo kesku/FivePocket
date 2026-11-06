@@ -1,9 +1,6 @@
 # runtime/: the game library's runtime sources
 
-The builder compiles these files, together with the code it translates from **your** discs, into the game library
-(the `.bundle` your device loads). They are this project's own code (GPL-3.0-or-later), copied byte for byte from the
-source folder release 1.1.0-alpha.1 (library v852) was compiled from. `ppc_context.h` is upstream XenonRecomp's header
-(MIT, see `LICENSES/`) with this project's changes.
+The Duo builder links these runtime and shader sources with code translated locally from your own discs. The native dependencies previously stored in the Android app and probe projects now live in `host/`, `bridge/` and `gpu/`. The Apple frontend and frozen build inputs come from the separately supplied Duo source kit.
 
 Some files name the game's functions by address, size or script-function name, to say where the runtime hooks in.
 Those are facts needed to run your own copy; no game code or data is here (`tools/release/taint_scan.py` checks every

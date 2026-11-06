@@ -390,7 +390,7 @@ def main():
         ('vertex-shader.bin',4096), ('pixel-shader.bin',4096), ('device-state.bin',16384),
         ('vertices.bin',256*1024), ('indices.bin',256*1024),
         ('vertex-constants.bin',4096), ('pixel-constants.bin',4096))}
-    sources = {name: (root/'android/app/src/main/cpp'/name).read_text()
+    sources = {name: (root/'runtime/host'/name).read_text()
                for name in ('native_translated_draw.h','native_color_viewport.h','gta5_draw_state.h',
                             'native_offscreen_draw_plan.h','native_affine_position.h')}
     for name, count in (('native_translated_draw.h',11), ('native_color_viewport.h',28)):

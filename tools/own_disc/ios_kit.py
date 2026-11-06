@@ -33,8 +33,8 @@ new names exactly as the old ones; the expected identities are code identities, 
 of kit-243d-np in another folder was code-equal unit by unit).
 assemble: lays the tree out: kit files by clone, stage files from the run's stage folders (each checked by hash: a run
 whose stage wrote other bytes is refused), links as they were. Then replay_ios_build.py --manifest TREE/frozen.json
---from-snapshot compiles in it. The kit holds the runtime sources the Android kit holds and the iOS shell sources: private
-until the owner and a lawyer say otherwise (docs/builder/IOS-BUILDER-BRIEF-2026-11-05.md 2.1).
+--from-snapshot compiles in it. An explicit source root can supply the relocated host, bridge and GPU dependencies. Their bytes are pinned in the
+assembled manifest; generated game inputs still come only from the verified stages.
 Exit 0: done; 2: refused.
 """
 from __future__ import annotations
@@ -43,6 +43,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -211,11 +212,70 @@ def make(manifest_path: Path, stages: list[tuple[str, Path]], out: Path, referen
     return record
 
 
-def assemble(kit: Path, stages: dict[str, Path], out: Path) -> Path:
+# These names are part of the archived kit format, not the current source layout.
+SOURCE_ROOTS = {
+    'repo/android/app/src/main/cpp/': 'runtime/host',
+    'repo/tools/host_guest_trace/': 'runtime/bridge',
+    'repo/tools/vulkan_probe/': 'runtime/gpu',
+}
+
+
+def input_places(record: dict) -> set[str]:
+    mappings = sorted(record['frozen']['snapshot']['map'], key=lambda pair: -len(pair[0]))
+    links = sorted(((path, entry['link']) for path, entry in record['places'].items() if 'link' in entry),
+                   key=lambda pair: -len(pair[0]))
+    result = set()
+    for name in record['frozen']['inputs']:
+        for old, new in mappings:
+            if name == old or name.startswith(old + '/'):
+                relative = posixpath.normpath((new + name[len(old):]).removeprefix('@TREE/'))
+                for _ in range(len(links) + 1):
+                    for path, destination in links:
+                        if relative == path or relative.startswith(path + '/'):
+                            target = posixpath.normpath(posixpath.join(posixpath.dirname(path), destination))
+                            relative = target + relative[len(path):]
+                            break
+                    else:
+                        result.add(relative)
+                        break
+                else:
+                    raise SystemExit('cyclic kit source aliases')
+                break
+    return result
+
+
+def local_sources(kit: Path, record: dict, root: Path | None) -> dict:
+    if root is None:
+        return {}
+    root = root.resolve()
+    sources = {}
+    needed = input_places(record)
+    for rel, entry in record['places'].items():
+        if 'kit' not in entry or rel not in needed:
+            continue
+        for old, new in SOURCE_ROOTS.items():
+            if not rel.startswith(old):
+                continue
+            base = root / new
+            path = base / rel[len(old):]
+            if not path.resolve().is_relative_to(base.resolve()) or path.is_symlink() or not path.is_file():
+                raise SystemExit(f'relocated source missing or outside source root: {path}')
+            original = kit / 'files' / entry['kit']
+            if not original.is_file() or sha256(original) != entry['sha256']:
+                raise SystemExit(f'source-kit input changed: {rel}')
+            data = path.read_bytes()
+            sources[rel] = {'data': data, 'path': path.relative_to(root).as_posix(),
+                            'sha256': hashlib.sha256(data).hexdigest()}
+            break
+    return sources
+
+
+def assemble(kit: Path, stages: dict[str, Path], out: Path, source_root: Path | None = None) -> Path:
     record = json.loads((kit / 'kit.json').read_text(encoding='utf-8'))
     missing = [s for s in record['stages'] if s not in stages]
     if missing:
         raise SystemExit(f'stage folders not given: {", ".join(missing)}')
+    sources = local_sources(kit, record, source_root)
     tree = out.resolve()
     out.mkdir(parents=True)
     old_root = record['snapshot_dir']
@@ -229,7 +289,13 @@ def assemble(kit: Path, stages: dict[str, Path], out: Path) -> Path:
             dst.mkdir(parents=True, exist_ok=True)
         elif 'kit' in src:
             path = kit / 'files' / src['kit']
-            if src.get('names_the_tree'):
+            if rel in sources:
+                data = sources[rel]['data']
+                if src.get('names_the_tree'):
+                    data = data.replace(old_root.encode(), str(tree).encode())
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(data)
+            elif src.get('names_the_tree'):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(path.read_bytes().replace(old_root.encode(), str(tree).encode()))
             else:
@@ -254,6 +320,20 @@ def assemble(kit: Path, stages: dict[str, Path], out: Path) -> Path:
     if problems:
         raise SystemExit('\n'.join(problems[:20]))
     frozen = json.loads(json.dumps(record['frozen']).replace('@TREE', str(tree)))
+    source_audit = {}
+    for rel, source in sources.items():
+        source_audit[rel] = {'source': source['path'], 'source_sha256': source['sha256'],
+                             'assembled_sha256': sha256(tree / rel)}
+    if source_audit:
+        frozen['source_overrides'] = source_audit
+        for name in frozen['inputs']:
+            for old, new in frozen['snapshot']['map']:
+                if name == old or name.startswith(old + '/'):
+                    path = Path(new + name[len(old):])
+                    rel = path.resolve().relative_to(tree).as_posix()
+                    if rel in sources:
+                        frozen['inputs'][name] = {'size': path.stat().st_size, 'sha256': sha256(path)}
+                    break
     rewritten = {}
     for name, h in frozen['snapshot'].get('rewritten', {}).items():
         for old, new in frozen['snapshot']['map']:
@@ -338,6 +418,7 @@ def main(argv=None) -> int:
     asm.add_argument('--kit', type=Path, required=True)
     asm.add_argument('--stage', action='append', default=[])
     asm.add_argument('--out', type=Path, required=True)
+    asm.add_argument('--source-root', type=Path)
     neu = sub.add_parser('neutral')
     neu.add_argument('--kit', type=Path, required=True)
     neu.add_argument('--out', type=Path, required=True)
@@ -350,7 +431,7 @@ def main(argv=None) -> int:
     elif a.command == 'neutral':
         neutral(a.kit, a.out)
     else:
-        assemble(a.kit, dict(pairs(a.stage)), a.out)
+        assemble(a.kit, dict(pairs(a.stage)), a.out, a.source_root)
     return 0
 
 

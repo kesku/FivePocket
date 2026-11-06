@@ -5,14 +5,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Do not attach** disc images, bundles, the .apk or .ipa you built, files from the app's game folder, shader or
+        **Do not attach** disc images, bundles, the .ipa you built, files from the app's game folder, shader or
         pipeline caches, saves or memory dumps, and do not paste hex of game data. A plain log and a screenshot are
         enough. You can also report in the #bug-reports forum on the [FivePocket Discord](https://discord.gg/mZvqCsxgxT).
   - type: dropdown
     id: edition
     attributes:
       label: Edition
-      options: [FivePocket (Android), FivePocket Thor Edition, FivePocket iOS, FivePocket Duo, "Builder (macOS, iOS and Duo)", "Builder (Windows, FivePocket)", "Builder (Windows, Thor Edition)"]
+      options: [FivePocket Duo, "Duo Builder (macOS)"]
     validations: {required: true}
   - type: input
     id: version
@@ -20,7 +20,7 @@ body:
     validations: {required: true}
   - type: input
     id: device
-    attributes: {label: Device and system, placeholder: "AYN Thor, Android 13 / iPad mini (A17 Pro), iPadOS 18 / MacBook Air M2, macOS 15"}
+    attributes: {label: Device and system, placeholder: "iPhone Duo, iOS version / Mac model, macOS and Xcode version"}
     validations: {required: true}
   - type: textarea
     id: what
@@ -30,7 +30,7 @@ body:
     id: log
     attributes:
       label: Log
-      description: "Builder: the --report file. Android/Thor: adb logcat -d. iOS/Duo: the crash report from Settings > Privacy & Security > Analytics & Improvements > Analytics Data. Details in docs/TROUBLESHOOTING.md. Paste text; no attachments of game files."
+      description: "Builder: the --report file. Duo: the crash report from Settings > Privacy & Security > Analytics & Improvements > Analytics Data. Details in docs/TROUBLESHOOTING.md. Paste text; no attachments of game files."
       render: text
   - type: checkboxes
     id: clean

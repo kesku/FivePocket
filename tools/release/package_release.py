@@ -1,38 +1,13 @@
 #!/usr/bin/env python3
-"""Make the downloads of a release: one archive per platform, the source archive and SHA256SUMS.
+"""Package the Mac Duo builder and its source with integrity and release checks.
 
-    package_release.py --version V --out NEW_DIR
-                       [--android-apk APK] [--thor-apk APK]
-                       [--builder-macos DIR [--macos-editions ios|all]]
-                       [--builder-windows DIR] [--builder-thor-windows DIR] [--ios-kit DIR]
-                       [--retail-list FILE [--generated-list FILE]] [--extra PRIVATE_LITERALS] [--key-file F ...]
-                       [--report-dir DIR] [--taint-recheck EARLIER_REPORT_DIR]
+    package_release.py --version V --out NEW_DIR [--builder-macos DIR]
+                       [--retail-list FILE [--generated-list FILE]] [--extra PRIVATE_LITERALS]
+                       [--key-file FILE ...] [--report-dir DIR] [--taint-recheck DIR]
 
-Each download is staged as FivePocket[-Thor-Edition][-iOS][-Builder]-V-<platform>/ holding its payload, its README.txt
-(from packaging/), COPYING, LEGAL.md, THIRD-PARTY-NOTICES.md and LICENSES/. The Windows builders are one per Android
-edition (--builder-windows: FivePocket; --builder-thor-windows: Thor Edition). The Mac builder is named for what it
-makes: --macos-editions ios (default) for a package with the iOS and Duo targets only, all when it also builds the
-Android editions. The source archive is `git archive` of this
-checkout's HEAD (the checkout must be clean) plus SOURCES.txt naming the commit. RELEASE-NOTES.md
-(packaging/RELEASE-NOTES.md plus the downloads' SHA-256 table) is the release page's text.
-
-Before anything is packed, every staged folder (and the unpacked source) passes scan_names, scan_secrets and
-scan_owner (an .apk inside a download is unpacked and its contents scanned too; --key-file lets large binaries be
-searched for private key bytes), and, with --retail-list, the taint scan against your own game files (once over every distinct file of all downloads:
-a file at the same path inside two downloads with the same bytes is scanned once; the path is kept, so path-scoped
-allowances still apply). A failure stops the run and
-nothing is packed. Archives are written in a fixed order with fixed times and no extra metadata (no AppleDouble
-entries), so the same inputs give the same bytes. SHA256SUMS covers every archive whole. --report-dir keeps every
-check's full output (one file per download and check), packed or not, and staged-files.tsv (download, path, SHA-256
-of every staged file and .apk member) for checking the unpacked archives against what was scanned.
-
---taint-recheck takes the report folder of an earlier run of this release whose taint scan only failed on runs since
-reviewed: instead of scanning again it proves the staged files are those that run scanned (its staged-files.tsv, path
-and SHA-256 of every file and .apk member, no difference), that every taint report of every part is there with all its
-controls found, and that every FINDING, re-read from the staged bytes and hashed, is allowed by the current allow list
-(taint_scan's own rule). The proof is written to taint-recheck.txt in --report-dir.
-
-Exit 0: written. 1: a check failed. 2: refused (bad input, dirty checkout, existing output).
+The source archive comes from a clean Git revision. Prepared builder payloads are copied
+with their notices and then checked before deterministic archives are written. No IPA or
+game-derived build output is published by this tool.
 """
 from __future__ import annotations
 
@@ -374,13 +349,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--version', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--android-apk')
-    ap.add_argument('--thor-apk')
     ap.add_argument('--builder-macos')
-    ap.add_argument('--macos-editions', choices=('ios', 'all'), default='ios')
-    ap.add_argument('--builder-windows')
-    ap.add_argument('--builder-thor-windows')
-    ap.add_argument('--ios-kit', help='the game-free iOS kit folder the Mac builder makes the app from')
     ap.add_argument('--retail-list')
     ap.add_argument('--generated-list')
     ap.add_argument('--extra')
@@ -391,8 +360,7 @@ def main(argv=None) -> int:
                     help='DOWNLOAD=EVIDENCE_FILE: that download\'s files scanned by another run (see taint_elsewhere)')
     a = ap.parse_args(argv)
     out = Path(a.out)
-    inputs = {'--android-apk': a.android_apk, '--thor-apk': a.thor_apk, '--builder-macos': a.builder_macos,
-              '--builder-windows': a.builder_windows, '--builder-thor-windows': a.builder_thor_windows, '--ios-kit': a.ios_kit}
+    inputs = {'--builder-macos': a.builder_macos}
     missing = [f'{flag} {path}' for flag, path in inputs.items() if path and not Path(path).exists()]
     if missing:
         print('package_release: missing input: ' + ', '.join(missing), file=sys.stderr)
@@ -412,22 +380,9 @@ def main(argv=None) -> int:
                             check=True).stdout.strip()
     v = a.version
     plans = []  # (staged name, readme template, payload, archive kind[, extra readmes])
-    if a.android_apk:
-        plans.append((f'FivePocket-{v}-android', 'README-android.txt', {f'FivePocket-{v}.apk': a.android_apk}, 'zip'))
-    if a.thor_apk:
-        plans.append((f'FivePocket-Thor-Edition-{v}-android', 'README-thor.txt',
-                      {f'FivePocket-Thor-Edition-{v}.apk': a.thor_apk}, 'zip'))
     if a.builder_macos:
-        name, readme = ((f'FivePocket-iOS-Builder-{v}-macos-arm64', 'README-builder-macos.txt') if a.macos_editions == 'ios'
-                        else (f'FivePocket-Builder-{v}-macos-arm64', 'README-builder-macos-all.txt'))
-        plans.append((name, readme, {'builder': a.builder_macos}, 'zip', ('README-ios.txt', 'README-duo.txt')))
-    if a.builder_windows:
-        plans.append((f'FivePocket-Builder-{v}-windows-x64', 'README-builder-windows.txt', {'builder': a.builder_windows}, 'zip'))
-    if a.builder_thor_windows:
-        plans.append((f'FivePocket-Thor-Edition-Builder-{v}-windows-x64', 'README-builder-thor-windows.txt',
-                      {'builder': a.builder_thor_windows}, 'zip'))
-    if a.ios_kit:  # the game-free kit only; an .ipa (builder output) fails scan_secrets in any download
-        plans.append((f'FivePocket-iOS-Kit-{v}-macos-arm64', 'README-ios.txt', {'ios-kit': a.ios_kit}, 'zip'))
+        plans.append((f'FivePocket-Duo-Builder-{v}-macos-arm64', 'README-builder-macos.txt',
+                      {'builder': a.builder_macos}, 'zip', ('README-duo.txt',)))
 
     with tempfile.TemporaryDirectory(prefix='fivepocket-release-') as tmp:
         work = Path(tmp)

@@ -45,7 +45,7 @@ publish any of it:
 | saves | game data |
 | logs that contain memory dumps | parts of the game's memory |
 
-Ordinary logs are fine to share (see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)). Screenshots and
+Ordinary logs are fine to share (see [build notes](docs/BUILDING.md#checks-and-logs)). Screenshots and
 videos of your own play are your own captures.
 
 ## Keys

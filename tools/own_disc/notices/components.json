@@ -1,6 +1,6 @@
 {
  "schema": "builder-notices/1",
- "package": "the Windows builder package (builder.exe, host-tools, python, the tools and the files the profile names)",
+ "package": "the Mac Duo builder package (builder, host tools, source kits and the files the Duo profile names)",
  "components": [
   {
    "id": "this-project",
@@ -8,12 +8,13 @@
    "origin": "this download; its sources are in it",
    "terms": "GNU General Public License, version 3 or (at your option) any later version",
    "in_package": [
-    "builder.exe",
+    "builder",
     "tools/*",
-    "android/*",
+    "runtime/*",
     "local-analysis/*",
-    "host-tools/xex_image.exe",
-    "host-tools/xmem-lzx.exe"
+    "host-tools/xex_image",
+    "host-tools/xmem-lzx",
+    "resources/*"
    ],
    "note": "The tools, the launcher, the runtime sources and the parameter files are this project's own work unless a part below says otherwise. The complete sources of every program in this package are in the download.",
    "texts": [
@@ -30,11 +31,11 @@
    "origin": "https://github.com/sonicnext-dev/XenonRecomp.git (hedge-dev and contributors)",
    "terms": "MIT",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xex_image.exe",
+    "host-tools/XenonRecomp",
+    "host-tools/xex_image",
     "host-tools/ppc_context.h"
    ],
-   "note": "Built with this project's patches; the patched source and the build script are in the download. As a whole XenonRecomp.exe comes under the GNU General Public License because of part 3.",
+   "note": "Built with this project's patches; the patched source and the build script are in the download. As a whole XenonRecomp comes under the GNU General Public License because of part 3.",
    "texts": [
     {
      "root": "xenonrecomp",
@@ -49,7 +50,7 @@
    "origin": "GNU binutils (Free Software Foundation), as carried in XenonRecomp's thirdparty/disasm",
    "terms": "GNU General Public License, version 2 or any later version; taken here under version 3",
    "in_package": [
-    "host-tools/XenonRecomp.exe"
+    "host-tools/XenonRecomp"
    ],
    "note": "The notice below is the head of ppc-dis.c. The text of version 3 of the licence is under part 1.",
    "texts": [
@@ -70,8 +71,8 @@
    "origin": "https://github.com/kyz/libmspack",
    "terms": "GNU Lesser General Public License, version 2.1",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xmem-lzx.exe"
+    "host-tools/XenonRecomp",
+    "host-tools/xmem-lzx"
    ],
    "note": "Only mspack/lzxd.c is compiled in. Its source and the build script are in the download, so the programs can be linked again with another version of it.",
    "texts": [
@@ -88,8 +89,8 @@
    "origin": "https://github.com/kokke/tiny-AES-c.git",
    "terms": "The Unlicense (public domain)",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xex_image.exe"
+    "host-tools/XenonRecomp",
+    "host-tools/xex_image"
    ],
    "texts": [
     {
@@ -105,8 +106,8 @@
    "origin": "https://github.com/mohaps/TinySHA1 (as modified for Xenia)",
    "terms": "permission notice in the file",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xex_image.exe"
+    "host-tools/XenonRecomp",
+    "host-tools/xex_image"
    ],
    "note": "The notice below is the head of TinySHA1.hpp.",
    "texts": [
@@ -127,10 +128,10 @@
    "origin": "https://github.com/fmtlib/fmt.git",
    "terms": "MIT with an exception for binary forms",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xex_image.exe",
-    "host-tools/xenos/*/XenosRecomp.exe",
-    "host-tools/xenos/*/XenosShaderPreflight.exe"
+    "host-tools/XenonRecomp",
+    "host-tools/xex_image",
+    "host-tools/xenos/*/XenosRecomp",
+    "host-tools/xenos/*/XenosShaderPreflight"
    ],
    "texts": [
     {
@@ -146,7 +147,7 @@
    "origin": "https://github.com/marzer/tomlplusplus.git",
    "terms": "MIT",
    "in_package": [
-    "host-tools/XenonRecomp.exe"
+    "host-tools/XenonRecomp"
    ],
    "texts": [
     {
@@ -162,9 +163,9 @@
    "origin": "https://github.com/Cyan4973/xxHash.git",
    "terms": "BSD 2-Clause",
    "in_package": [
-    "host-tools/XenonRecomp.exe",
-    "host-tools/xenos/*/XenosRecomp.exe",
-    "host-tools/xenos/*/XenosShaderPreflight.exe"
+    "host-tools/XenonRecomp",
+    "host-tools/xenos/*/XenosRecomp",
+    "host-tools/xenos/*/XenosShaderPreflight"
    ],
    "texts": [
     {
@@ -197,8 +198,8 @@
    "origin": "https://github.com/sonicnext-dev/XenosRecomp.git (hedge-dev and contributors)",
    "terms": "MIT",
    "in_package": [
-    "host-tools/xenos/*/XenosRecomp.exe",
-    "host-tools/xenos/*/XenosShaderPreflight.exe",
+    "host-tools/xenos/*/XenosRecomp",
+    "host-tools/xenos/*/XenosShaderPreflight",
     "host-tools/xenos/*/shader_common.h"
    ],
    "note": "Built with this project's changes; the changed source and the build script are in the download.",
@@ -216,8 +217,8 @@
    "origin": "https://github.com/facebook/zstd.git",
    "terms": "BSD 3-Clause (offered under BSD or GPL version 2; the BSD terms are taken)",
    "in_package": [
-    "host-tools/xenos/*/XenosRecomp.exe",
-    "host-tools/xenos/*/XenosShaderPreflight.exe"
+    "host-tools/xenos/*/XenosRecomp",
+    "host-tools/xenos/*/XenosShaderPreflight"
    ],
    "texts": [
     {
@@ -233,8 +234,8 @@
    "origin": "https://github.com/aras-p/smol-v",
    "terms": "public domain or MIT, as its file says",
    "in_package": [
-    "host-tools/xenos/*/XenosRecomp.exe",
-    "host-tools/xenos/*/XenosShaderPreflight.exe"
+    "host-tools/xenos/*/XenosRecomp",
+    "host-tools/xenos/*/XenosShaderPreflight"
    ],
    "texts": [
     {
@@ -273,82 +274,31 @@
    "origin": "named part by part in the text below",
    "terms": "MIT, BSD 3-Clause, LGPL 2.1 or later, Apache 2.0 with LLVM exceptions, as the text says",
    "in_package": [
-    "android/*",
-    "tools/host_guest_trace/*",
-    "tools/vulkan_probe/*",
-    "local-analysis/builder/portable/supplied/*"
+    "runtime/host/*",
+    "runtime/bridge/*",
+    "runtime/gpu/*",
+    "runtime/*",
+    "resources/duo/*",
+    "local-analysis/.builder/ios/*"
    ],
    "note": "The same notices the app shows; the runtime sources in this package carry these parts.",
-   "texts": [
-    {
-     "root": "repo",
-     "path": "docs/alpha/LICENCES.md",
-     "sha256": "d3467f8f96d63a03b0465905a3c89be0932b4ecd151cb5d8c0794baeb94e2fff"
-    }
-   ]
-  },
-  {
-   "id": "llvm-mingw-runtime",
-   "name": "LLVM runtime libraries linked into the Windows programs (libc++, libunwind, compiler-rt)",
-   "origin": "the llvm-mingw toolchain the programs were built with",
-   "terms": "Apache License 2.0 with LLVM Exceptions",
-   "in_package": [
-    "builder.exe",
-    "host-tools/*.exe",
-    "host-tools/xenos/*/*.exe"
-   ],
-   "general": true,
-   "texts": [
-    {
-     "root": "llvm-mingw",
-     "path": "LICENSE.TXT",
-     "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
-    }
-   ]
-  },
-  {
-   "id": "mingw-w64-runtime",
-   "name": "MinGW-w64 runtime and winpthreads linked into the Windows programs",
-   "origin": "the llvm-mingw toolchain the programs were built with",
-   "terms": "the MinGW-w64 runtime's own permissive terms",
-   "in_package": [
-    "builder.exe",
-    "host-tools/*.exe",
-    "host-tools/xenos/*/*.exe"
-   ],
-   "general": true,
-   "texts": [
-    {
-     "root": "llvm-mingw",
-     "path": "x86_64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt",
-     "sha256": "1db8da07b436c68833c0673ffee3d9fcb2526047f3820b81661865dfedc79a1f"
-    },
-    {
-     "root": "llvm-mingw",
-     "path": "x86_64-w64-mingw32/share/mingw32/COPYING.winpthreads.txt",
-     "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177"
-    }
-   ]
-  },
-  {
-   "id": "python",
-   "name": "CPython 3.12.10, embeddable package, with the libraries python.org ships in it",
-   "origin": "https://www.python.org/",
-   "terms": "PSF License 2.0 and the third-party terms in its own file",
-   "in_package": [
-    "python/*"
-   ],
-   "travels": "python/LICENSE.txt"
+   "travels": "THIRD-PARTY-NOTICES.md"
   },
   {
    "id": "directx-shader-compiler",
-   "name": "DirectX Shader Compiler (Microsoft release v1.9.2607)",
+   "name": "DirectX Shader Compiler (Mac shader tools)",
    "origin": "https://github.com/microsoft/DirectXShaderCompiler",
-   "terms": "LLVM release licence for the compiler; Microsoft's terms for the release and dxil.dll",
+   "terms": "University of Illinois/NCSA Open Source License",
    "in_package": [
     "host-tools/dxc/*"
    ],
-   "fetched": "the builder's fetch step takes the release from its publisher after the player accepts its terms, and puts its licence files beside it"
+   "texts": [
+    {
+     "root": "repo",
+     "path": "LICENSES/NCSA-DirectXShaderCompiler.txt",
+     "sha256": "27a49e35d1da96eba18fba54bc882667ff0ff8c0254f16f2b6e165d605ba7df8"
+    }
+   ]
   },
   {
    "id": "android-ndk",

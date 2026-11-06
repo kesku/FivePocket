@@ -71,6 +71,19 @@ class DevelopmentReplay(unittest.TestCase):
 
 class DevelopmentPlan(unittest.TestCase):
 
+    def test_local_sources_require_explicit_development_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(SystemExit):
+                ios_compile.main(['--kit', str(root / 'kit'), '--work', str(root / 'work'),
+                                  '--source-root', str(root / 'source')])
+            self.assertFalse((root / 'work').exists())
+            with mock.patch.object(ios_compile.ios_kit, 'assemble', return_value=root / 'tree') as assemble, \
+                 mock.patch.object(ios_compile.replay_ios_build, 'main', return_value=0):
+                self.assertEqual(ios_compile.main(['--kit', str(root / 'kit'), '--work', str(root / 'work'),
+                                                  '--source-root', str(root / 'source'), '--development-toolchain']), 0)
+            self.assertEqual(assemble.call_args.args[3], root / 'source')
+
     def test_compile_stage_forwards_explicit_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
