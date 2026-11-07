@@ -1,0 +1,115 @@
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -390,6 +390,20 @@
+         g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
+ }
+ 
++// dusk-speckle (register LOD): a tfetch whose UseRegisterLOD bit is set samples the mip level a setTexLOD put in the
++// LOD register (the sampler still applies the fetch constant's LOD bias and mip range).
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
++}
++
++float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
++{
++    float3 dir = cubeDir(texCoord);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lod);
++}
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -251,6 +251,47 @@
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    // dusk-speckle (register LOD): setTexLOD (fetch opcode 24) loads the LOD register from the FIRST component of its
++    // source; every later tfetch whose UseRegisterLOD bit is set samples that mip level instead of the level the GPU
++    // computes from screen derivatives. Both were dropped (the setTexLOD without output, the bit unread), so GTA V's
++    // reflection map was blurred from the wrong level and fetched at the wrong level (108 pack pixel shaders).
++    // The local is declared only in shaders that use it: every other shader translates to the same text as before.
++    const bool registerLod = instr.opcode == FetchOpcode::TextureFetch && instr.useRegLod != 0;
++    if (instr.opcode == FetchOpcode::SetTextureLod || registerLod)
++    {
++        if (!texLodDeclared)
++        {
++            out.insert(texLodDeclaration, "\tfloat texLod = 0.0;\n");
++            texLodDeclared = true;
++        }
++    }
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        if (instr.isPredicated)
++        {
++            indent();
++            println("if ({}p0)", instr.predCondition ? "" : "!");
++            indent();
++            out += "{\n";
++            ++indentation;
++        }
++        indent();
++        println("texLod = r{}.{};", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++    if (registerLod && instr.dimension != TextureDimension::Texture2D && instr.dimension != TextureDimension::TextureCube)
++    {
++        // (none in the GTA V corpus: 183 two-dimensional fetches and 1 cube fetch use the register)
++        fmt::println(stderr, "register-LOD fetch of an unsupported dimension {}", uint32_t(instr.dimension));
++        std::exit(3);
++    }
++
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
+         return;
+ 
+@@ -369,6 +410,9 @@
+     if (instr.opcode != FetchOpcode::TextureFetch || instr.dimension != TextureDimension::Texture3D)
+         out += dimension;
+ 
++    if (registerLod)
++        out += "Lod"; // tfetch2DLod / tfetchCubeLod: SampleLevel with the LOD register
++
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+         out += "Bicubic";
+@@ -403,6 +447,9 @@
+             print(", float3({}, {}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f, instr.offsetZ * 0.5f);
+             break;
+     }
++
++    if (registerLod)
++        out += ", texLod";
+ 
+     out += ").";
+ 
+@@ -1991,6 +2038,8 @@
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
++    texLodDeclaration = out.size(); // dusk-speckle: where "float texLod" goes if the shader turns out to use the LOD register
++    texLodDeclared = false;
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,10 @@
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    // dusk-speckle (register LOD): the offset in `out` right after the register declarations, and whether
++    // "float texLod" was inserted there (recompile(TextureFetchInstruction) does it at the first use).
++    size_t texLodDeclaration = 0;
++    bool texLodDeclared = false;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

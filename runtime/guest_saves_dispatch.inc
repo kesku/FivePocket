@@ -325,12 +325,7 @@ if (auto* sv = savesStateFor(this, nativeXamAddress_ != 0 && signedOutUsersBound
                     }
                     else { ++it; }
                 }
-                const auto how = sv->store->closeContent(mount->second, mount->first); sv->mounts.erase(mount); // save-replace-safety: a replaced save is committed here
-                // save-failure-paths (v545): a replacement the store held back (a write, flush or open failed in it) or could
-                // not commit is not saved: the game is told, so it does not report a save that did not happen.
-                if (how == saves::content_close::HeldBack || how == saves::content_close::CommitFailed) {
-                    return deliver(importName, call.argument32(1), saves::win32::AccessDenied, 0, "Closed saved-game content; its new contents were not kept (the old save stays)");
-                }
+                (void)sv->store->closeContent(mount->second, mount->first); sv->mounts.erase(mount); // save-replace-safety: a replaced save is committed here
                 return deliver(importName, call.argument32(1), ErrorSuccess, 0, "Closed saved-game content (files flushed and closed)");
             }
         }
@@ -469,22 +464,12 @@ if (auto* sv = savesStateFor(this, nativeXamAddress_ != 0 && signedOutUsersBound
                                 (unsigned long long)(result.status == StatusSuccess && !result.directory ? sv->store->size(result.fd).value_or(0) : 0));
             (void)writeU32(iosb, result.status); (void)writeU32(iosb + 4, result.information);
             if (result.status != StatusSuccess) { call.returnValue = result.status; return handled(importName, "Saved-game file open failed as NT reports it"); }
-            // save-failure-paths (v545): an open for writing may already have truncated the staged file, so a failure to
-            // publish it to the guest abandons the open (store->abandon keeps the old save) instead of only closing it.
             std::uint32_t token = 0;
-            try {
-                token = createKernelHandle({KernelObjectKind::File, 1, 1});
-                if (token) {
-                    SaveFile file; file.fd = result.fd; file.directory = result.directory; file.write = write; file.key = *key;
-                    file.path = relativeOf(path); file.root = path.substr(0, path.find(':') + 1);
-                    sv->files.emplace(token, std::move(file));
-                }
-            } catch (const std::bad_alloc&) { if (token) { ::recomp::imports_fast::eraseKey(kernelHandles_, token, ::recomp::imports_fast::handleGenerations()); } token = 0; }
-            if (!token) {
-                (void)sv->store->abandon(result.fd);
-                (void)writeU32(iosb, StatusNoMemory); (void)writeU32(iosb + 4, 0);
-                call.returnValue = StatusNoMemory; return handled(importName, "File handle storage is exhausted");
-            }
+            try { token = createKernelHandle({KernelObjectKind::File, 1, 1}); } catch (const std::bad_alloc&) { token = 0; }
+            if (!token) { sv->closeFd(result.fd); call.returnValue = StatusNoMemory; return handled(importName, "File handle storage is exhausted"); }
+            SaveFile file; file.fd = result.fd; file.directory = result.directory; file.write = write; file.key = *key;
+            file.path = relativeOf(path); file.root = path.substr(0, path.find(':') + 1);
+            sv->files.emplace(token, std::move(file));
             (void)writeU32(handleOut, token);
             call.returnValue = StatusSuccess;
             return handled(importName, "Opened a saved-game file in local storage");

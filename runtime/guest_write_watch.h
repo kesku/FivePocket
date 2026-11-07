@@ -198,7 +198,28 @@ private:
         if(w)w->counters.chained.fetch_add(1,std::memory_order_relaxed);
         if(previous && (previous->sa_flags&SA_SIGINFO) && previous->sa_sigaction){previous->sa_sigaction(sig,info,context);return;}
         if(previous && previous->sa_handler!=SIG_DFL && previous->sa_handler!=SIG_IGN){previous->sa_handler(sig);return;}
-        signal(sig,SIG_DFL);raise(sig);
+        // (Claude 2026-10-22, iPad c492) a fault this watch does not own ends in raise(), as before; the crash report then shows
+        // EXC_CRASH/SIGSEGV with no faulting stack (the raise erases it). Before raising, one line names the fault: signal,
+        // code, address, pc, lr and the frame-pointer chain of the faulting context (async-signal-safe: write(2) of a stack
+        // buffer). The default disposition is set first, so a bad frame in the walk ends the process as the raise would.
+        signal(sig,SIG_DFL);
+        {
+            char line[640];std::size_t n=0;
+            auto put=[&](const char* t){while(*t && n<sizeof line-1)line[n++]=*t++;};
+            auto hex=[&](std::uint64_t v){char b[17];int i=16;b[i]=0;do{b[--i]="0123456789abcdef"[v&15];v>>=4;}while(v && i);put(b+i);};
+            std::uint64_t pc=0,lr=0,fp=0;
+#if defined(__APPLE__) && defined(__aarch64__)
+            if(context){const auto* uc=static_cast<const ucontext_t*>(context);if(uc->uc_mcontext){pc=uc->uc_mcontext->__ss.__pc;lr=uc->uc_mcontext->__ss.__lr;fp=uc->uc_mcontext->__ss.__fp;}}
+#endif
+            put("GUEST_WRITE_WATCH_UNOWNED_FAULT sig=");hex(std::uint64_t(sig));put(" code=");hex(info?std::uint64_t(info->si_code):0);
+            put(" addr=");hex(info?reinterpret_cast<std::uint64_t>(info->si_addr):0);put(" pc=");hex(pc);put(" lr=");hex(lr);put(" fp_chain=");
+            for(int k=0;k<24 && fp && !(fp&15);++k) { // (fp, return address) pairs; stops at a null, misaligned or non-increasing frame
+                const std::uint64_t next=reinterpret_cast<const std::uint64_t*>(fp)[0],ret=reinterpret_cast<const std::uint64_t*>(fp)[1];
+                hex(ret);put(",");if(next<=fp)break;fp=next;
+            }
+            put("\n");(void)::write(2,line,n);
+        }
+        raise(sig);
     }
     bool installed_=false;unsigned shift_=12;std::uint32_t pageBytes_=4096;
     std::uint8_t* views_[MaxViews]{};unsigned viewCount_=0;std::uint64_t bytes_=0;std::uint32_t pages_=0;

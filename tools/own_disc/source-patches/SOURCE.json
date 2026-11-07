@@ -1,0 +1,14 @@
+{
+  "license": "GPL-3.0-or-later modifications to MIT XenosRecomp",
+  "upstream": "https://github.com/hedge-dev/XenosRecomp",
+  "revision": "811240b0137dc9806ae1480d96314cf43941c4b9",
+  "provenance": "Source-only changes from the corresponding source of the public FivePocket v1.1.0-alpha.1 Mac builder. No shader containers or generated shaders are included.",
+  "patches": {
+    "xenos-base.patch": "942c4993b5795eba57061d039fbbea45d199b784d8f077f0a3ba4e44d1bacdcb",
+    "xenos-coissue-reglod.patch": "5b5fb2d372141617ba2fbccc34f2ca0dc585106db02d309bab1f7a612c164dfe",
+    "xenos-coissue.patch": "24e8eba270e80a16951cd7e88c0070907e7876e315274c154841faf55aedc08c",
+    "xenos-gradient.patch": "5a3d8124e3e64f4174397a6bcbff61bcffa93686e7d0c66c7708c6d6bae491d0",
+    "xenos-main.patch": "6b9494922862c9f27c8c6fbf448255199c4f758560b7d55dd58a919874dd1b4f",
+    "xenos-reglod.patch": "9e9716825e9a28efdf7fd6781ed69848a6871feaa9b589820dd6b82dce35643c"
+  }
+}

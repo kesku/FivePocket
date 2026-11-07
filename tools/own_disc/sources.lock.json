@@ -1,0 +1,60 @@
+{
+  "schema": "duo-source-lock/1",
+  "sources": {
+    "xenon-dependencies": {
+      "directory": "XenonRecomp",
+      "url": "https://github.com/hedge-dev/XenonRecomp.git",
+      "revision": "ddd128bcca99fe8bfbb99bea583c972351fa6ace",
+      "submodules": [
+        "thirdparty/fmt",
+        "thirdparty/xxHash",
+        "thirdparty/tomlplusplus",
+        "thirdparty/libmspack",
+        "thirdparty/tiny-AES-c",
+        "thirdparty/simde"
+      ]
+    },
+    "xenos": {
+      "directory": "XenosRecomp",
+      "url": "https://github.com/hedge-dev/XenosRecomp.git",
+      "revision": "811240b0137dc9806ae1480d96314cf43941c4b9",
+      "submodules": [
+        "thirdparty/fmt",
+        "thirdparty/xxHash",
+        "thirdparty/zstd",
+        "thirdparty/smol-v"
+      ]
+    },
+    "dxc": {
+      "directory": "DirectXShaderCompiler",
+      "url": "https://github.com/microsoft/DirectXShaderCompiler.git",
+      "revision": "0d3ee6b551b8fa768fbf825300ebab81047ef6a8",
+      "submodules": [
+        "external/DirectX-Headers",
+        "external/SPIRV-Headers",
+        "external/SPIRV-Tools"
+      ]
+    },
+    "ffmpeg": {
+      "directory": "FFmpeg",
+      "url": "https://github.com/xenia-project/FFmpeg.git",
+      "revision": "15ece0882e8d5875051ff5b73c5a8326f7cee9f5",
+      "submodules": []
+    }
+  },
+  "xenos_variants": [
+    "main",
+    "gradient",
+    "reglod",
+    "coissue",
+    "coissue-reglod"
+  ],
+  "ndk": {
+    "directory": "android-ndk-r27c",
+    "license_url": "https://developer.android.com/ndk/downloads",
+    "sha256": "8c5685457c58a88527367d46d3f14e8c727d962c39f85344cff0c0768a73c3b7",
+    "size": 836128272,
+    "unpacked_bytes": 3972136767,
+    "url": "https://dl.google.com/android/repository/android-ndk-r27c-darwin.zip"
+  }
+}

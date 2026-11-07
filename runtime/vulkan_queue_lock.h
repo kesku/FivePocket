@@ -6,6 +6,7 @@
 // v119 may give them separate domains (diag-domain-split-render), which needs this lock. Lock order: callers may
 // hold the registry lock or the generic renderer's mutex; nothing is acquired while this is held.
 #include <vulkan/vulkan.h>
+#include "apple/ios_gpu_lifecycle.h"
 #include <cstdint>
 #include <atomic>
 #include <mutex>
@@ -27,6 +28,8 @@ struct GenericSubmissionScope {
     ~GenericSubmissionScope() { genericQueueSubmission = false; }
 };
 inline VkResult lockedQueueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    auto operation=::recomp::apple::iosGpuLifecycle().acquire(queue);
+    if(!operation)return VK_ERROR_DEVICE_LOST;
     std::lock_guard lock(sharedQueueMutex());
     if (!genericQueueSubmission) nativeSubmissionTickets().fetch_add(1, std::memory_order_acq_rel);
     return vkQueueSubmit(queue, count, submits, fence);
@@ -47,6 +50,8 @@ inline void noteNativeTicketsFenced(std::uint64_t covered) noexcept {
 // submitted), without holding the lock while the GPU drains: an empty submission signals a fresh fence after all
 // earlier work, and only that submission is locked. Falls back to a locked vkQueueWaitIdle if no fence can be made.
 inline VkResult lockedQueueWaitIdle(VkDevice device, VkQueue queue) {
+    auto operation=::recomp::apple::iosGpuLifecycle().acquire(queue);
+    if(!operation)return VK_ERROR_DEVICE_LOST;
     VkFenceCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;

@@ -55,11 +55,11 @@ sources and build scripts in this repository and in the builder download.
 | Windows only: LLVM runtime (libc++, libunwind, compiler-rt) | `*.exe` | Apache 2.0 with LLVM Exceptions | `LICENSES/Apache-2.0-WITH-LLVM-exception.txt` |
 | Windows only: MinGW-w64 runtime and winpthreads | `*.exe` | MinGW-w64 runtime terms | `LICENSES/MinGW-w64-runtime.txt`, `LICENSES/MinGW-w64-winpthreads.txt` |
 | Windows only: CPython 3.12 embeddable | `python/` | PSF License 2.0 and its listed parts | `python/LICENSE.txt` (travels with it) |
-| macOS only: DirectX Shader Compiler v1.9.2607 (Microsoft), built from its source | `host-tools/dxc` | University of Illinois/NCSA, with DXC's third-party notices | `LICENSES/NCSA-DirectXShaderCompiler.txt`, `builder/notices/` |
+| macOS only: DirectX Shader Compiler v1.9.2607 (Microsoft), built from its source | `host-tools/dxc` | University of Illinois/NCSA, with DXC's third-party notices | `LICENSES/NCSA-DirectXShaderCompiler.txt`, the downloaded SDK notices |
 | Fetched, not distributed: Android NDK r27c (Google); DirectX Shader Compiler v1.9.2607 (Microsoft; Windows builders only) | builder cache | the publishers' terms, accepted by the player at `builder fetch` | shown by the publisher |
 
 Each builder download contains the complete corresponding source of its host programs (the pinned upstream source
-plus our patches and build scripts) in `builder/sources/`, and the notices of every part it carries in `builder/notices/`.
+plus our patches and build scripts) in `builder/sources/`, and the notices of every part it carries in the downloaded SDK notices.
 
 ## 4. iOS and Duo apps (made by the Mac builder on the player's Mac; never distributed)
 
@@ -67,10 +67,10 @@ The Mac builder download carries the iOS kit these apps are built from; the app 
 
 | Part | Terms | Text |
 |---|---|---|
-| MoltenVK 1.4.2 (The Brenwill Workshop and contributors), static library in the kit | Apache License 2.0 | `LICENSES/Apache-2.0.txt`, `builder/notices/` |
-| SPIRV-Cross and SPIRV-Tools (Khronos and contributors), built into MoltenVK | Apache License 2.0 | `LICENSES/Apache-2.0.txt`, `builder/notices/` |
-| cereal (Randolph Voorhies, Shane Grant), built into MoltenVK | BSD 3-Clause | `LICENSES/BSD-3-Clause-cereal.txt`, `builder/notices/` |
-| Vulkan headers (Khronos Group), as carried by MoltenVK | Apache License 2.0 or MIT | `builder/notices/` |
+| MoltenVK 1.4.2 (The Brenwill Workshop and contributors), official iOS SDK fetched by CMake | Apache License 2.0 | `LICENSES/Apache-2.0.txt`, the downloaded SDK notices |
+| SPIRV-Cross and SPIRV-Tools (Khronos and contributors), built into MoltenVK | Apache License 2.0 | `LICENSES/Apache-2.0.txt`, the downloaded SDK notices |
+| cereal (Randolph Voorhies, Shane Grant), built into MoltenVK | BSD 3-Clause | `LICENSES/BSD-3-Clause-cereal.txt`, the downloaded SDK notices |
+| Vulkan headers (Khronos Group), as carried by MoltenVK | Apache License 2.0 or MIT | the downloaded SDK notices |
 | FFmpeg (as in section 2), statically linked by the player's own build | LGPL 2.1 or later | `LICENSES/LGPL-2.1-or-later.txt` |
 | LLVM compiler-rt | Apache 2.0 with LLVM Exceptions | `LICENSES/Apache-2.0-WITH-LLVM-exception.txt` |
 | Nunito Sans, FSR 1, GSR 1, Xenia, ReXGlue, SIMDe | as above | as above |

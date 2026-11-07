@@ -1,4 +1,5 @@
 #include "diag_log_sample.h" // v218
+#include "diag_timeline.h"
 #include <unordered_map>
 #include "guest_cooperative_executor.h"
 #include "guest_parallel_wake.h"
@@ -31,12 +32,13 @@
 #include <cerrno> // v240
 #include <cstring> // v362: std::memcpy
 #include "fast_tls_v362.h" // v362
-extern "C" const void* recomp_v362_guard_active_slot() noexcept; // v362 (guest_execution_guard.cpp): the calling thread's activeExecution variable (its address; read in place by the claimed thread)
-#include "native_clock_quiet.h" // native-imports (lane native-syscalls): the permit-hold and scheduler-lock accounting stamps read no clock while diag-native-imports is on (this line was the v362 comment above: every later line keeps its number)
+// v362 (guest_execution_guard.cpp): the calling thread's activeExecution variable (its address; read in place by the claimed thread)
+extern "C" const void* recomp_v362_guard_active_slot() noexcept;
 #include <functional> // v240
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include "diag_timeline.inc" // v159: the timeline probe (defined here, used by other TUs through diag_timeline.h)
+#include "diag_native_stacks.h" // v199: native stacks at a stall (stallWatchdogMain)
 #include <unistd.h>
 #endif
 
@@ -64,12 +66,78 @@ namespace recomp::bootstrap { void diagnosticDumpImports(); } // v49 (guest_impo
 #include "pooled_host.h" // v240
 #include "prime_swap_v245.h" // v245
 extern "C" std::atomic<unsigned> recomp_v346_main_spin_us; // v346/v347 (defined with the gate counters below)
-#include "park_watch.h" // park-watch (v531): the watch's pause, defined at the end of this file
 #include "poll_sleep_v266.h" // v266
 #include "park_poll_jp.h" // job-path: diag-jp-park-poll (park poll schedule of non-critical tasks)
 // job-path: the in-run switch (files/private-trace/diag-jp-park-poll, set by the renderer's switch poll; read once per wait).
 extern "C" { std::atomic<bool> recomp_jp_park_poll{false}; }
 #include "aw_waker.h" // async-wake: diag-aw-* (dedupe of repeat notifies; main's notifies through a waker thread)
+#if defined(__APPLE__)
+// ios-qos-main-wait (Claude, 2026-10-18): the pad-poll hook in Main.mm sets the main loop's QoS only while main polls the pad, and
+// main stops polling before gameplay (c195: its last change came before the renderer's A/B windows began). Main waits here
+// every frame in gameplay (c193 sampler: sub_823C7A68 < sub_822DE960), so the same rule is applied again on main's own
+// thread from its waits: ios-qos-main = user-interactive; ios-qos-main-low = utility; ios-qos-main-keep = default; none = utility
+// at 100 % render scale and above, default below 100 % (ADOPTED 2026-10-18, see below).
+#define RECOMP_IOS_SWITCHES_NO_MACRO
+#include "ios_switches.h"
+#include <pthread/qos.h>
+namespace recomp::bootstrap { std::uint32_t currentGuestThreadToken() noexcept; }
+extern "C" std::atomic<int> recomp_ios_render_sixteenths; // (generic_renderer.cpp: the applied render scale, 16 = 100 %)
+#include <mach/mach_time.h>
+// ios-qos-recheck (Claude 2026-10-20): the QoS hooks below re-read their switch files at most every 250 ms per thread, no longer
+// every 16th wait. A check is one to four access() syscalls (a file-system lookup under the sandbox), and guest threads,
+// main on the frame's serial chain among them, wait hundreds of times per second. The same files, same decisions, later by
+// at most 250 ms. The first wait of a thread checks at once.
+inline bool iosQosRecheckDue(std::uint64_t& next) noexcept {
+    const std::uint64_t now = mach_absolute_time();
+    if (now < next) return false;
+    static const std::uint64_t step = [] {mach_timebase_info_data_t tb{}; mach_timebase_info(&tb);
+        return tb.numer ? std::uint64_t(250'000'000ull) * tb.denom / tb.numer : std::uint64_t(6'000'000ull);}();
+    next = now + step; return true;
+}
+namespace {
+// ios-qos-guest-low (Claude 2026-10-20; scheduling only, A/B aid): every guest thread except main and the game's render thread at
+// utility QoS while files/private-trace/ios-qos-guest-low is present, so the two performance cores stay with the frame's serial
+// chain (main -> render thread -> worker); without the file nothing is changed. The render thread's token comes from the present
+// hook (generic_renderer.cpp).
+extern "C" { std::atomic<std::uint32_t> recomp_ios_render_guest_token{0}; std::atomic<unsigned> recomp_ios_guest_low_applied{0}; }
+void iosGuestQosFromWait(std::uint32_t token) noexcept {
+    if (!token || token == recomp_ios_render_guest_token.load(std::memory_order_relaxed)) return;
+    static thread_local std::uint64_t next = 0; static thread_local int applied = -1;
+    if (!iosQosRecheckDue(next)) return; // (ios-qos-recheck)
+    static const std::string home = std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/Library/r/private-trace/";
+    static const std::string low = home + "ios-qos-guest-low";
+    const int want = recomp_ios_switches_access(low.c_str(), F_OK) == 0 ? 2 : 0;
+    if (want == applied || (applied == -1 && want == 0)) return;
+    const int r = pthread_set_qos_class_self_np(want == 2 ? QOS_CLASS_UTILITY : QOS_CLASS_DEFAULT, 0);
+    if (want == 2) recomp_ios_guest_low_applied.fetch_add(1, std::memory_order_relaxed);
+    else recomp_ios_guest_low_applied.fetch_sub(1, std::memory_order_relaxed);
+    if (applied == -1) std::fprintf(stderr, "APPLE_IOS_QOS thread=guest token=%08x want=%d result=%d\n", token, want, r);
+    applied = want;
+}
+void iosMainQosFromWait() noexcept {
+    const std::uint32_t token = recomp::bootstrap::currentGuestThreadToken();
+    if (token != 0x63001000u) { iosGuestQosFromWait(token); return; }
+    static thread_local std::uint64_t next = 0; static thread_local int applied = -1;
+    if (!iosQosRecheckDue(next)) return; // (ios-qos-recheck)
+    static const std::string home = std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/Library/r/private-trace/";
+    static const std::string ui = home + "ios-qos-main", low = home + "ios-qos-main-low", keep = home + "ios-qos-main-keep",
+        dflt = home + "ios-qos-main-default"; // (Claude 2026-10-20: default even with -low on: the reversed order of a -low A/B)
+    const int want = recomp_ios_switches_access(ui.c_str(), F_OK) == 0 ? 1 : recomp_ios_switches_access(dflt.c_str(), F_OK) == 0 ? 0 :
+        recomp_ios_switches_access(low.c_str(), F_OK) == 0 ? 2 :
+        recomp_ios_switches_access(keep.c_str(), F_OK) == 0 ? 0 :
+        // no switch: utility while the frame is GPU-bound (100 % and above; c199/c200: utility -2.0 / -4.4 ms in both phase
+        // orders), default below 100 %, where main itself limits (c197/c198: default -5.2 ms pooled, 79 vs 54 % in band)
+        recomp_ios_render_sixteenths.load(std::memory_order_relaxed) < 16 ? 0 : 2;
+    if (want == applied) return;
+    const int r = pthread_set_qos_class_self_np(want == 1 ? QOS_CLASS_USER_INTERACTIVE : want == 2 ? QOS_CLASS_UTILITY : QOS_CLASS_DEFAULT, 0);
+    std::fprintf(stderr, "APPLE_IOS_QOS thread=main-wait token=63001000 want=%d result=%d\n", want, r);
+    applied = want;
+}
+}
+#define RECOMP_IOS_MAIN_QOS_FROM_WAIT() iosMainQosFromWait()
+#else
+#define RECOMP_IOS_MAIN_QOS_FROM_WAIT() ((void)0)
+#endif
 // async-wake: the switch state (set by the renderer's window poll, awWindow) and the waker's tid (trace_runner's ranking).
 extern "C" { std::atomic<unsigned> recomp_aw_mode{0}; std::atomic<unsigned> recomp_aw_spin_us{500}; std::atomic<int> recomp_aw_waker_tid{0}; }
 // async-wake: notifies handed to the waker and not yet completed (the renderer keeps the FIFO path on until they drain).
@@ -181,7 +249,7 @@ __attribute__((format(printf, 1, 2), noinline)) void executorLogQuiet(const char
     recomp::diag::quietLogEmit(4 /* ANDROID_LOG_INFO */, "RecompRenderer", format, arguments);
     va_end(arguments);
 }
-#include "play_executor_log.h" // play-config-2 (v527): in the play build the supervisor block's line types take executorLogQuiet (nothing without -DRECOMP_PLAY_BUILD=1)
+
 std::string_view boundedCheckpointLabel(const char* label, std::size_t length) noexcept {
     return label ? std::string_view(label, std::min(length, MaximumCheckpointLabelBytes)) : std::string_view{};
 }
@@ -261,9 +329,53 @@ void setGuestThreadDomainPolicy(GuestThreadDomainPolicy policy) {
     domainPolicy = std::move(policy);
 }
 
+// ios-wait-slots (Claude 2026-10-21; DIAGNOSTIC, two relaxed stores per parallel wait): c412 hung with every guest thread in
+// waitUntil. Each host thread that waits takes one slot (token, the object the registry set in timeline::waitObject, the wait
+// start). recomp_ios_wait_slots() lists the waiting ones with the first 16 bytes of the object when it is a guest address; the
+// stall watcher (ios_sampler.h) prints them after each capture (APPLE_IOS_STALL_WAIT).
+namespace iosWaits {
+struct Slot { std::atomic<std::uint32_t> token{0}, object{0}; std::atomic<std::uint64_t> sinceNs{0}; };
+inline Slot slots[160]; inline std::atomic<unsigned> used{0}; inline std::atomic<const std::uint8_t*> guestBase{nullptr};
+inline std::uint64_t nowNs() noexcept {return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count());}
+struct Scope {
+    Slot* slot=nullptr;
+    explicit Scope(std::uint32_t token) noexcept {
+        static thread_local int mine=-1;
+        if(mine<0){const unsigned i=used.fetch_add(1,std::memory_order_relaxed);mine=i<160?int(i):160;}
+        if(mine>=160)return;
+        slot=&slots[mine];slot->token.store(token,std::memory_order_relaxed);
+        slot->object.store(recomp::diag::timeline::waitObject,std::memory_order_relaxed);
+        slot->sinceNs.store(nowNs(),std::memory_order_release);
+    }
+    ~Scope(){if(slot)slot->sinceNs.store(0,std::memory_order_release);}
+};
+}
+extern "C" unsigned recomp_ios_wait_slots(std::uint32_t* tokens,std::uint32_t* objects,std::uint64_t* waitedNs,std::uint8_t (*head)[16],unsigned max) noexcept {
+    const auto now=iosWaits::nowNs();unsigned n=0;
+    const auto* base=iosWaits::guestBase.load(std::memory_order_relaxed);
+    const unsigned used=std::min(iosWaits::used.load(std::memory_order_relaxed),160u);
+    for(unsigned i=0;i<used && n<max;++i) {
+        const auto since=iosWaits::slots[i].sinceNs.load(std::memory_order_acquire);if(!since)continue;
+        tokens[n]=iosWaits::slots[i].token.load(std::memory_order_relaxed);objects[n]=iosWaits::slots[i].object.load(std::memory_order_relaxed);
+        waitedNs[n]=now>since?now-since:0;std::memset(head[n],0,16);
+        if(base && objects[n]>=0x10000u && objects[n]<0xFFFF0000u)std::memcpy(head[n],base+objects[n],16);
+        ++n;
+    }
+    return n;
+}
+
+// ios-stall-mem (Claude 2026-10-21; DIAGNOSTIC): raw guest bytes for the stall watcher (RECOMP_IOS_STALL_MEM), e.g. the game's
+// job-completion queue main waited on in the c322/c412 hangs (0x83CB64F8: outstanding counter, ring, waiting flag; event at +4112).
+extern "C" unsigned recomp_ios_guest_read(std::uint32_t address,std::uint8_t* out,unsigned size) noexcept {
+    const auto* base=iosWaits::guestBase.load(std::memory_order_relaxed);
+    if(!base || !size || size>256 || address<0x10000u || address>0xFFFF0000u-size)return 0;
+    std::memcpy(out,base+address,size);return size;
+}
 void noteGuestThreadStart(std::uint32_t token, std::uint32_t entry, std::uint32_t context,
                           std::uint32_t xapiStartup, const std::uint8_t* guestBase) noexcept {
     pendingStartNote = StartNote{token, entry, context, xapiStartup, guestBase};
+    if(guestBase)iosWaits::guestBase.store(guestBase,std::memory_order_relaxed); // (ios-wait-slots)
 }
 
 void noteGuestWaitSite(const char* site) noexcept { pendingWaitSite = site; }
@@ -571,6 +683,7 @@ std::size_t GuestCooperativeExecutor::selectTask(std::size_t after, std::unique_
 
 bool GuestCooperativeExecutor::waitUntil(const Ready& ready,
         std::optional<std::chrono::steady_clock::time_point> deadline) {
+    RECOMP_IOS_MAIN_QOS_FROM_WAIT();
     return waitUntilImpl(ready, deadline, false);
 }
 
@@ -774,7 +887,7 @@ std::uint32_t attentionBits() noexcept {
     return __atomic_load_n(&recomp_guest_checkpoint_attention, __ATOMIC_ACQUIRE);
 }
 std::uint64_t elapsedNs(Clock::time_point since) noexcept {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(::recomp::native_clock::now(since) - since).count(); // native-imports (native_clock_quiet.h): 0 for a zero stamp, without a clock read
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - since).count();
     return ns > 0 ? static_cast<std::uint64_t>(ns) : 0;
 }
 
@@ -787,7 +900,7 @@ struct MaxCounter {
 };
 
 struct Counters {
-    RECOMP_PLAY_COUNTER_UINT64 slowCheckpoints{0}; std::atomic<std::uint64_t> permitAcquired{0}, permitContended{0}, permitWaitNs{0}, permitHoldNs{0};
+    std::atomic<std::uint64_t> slowCheckpoints{0}, permitAcquired{0}, permitContended{0}, permitWaitNs{0}, permitHoldNs{0};
     MaxCounter permitWaitMaxNs, permitHoldMaxNs, maxConcurrent;
     std::atomic<std::uint64_t> rotations{0}, parks{0}, wakeNotified{0}, wakePoll{0}, wakeDeadline{0}, lateWakeups{0};
     std::atomic<std::uint64_t> wakeCalls{0}, wakeAllCalls{0}, safepointParks{0}, safepointNs{0};
@@ -797,8 +910,8 @@ struct Counters {
     std::atomic<std::uint64_t> v346SpinHits{0}, v346SpinMisses{0}; // v346: main's pre-park spins that saw a wake / did not
     MaxCounter safepointMaxNs, exclusiveMaxNs;
     std::array<std::atomic<std::uint64_t>, 4> exclusiveCount{}, exclusiveNs{};
-    std::atomic<std::uint64_t> probes{0}, probesConfirmed{0}, boostsParked{0}, boostsPending{0}; RECOMP_PLAY_COUNTER_UINT64 delays{0}; // play-config-2 (v527; play_build.h): slowCheckpoints, delays and fastYields are counts that only RENDER_DIAG_EXEC* lines and guestParallelStats() read; in the play build fetch_add on them does nothing (std::atomic without the flag)
-    RECOMP_PLAY_COUNTER_UINT64 fastYields{0}; // v117: zero-length delays that kept the permit (no scheduler lock)
+    std::atomic<std::uint64_t> probes{0}, probesConfirmed{0}, boostsParked{0}, boostsPending{0}, delays{0};
+    std::atomic<std::uint64_t> fastYields{0}; // v117: zero-length delays that kept the permit (no scheduler lock)
     // v29 lock gate (runNativeLockedGate): count, time inside, time waiting for the lock.
     std::atomic<std::uint64_t> lockGates{0}, lockGateNs{0}, lockGateWaitNs{0};
     MaxCounter lockGateMaxNs;
@@ -1014,7 +1127,7 @@ unsigned schedRole() noexcept {
            t->token == 0x640b1000u ? SchedRoleTile : t->token == 0x64141000u ? SchedRoleAudio : SchedRoleOther;
 }
 void schedLockContended(std::unique_lock<std::mutex>& lock, SchedLockSite& site) {
-    const auto started = ::recomp::native_clock::stamp(); // native-imports (native_clock_quiet.h): feeds only this site's wait figures
+    const auto started = Clock::now();
     bool spun = false;
     if (schedSpinEnabled()) {
         for (unsigned attempt = 0; attempt < 256 && !spun; ++attempt) {
@@ -1111,7 +1224,7 @@ void grantLocked(ParallelState& S, Task& t) {
     ++S.running;
     S.counters.maxConcurrent.update(S.running);
     t.state = TaskState::Running;
-    t.permitSince = ::recomp::native_clock::stamp(); // native-imports (native_clock_quiet.h): read back only by the hold accounting
+    t.permitSince = Clock::now();
     S.counters.permitAcquired.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1730,7 +1843,9 @@ bool parallelWait(ParallelState& S, Task& t, const Ready& ready, std::optional<C
             unsigned k = 0;
             while (__atomic_load_n(&t.wakeSeq, __ATOMIC_ACQUIRE) == seq && __atomic_load_n(&S.epoch, __ATOMIC_ACQUIRE) == epoch) {
                 if ((++k & 15u) == 0 && Clock::now() >= until) break;
-                k |= recomp_park_watch_pause(&t.wakeSeq, seq); // park-watch (v531): the yield hint as before, or the idle wait
+#if defined(__aarch64__)
+                asm volatile("yield");
+#endif
             }
             RECOMP_SCHED_RELOCK(lock);
             if (t.wakeSeq != seq || S.epoch != epoch) S.counters.v346SpinHits.fetch_add(1, std::memory_order_relaxed);
@@ -2317,7 +2432,51 @@ void dumpTasksForFreeze(ParallelState& S) {
     executorLog("RENDER_DIAG_FREEZE_DUMP tasks=%zu", rows.size());
 }
 
+// v199: native stacks at a stall, independent of the supervisor (which needs the scheduler lock to run at all).
+// Every 5 s it samples the live tasks' guest entry counts, taking S.sched only by try_lock (up to 1 s). Three samples
+// (10 s) without any task making an entry, or two samples in a row without the scheduler lock, dump every thread's
+// native stack (diag_native_stacks.h) once per stall; progress re-arms it. files/private-trace/diag-native-stacks-now
+// forces one dump per appearance (the file is left in place; remove it to re-arm). No effect while tasks progress.
+void stallWatchdogMain(ParallelState& S, const std::atomic<bool>& stop) {
+#if defined(__aarch64__) && defined(__linux__)
+    std::uint64_t lastEntries = ~std::uint64_t{0};
+    unsigned sameSamples = 0, lockMisses = 0;
+    bool dumped = false, forcedSeen = false;
+    const auto dump = [](const char* why, unsigned long long entries) {
+        executorLog("RENDER_DIAG_NATIVE_STACKS_BEGIN reason=%s entries=%llu", why, entries);
+        const int captured = recomp::diag::nativestacks::dumpAll([](const char* line) { executorLog("%s", line); });
+        executorLog("RENDER_DIAG_NATIVE_STACKS_END captured=%d", captured);
+    };
+    while (!stop.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 50 && !stop.load(std::memory_order_acquire); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (stop.load(std::memory_order_acquire)) return;
+        const bool forced = diagSwitchPresent(RECOMP_DIAG_SWITCH("diag-native-stacks-now"));
+        if (forced && !forcedSeen) dump("forced", 0);
+        forcedSeen = forced;
+        bool locked = false;
+        for (int i = 0; i < 100 && !(locked = S.sched.try_lock()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!locked) {
+            sameSamples = 0;
+            if (++lockMisses >= 2 && !dumped) { dumped = true; dump("sched-lock", 0); }
+            continue;
+        }
+        std::uint64_t entries = 0;
+        for (const auto& task : S.tasks) if (task && !task->finished) entries += task->entries;
+        S.sched.unlock();
+        lockMisses = 0;
+        if (entries != lastEntries) { lastEntries = entries; sameSamples = 0; dumped = false; continue; }
+        if (++sameSamples >= 2 && !dumped) { dumped = true; dump("no-entries", static_cast<unsigned long long>(entries)); }
+    }
+#else
+    (void)S; (void)stop;
+#endif
+}
+
 void supervisorMain(ParallelState& S) {
+    std::atomic<bool> watchdogStop{false};
+    std::thread watchdog([&S, &watchdogStop] { stallWatchdogMain(S, watchdogStop); });
+    struct JoinWatchdog { std::atomic<bool>& stop; std::thread& thread;
+        ~JoinWatchdog() { stop.store(true, std::memory_order_release); if (thread.joinable()) thread.join(); } } joinWatchdog{watchdogStop, watchdog};
     RECOMP_SCHED_LOCK(lock);
     Clock::time_point lastFreezeDump{};
     for (;;) {
@@ -2382,19 +2541,6 @@ extern "C" bool recomp_mw_domain_contended() noexcept {
     if (!t || t->domain >= PermitDomains) return false;
     return parallelState().domains[t->domain].queued.load(std::memory_order_relaxed) != 0;
 }
-
-// scene-wait (scene_wait_sw.h): true while neither the calling task's next zero-length delay (delayUntil's fast path) nor
-// its next entry checkpoint (parallelCheckpoint) would act: no attention bit (stop, exclusive scope, children to arm, idle),
-// no task queued for its permit domain, no children, no reschedule hint. The Sleep(0) watch of main's scene-item poll
-// returns to the guest as soon as this is false, so the guest's next Sleep(0) / entry runs those paths as before.
-// scene-wait:quiet:begin (host test: tests/extract_glue.py compiles the text between these markers)
-extern "C" bool recomp_sw_quiet() noexcept {
-    const Task* t = currentTask;
-    if (!t || t->domain >= PermitDomains) return false;
-    return attentionBits() == 0 && parallelState().domains[t->domain].queued.load(std::memory_order_relaxed) == 0 &&
-           t->children.empty() && !t->rescheduleHint;
-}
-// scene-wait:quiet:end
 
 thread_local GuestCooperativeExecutor::Current* GuestCooperativeExecutor::current_ = nullptr; // Unused here.
 
@@ -2693,10 +2839,12 @@ bool GuestCooperativeExecutor::setPriority(std::uint32_t token, std::int32_t pri
 
 bool GuestCooperativeExecutor::waitUntil(const Ready& ready,
         std::optional<std::chrono::steady_clock::time_point> deadline) {
+    RECOMP_IOS_MAIN_QOS_FROM_WAIT();
     auto& S = parallelState();
     Task* t = liveTask(this);
     if (!t || stopObserved(S, *t) || t->scopeActive || (S.handoffActive.load(std::memory_order_acquire) && domainStoppedView(S, t->domain)) || /* v193 */ !ready ||
         !reserveWait(S)) return false;
+    [[maybe_unused]] iosWaits::Scope iosWaitSlot(recomp::bootstrap::currentGuestThreadToken()); // (ios-wait-slots)
     return parallelWait(S, *t, ready, deadline);
 }
 
@@ -3144,30 +3292,3 @@ extern "C" void recomp_guest_execution_checkpoint_slow(std::int32_t* countdown, 
     parallelCheckpoint(S, *t, reinterpret_cast<GuestCheckpointCountdown*>(countdown), view);
 }
 #endif
-
-// park-watch (park_watch.h, attempt v531): the switch word and the watch's one pause. Out of line and behind no branch in
-// parallelWait: that function keeps its control flow and its profile record. At global scope, after every namespace of this file.
-extern "C" { std::atomic<bool> recomp_park_watch_idle{false}; }
-namespace recomp::park_watch { Counters& counters() noexcept { static Counters c; return c; } }
-extern "C" __attribute__((noinline)) unsigned recomp_park_watch_pause(const std::uint64_t* wakeSeq, std::uint64_t seen) noexcept {
-    auto& c = recomp::park_watch::counters();
-#if defined(__aarch64__)
-    if (recomp_park_watch_idle.load(std::memory_order_relaxed)) {
-        std::uint64_t marked;
-        asm volatile("ldxr %0, [%1]" : "=&r"(marked) : "r"(wakeSeq) : "memory"); // a read that marks the word
-        if (recomp::park_watch::waitsFor(marked, seen)) {
-            asm volatile("wfe" ::: "memory"); // ends at the waker's store to the word, or at the event stream's next tick
-            c.idleWaits.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            asm volatile("clrex" ::: "memory");
-            c.movedAtMark.fetch_add(1, std::memory_order_relaxed);
-        }
-        return recomp::park_watch::pauseBits(true);
-    }
-    asm volatile("yield");
-#else
-    (void)wakeSeq; (void)seen;
-#endif
-    c.yields.store(c.yields.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); // main is the only writer
-    return recomp::park_watch::pauseBits(false);
-}

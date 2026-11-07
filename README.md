@@ -8,22 +8,24 @@ No game is included. Supply your own two disc images. Generated game code, impor
 
 ## Source layout
 
-- `runtime/`: the shared runtime and authored shaders.
+- `app/duo/`: the UIKit launcher and application lifecycle.
+- `platform/apple/`: Metal presentation, audio, input and Apple platform support.
+- `runtime/`: the emulation runtime and authored shaders.
 - `runtime/host`, `runtime/bridge`, `runtime/gpu`: native dependencies moved out of the former Android/probe projects.
 - `resources/duo/`: the Duo app template, font and icon.
 - `tools/own_disc/`: the Mac build, verification and signing stages.
 - `tools/fp_codegen`, `tools/rpf7_inventory`: code and shader translation support.
 
-The Android NDK is still a build dependency: the current pipeline uses its host shader tools and an intermediate decoder build. It does not produce an Android application.
+The source build fetches pinned compiler/SDK dependencies. NDK shader tools are retained; they do not produce an Android application.
 
 ## Build and test
 
-The build needs an Apple-silicon Mac, Xcode, the matching upstream Duo source kit and your own discs. The kit and generated inputs are not committed here. [Build notes](docs/BUILDING.md).
+Build from this checkout on an Apple-silicon Mac with Xcode, CMake, Ninja, Python and your own discs. No recovered source kit or prebuilt game runtime is needed. [Source build instructions](docs/BUILDING.md).
 
 ```sh
-cmake -S runtime/tests -B build/runtime -DCMAKE_BUILD_TYPE=Release
-cmake --build build/runtime
-ctest --test-dir build/runtime --output-on-failure
+cmake -S . -B build/tests -DFIVEPOCKET_BUILD_DUO=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/tests
+ctest --test-dir build/tests --output-on-failure
 python3 tools/release/run_checks.py
 ```
 

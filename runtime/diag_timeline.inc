@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 // Attempt v159: the timeline probe (diag_timeline.h), included once by guest_cooperative_executor.cpp.
 #include "diag_timeline.h"
 #include <array>
@@ -43,7 +46,16 @@ void record(Kind kind, std::uint16_t arg, std::uint32_t extra) noexcept { record
 void recordAt(std::uint64_t ns, Kind kind, std::uint16_t arg, std::uint32_t extra) noexcept {
     const auto i = next.fetch_add(1, std::memory_order_relaxed);
     if (i >= Capacity) { armed.store(false, std::memory_order_relaxed); return; }
+#if defined(__APPLE__)
+    // RTL1 has a 32-bit field. Use the process-local Mach thread port name;
+    // do not truncate Apple's 64-bit kernel thread ID. Diagnostic identity only.
+    if (!threadTid) threadTid = std::uint32_t(pthread_mach_thread_np(pthread_self()));
+#if defined(APPLE_TIMELINE_MUTANT_ZERO_TID)
+    threadTid = 0;
+#endif
+#else
     if (!threadTid) threadTid = std::uint32_t(::syscall(SYS_gettid));
+#endif
     ring[i] = Rec{ns, threadTid, threadToken, std::uint16_t(kind), arg, extra};
     if (written.fetch_add(1, std::memory_order_acq_rel) + 1 == Capacity) { // the last record: write the ring once
         armed.store(false, std::memory_order_relaxed);

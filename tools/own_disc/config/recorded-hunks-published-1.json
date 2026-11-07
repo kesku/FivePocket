@@ -1,0 +1,2235 @@
+{
+ "schema": "gta5-recorded-hunks/2",
+ "chunks": {
+  "10": [
+   {
+    "function": "822DBF20",
+    "offset": 22,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Recover only the original local case, never the table-as-code body.",
+     "\tif (ctx.r4.u32 == 0 && ctx.ctr.u32 == 0x822DC078U) {",
+     {
+      "copy": [
+       "822C23E8",
+       15,
+       2
+      ],
+      "indent": 1
+     },
+     {
+      "copy": [
+       "822DBF44",
+       158,
+       18
+      ],
+      "indent": 1
+     }
+    ]
+   }
+  ],
+  "13": [
+   {
+    "function": "82329810",
+    "offset": 22,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Verified original local field-combine case; preserve live selector/CTR pairing.",
+     "\tif ((ctx.r11.u32 == 0 || ctx.r11.u32 == 1 || ctx.r11.u32 == 3 || ctx.r11.u32 == 11 || ctx.r11.u32 == 12 || ctx.r11.u32 == 13) && ctx.ctr.u32 == 0x8232986CU) {",
+     {
+      "copy": [
+       "82329834",
+       30,
+       11
+      ],
+      "indent": 1
+     }
+    ]
+   }
+  ],
+  "18": [
+   {
+    "function": "HEADER",
+    "offset": 1,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "extern bool finishNativeInlineBegin(PPCContext&,uint8_t*);",
+     "extern bool finishNativeInlineIndexedBegin(PPCContext&,uint8_t*);",
+     "extern bool usesNativeShaderBinding(std::uint32_t);"
+    ]
+   },
+   {
+    "function": "823B6718",
+    "offset": 22,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\tif (ctx.r11.u32 == 0 && ctx.ctr.u32 == 0x823B6768U) { sub_82911050(ctx, base); return; }"
+    ]
+   },
+   {
+    "function": "823BA608",
+    "offset": 382,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Native API allocation begins only after original ordered state preparation.",
+     "\tif (finishNativeInlineBegin(ctx,base)) {",
+     "\t\tctx.r1.s64 += 176;",
+     {
+      "copy": [
+       "823BA608",
+       719,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "823B6718",
+       9,
+       2
+      ]
+     }
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\tconst bool nativeShaderBinding=usesNativeShaderBinding(ctx.r3.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 96,
+    "old": {
+     "count": 1,
+     "sha256": "c08babdf847108309f01f86bdd89fabaa506433c5bcf2b6ab7636c759c71d950"
+    },
+    "new": [
+     "\tif (nativeShaderBinding) ctx.r3.u64 = PPC_LOAD_U32(ctx.r31.u32 + 48);",
+     "\telse sub_8235E218(ctx, base);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 104,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 108,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 115,
+    "old": {
+     "count": 1,
+     "sha256": "7ec8bb41d7890a5b4328910db36bca319fce1f99d8e7d99be24a4e20128af242"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ctx.r31.u32 + 48, ctx.r3.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 279,
+    "old": {
+     "count": 1,
+     "sha256": "c08babdf847108309f01f86bdd89fabaa506433c5bcf2b6ab7636c759c71d950"
+    },
+    "new": [
+     "\tif (nativeShaderBinding) ctx.r3.u64 = PPC_LOAD_U32(ctx.r31.u32 + 48);",
+     "\telse sub_8235E218(ctx, base);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 283,
+    "old": {
+     "count": 1,
+     "sha256": "03475aebe82d7f3692dcb73b8c0094d1a4c325a1de7841c8703bbb3f1473fba2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r14.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 313,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 325,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 328,
+    "old": {
+     "count": 1,
+     "sha256": "7ec8bb41d7890a5b4328910db36bca319fce1f99d8e7d99be24a4e20128af242"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ctx.r31.u32 + 48, ctx.r3.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 865,
+    "old": {
+     "count": 1,
+     "sha256": "c08babdf847108309f01f86bdd89fabaa506433c5bcf2b6ab7636c759c71d950"
+    },
+    "new": [
+     "\tif (nativeShaderBinding) ctx.r3.u64 = PPC_LOAD_U32(ctx.r31.u32 + 48);",
+     "\telse sub_8235E218(ctx, base);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 877,
+    "old": {
+     "count": 1,
+     "sha256": "521315ba51d5d8d71be7504928b342d781d557ed411321d079aa2a827b313ab3"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r7.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 891,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 897,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 903,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 913,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 921,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 938,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 942,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 959,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 963,
+    "old": {
+     "count": 1,
+     "sha256": "4e701b4150e50b6cf745c44c59dbce8ca2ebee5e20cdc77c2893ac4545b6bee2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r8.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 967,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 986,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 996,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1013,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1017,
+    "old": {
+     "count": 1,
+     "sha256": "4e701b4150e50b6cf745c44c59dbce8ca2ebee5e20cdc77c2893ac4545b6bee2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r8.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1021,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1040,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1048,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1054,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1073,
+    "old": {
+     "count": 1,
+     "sha256": "4e701b4150e50b6cf745c44c59dbce8ca2ebee5e20cdc77c2893ac4545b6bee2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r8.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1077,
+    "old": {
+     "count": 1,
+     "sha256": "424f3f5c543ed75b39568e554b4e9025feb2231dcc966c801eae380ec8edee11"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r6.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1081,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1085,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1108,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1136,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1150,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1164,
+    "old": {
+     "count": 1,
+     "sha256": "521315ba51d5d8d71be7504928b342d781d557ed411321d079aa2a827b313ab3"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r7.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1182,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1190,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1214,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1228,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1251,
+    "old": {
+     "count": 1,
+     "sha256": "03475aebe82d7f3692dcb73b8c0094d1a4c325a1de7841c8703bbb3f1473fba2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r14.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1277,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1291,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1303,
+    "old": {
+     "count": 1,
+     "sha256": "521315ba51d5d8d71be7504928b342d781d557ed411321d079aa2a827b313ab3"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r7.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1313,
+    "old": {
+     "count": 1,
+     "sha256": "50e62940a854677096cb7f3f02492a5bb9e5329e4e8c22deba0c38268a9f47d0"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r9.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1317,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1323,
+    "old": {
+     "count": 1,
+     "sha256": "e5255c0f31ea0a6fe1d2d833a568abb0c30953af88012692aaa3b642b49bb677"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r10.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1326,
+    "old": {
+     "count": 1,
+     "sha256": "b6b65ebb50267547b521ad6900d31e4f2f34d796fc7c4da4761a2a277901fcab"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ctx.r31.u32 + 48, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1346,
+    "old": {
+     "count": 1,
+     "sha256": "c08babdf847108309f01f86bdd89fabaa506433c5bcf2b6ab7636c759c71d950"
+    },
+    "new": [
+     "\tif (nativeShaderBinding) ctx.r3.u64 = PPC_LOAD_U32(ctx.r31.u32 + 48);",
+     "\telse sub_8235E218(ctx, base);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1352,
+    "old": {
+     "count": 1,
+     "sha256": "03475aebe82d7f3692dcb73b8c0094d1a4c325a1de7841c8703bbb3f1473fba2"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r14.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1382,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1394,
+    "old": {
+     "count": 1,
+     "sha256": "6a5fa5201f85172a59b4cfa0110c912e1455e841d9c7a020a8ae767ea9017b85"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ea, ctx.r11.u32);"
+    ]
+   },
+   {
+    "function": "823BAAC8",
+    "offset": 1401,
+    "old": {
+     "count": 1,
+     "sha256": "7ec8bb41d7890a5b4328910db36bca319fce1f99d8e7d99be24a4e20128af242"
+    },
+    "new": [
+     "\tif (!nativeShaderBinding) PPC_STORE_U32(ctx.r31.u32 + 48, ctx.r3.u32);"
+    ]
+   },
+   {
+    "function": "823C1088",
+    "offset": 397,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Native resource allocation after original ordered state/shader preparation.",
+     "\tif (finishNativeInlineIndexedBegin(ctx,base)) {",
+     "\t\tctx.r1.s64 += 224;",
+     {
+      "copy": [
+       "823C1088",
+       798,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "823B6718",
+       9,
+       2
+      ]
+     }
+    ]
+   }
+  ],
+  "84": [
+   {
+    "function": "82830120",
+    "offset": 19,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\tif (ctx.r11.u32 == 0 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 1 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 2 && ctx.ctr.u32 == 0x82830170U) { sub_82830040(ctx, base); return; }",
+     "\tif (ctx.r11.u32 == 4 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 5 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 6 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 7 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 8 && ctx.ctr.u32 == 0x82830188U) return;",
+     "\tif (ctx.r11.u32 == 9 && ctx.ctr.u32 == 0x82830188U) return;"
+    ]
+   }
+  ],
+  "209": [
+   {
+    "function": "82EF4CBC",
+    "offset": 27,
+    "old": {
+     "count": 1,
+     "sha256": "e269dac62262277d82394c29f7af939ee9eda7693c67910d1da8105896380fc6"
+    },
+    "new": [
+     "\t// Original image-verified shared-tail switch. Dispatch on live CTR;",
+     "\t// unknown/mutated targets still use the rejecting indirect resolver.",
+     "\tswitch(ctx.ctr.u32) {",
+     "\tcase 0x82EF4D1CU:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4CDC",
+       51,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D30U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D30",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D44U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D44",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D58U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D58",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D6CU:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D6C",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D80U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D80",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4D94U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4D94",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4DA8U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4DA8",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4DBCU:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4DBC",
+       19,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4E18U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4DD0",
+       63,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4E44U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4DD0",
+       92,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4EF8U:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       1
+      ],
+      "squeeze": 2
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       65,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tif(!ctx.cr6.lt)goto menu_finish;",
+     {
+      "copy": [
+       "82EF4DD0",
+       194,
+       1
+      ],
+      "squeeze": 2
+     },
+     "\t\tgoto menu_append;",
+     "\tcase 0x82EF4F18U:goto menu_finish;",
+     "\tdefault:PPC_CALL_INDIRECT_FUNC(ctx.ctr.u32);return;",
+     {
+      "copy": [
+       "82EF4CBC",
+       15,
+       1
+      ]
+     },
+     "menu_append:",
+     "\tctx.r10.u64=(ctx.r11.u32<<2)&0xfffffffcU;",
+     "\tctx.r11.s64+=1;",
+     {
+      "copy": [
+       "82EF4CBC",
+       12,
+       1
+      ],
+      "squeeze": 1
+     },
+     {
+      "copy": [
+       "82EF4B54",
+       85,
+       1
+      ],
+      "squeeze": 1
+     },
+     "menu_finish:",
+     {
+      "copy": [
+       "82EF4CBC",
+       7,
+       7
+      ],
+      "squeeze": 1
+     }
+    ]
+   }
+  ],
+  "261": [
+   {
+    "function": "831B16A8",
+    "offset": 20,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Verified first switch case at 0x831B1744 (table data is not code).",
+     "\tif (ctx.r4.u32 == 0 && ctx.ctr.u32 == 0x831B1744U) {",
+     {
+      "copy": [
+       "831B07A0",
+       12,
+       1
+      ],
+      "indent": 1
+     },
+     "\t\tPPC_STORE_U8(ctx.r3.u32, ctx.r11.u8);",
+     {
+      "copy": [
+       "831B16A8",
+       7,
+       2
+      ]
+     }
+    ]
+   }
+  ],
+  "262": [
+   {
+    "function": "831B93C0",
+    "offset": 27,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Original shared tail: lwz r3,12(r11); blr. Bytes verified in title image.",
+     "\tif (ctx.r10.u32 == 0 && ctx.ctr.u32 == 0x831B9460U) {",
+     {
+      "copy": [
+       "831B944C",
+       13,
+       1
+      ],
+      "indent": 1
+     },
+     {
+      "copy": [
+       "831B93C0",
+       14,
+       2
+      ]
+     },
+     "\t// Original short case at 0x831B9414; retain live target validation.",
+     "\tif ((ctx.r10.u32 == 1) && ctx.ctr.u32 == 0x831B9414U) {",
+     {
+      "copy": [
+       "831B93EC",
+       22,
+       7
+      ],
+      "indent": 1
+     }
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 2,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C00:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 4,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C04:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 6,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C08:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 8,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C0C:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 10,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C10:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 11,
+    "old": {
+     "count": 4,
+     "sha256": "404bdea166ea02970914ec575af898d31812099564e98edc1548a705e9d87144"
+    },
+    "new": [
+     "\tif (ctx.cr6.gt) goto loc_831B9DBC;",
+     "loc_831B9C14:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 17,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C18:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 19,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C1C:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 21,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C20:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 23,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "loc_831B9C24:"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 25,
+    "old": {
+     "count": 1,
+     "sha256": "c0d222df85cd206ef25e0ae23d9c2ca11335aba9fbcdb1cbb751f0dfb67d5436"
+    },
+    "new": [
+     "loc_831B9C28:",
+     {
+      "copy": [
+       "831B9C00",
+       25,
+       1
+      ],
+      "indent": 0,
+      "trim": true
+     }
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 27,
+    "old": {
+     "count": 71,
+     "sha256": "f2d55c7380cb2e470ea60aa21a9b7750e9ff880c7fd09be6ef599ed1a0fd2e48"
+    },
+    "new": [
+     "\tcase 0: if (ctx.ctr.u32 == 0x831B9C88U) goto loc_831B9C88; break;",
+     "\tcase 1: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 2: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 3: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 4: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 5: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 6: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 7: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 8: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 9: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 10: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 11: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 12: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 13: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 14: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 15: if (ctx.ctr.u32 == 0x831B9C94U) goto loc_831B9C94; break;",
+     "\tcase 16: if (ctx.ctr.u32 == 0x831B9C88U) goto loc_831B9C88; break;",
+     "\tcase 17: if (ctx.ctr.u32 == 0x831B9CA4U) goto loc_831B9CA4; break;",
+     "\tcase 18: if (ctx.ctr.u32 == 0x831B9CB4U) goto loc_831B9CB4; break;",
+     "\tcase 19: if (ctx.ctr.u32 == 0x831B9CC0U) goto loc_831B9CC0; break;",
+     "\tcase 20: if (ctx.ctr.u32 == 0x831B9CD0U) goto loc_831B9CD0; break;",
+     "\tcase 21: if (ctx.ctr.u32 == 0x831B9CDCU) goto loc_831B9CDC; break;",
+     "\tcase 22: if (ctx.ctr.u32 == 0x831B9CDCU) goto loc_831B9CDC; break;"
+    ]
+   },
+   {
+    "function": "831B9C00",
+    "offset": 99,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     {
+      "copy": [
+       "831B8B38",
+       259,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "831B8AD0",
+       42,
+       1
+      ]
+     },
+     "loc_831B9C88:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9C8C:",
+     {
+      "copy": [
+       "831B9C2C",
+       50,
+       2
+      ]
+     },
+     "loc_831B9C90:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9C94:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9C98:",
+     {
+      "copy": [
+       "831B9C94",
+       4,
+       2
+      ]
+     },
+     "loc_831B9C9C:",
+     {
+      "copy": [
+       "831B9C94",
+       6,
+       2
+      ]
+     },
+     "loc_831B9CA0:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9CA4:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9CA8:",
+     {
+      "copy": [
+       "831B9CA4",
+       4,
+       2
+      ]
+     },
+     "loc_831B9CAC:",
+     {
+      "copy": [
+       "831B9CA4",
+       6,
+       2
+      ]
+     },
+     "loc_831B9CB0:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9CB4:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9CB8:",
+     {
+      "copy": [
+       "831B9CB4",
+       4,
+       2
+      ]
+     },
+     "loc_831B9CBC:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9CC0:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9CC4:",
+     {
+      "copy": [
+       "831B8AD0",
+       25,
+       2
+      ]
+     },
+     "loc_831B9CC8:",
+     {
+      "copy": [
+       "831B9CC0",
+       6,
+       2
+      ]
+     },
+     "loc_831B9CCC:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9CD0:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9CD4:",
+     {
+      "copy": [
+       "831B8B38",
+       222,
+       2
+      ]
+     },
+     "loc_831B9CD8:",
+     {
+      "copy": [
+       "831B9C2C",
+       52,
+       1
+      ]
+     },
+     "\tgoto loc_831B9CE4;",
+     "loc_831B9CDC:",
+     {
+      "copy": [
+       "831B9C2C",
+       48,
+       2
+      ]
+     },
+     "loc_831B9CE0:",
+     {
+      "copy": [
+       "831B9CDC",
+       4,
+       2
+      ]
+     },
+     "loc_831B9CE4:",
+     {
+      "copy": [
+       "831B9CDC",
+       6,
+       2
+      ]
+     },
+     "loc_831B9CE8:",
+     {
+      "copy": [
+       "831B9CDC",
+       8,
+       2
+      ]
+     },
+     "loc_831B9CEC:",
+     {
+      "copy": [
+       "831B9CDC",
+       10,
+       2
+      ]
+     },
+     "loc_831B9CF0:",
+     {
+      "copy": [
+       "831B9CDC",
+       12,
+       2
+      ]
+     },
+     "loc_831B9CF4:",
+     {
+      "copy": [
+       "831B9C00",
+       10,
+       1
+      ]
+     },
+     "\tif (ctx.cr6.gt) goto loc_831B9DBC;",
+     "loc_831B9CF8:",
+     {
+      "copy": [
+       "831B9C00",
+       15,
+       2
+      ]
+     },
+     "loc_831B9CFC:",
+     {
+      "copy": [
+       "831B9CDC",
+       21,
+       2
+      ]
+     },
+     "loc_831B9D00:",
+     {
+      "copy": [
+       "831B9CDC",
+       23,
+       2
+      ]
+     },
+     "loc_831B9D04:",
+     {
+      "copy": [
+       "831B9C00",
+       21,
+       2
+      ]
+     },
+     "loc_831B9D08:",
+     {
+      "copy": [
+       "831B9C00",
+       23,
+       2
+      ]
+     },
+     "loc_831B9D0C:",
+     {
+      "copy": [
+       "831B9C00",
+       25,
+       1
+      ],
+      "indent": 0,
+      "trim": true
+     },
+     {
+      "copy": [
+       "831B9CDC",
+       30,
+       1
+      ]
+     },
+     "\tcase 0: if (ctx.ctr.u32 == 0x831B9D88U) goto loc_831B9D88; break;",
+     "\tcase 1: if (ctx.ctr.u32 == 0x831B9D98U) goto loc_831B9D98; break;",
+     "\tcase 2: if (ctx.ctr.u32 == 0x831B9D98U) goto loc_831B9D98; break;",
+     "\tcase 3: if (ctx.ctr.u32 == 0x831B9DA4U) goto loc_831B9DA4; break;",
+     "\tcase 4: if (ctx.ctr.u32 == 0x831B9DA4U) goto loc_831B9DA4; break;",
+     "\tcase 5: if (ctx.ctr.u32 == 0x831B9DB0U) goto loc_831B9DB0; break;",
+     "\tcase 6: if (ctx.ctr.u32 == 0x831B9DB0U) goto loc_831B9DB0; break;",
+     "\tcase 7: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 8: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 9: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 10: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 11: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 12: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 13: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 14: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 15: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 16: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 17: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 18: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 19: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 20: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 21: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 22: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 23: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 24: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 25: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 26: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 27: if (ctx.ctr.u32 == 0x831B9DBCU) goto loc_831B9DBC; break;",
+     "\tcase 28: if (ctx.ctr.u32 == 0x831B9DB0U) goto loc_831B9DB0; break;",
+     "\tcase 29: if (ctx.ctr.u32 == 0x831B9DB0U) goto loc_831B9DB0; break;",
+     {
+      "copy": [
+       "831B9C00",
+       14,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "831B8B38",
+       259,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "831B8AD0",
+       42,
+       1
+      ]
+     },
+     "loc_831B9D88:",
+     {
+      "copy": [
+       "831B9D10",
+       62,
+       2
+      ]
+     },
+     "loc_831B9D8C:",
+     {
+      "copy": [
+       "831B8B38",
+       56,
+       2
+      ]
+     },
+     "loc_831B9D90:",
+     {
+      "copy": [
+       "831B9D10",
+       66,
+       2
+      ]
+     },
+     "loc_831B9D94:",
+     {
+      "copy": [
+       "831B9330",
+       30,
+       2
+      ]
+     },
+     {
+      "copy": [
+       "831B9D10",
+       70,
+       3
+      ]
+     },
+     "loc_831B9D9C:",
+     {
+      "copy": [
+       "831B9180",
+       231,
+       2
+      ]
+     },
+     "loc_831B9DA0:",
+     {
+      "copy": [
+       "831B8AD0",
+       41,
+       2
+      ]
+     },
+     "loc_831B9DA4:",
+     {
+      "copy": [
+       "831B9DA4",
+       2,
+       2
+      ]
+     },
+     "loc_831B9DA8:",
+     {
+      "copy": [
+       "831B9180",
+       231,
+       2
+      ]
+     },
+     "loc_831B9DAC:",
+     {
+      "copy": [
+       "831B8AD0",
+       41,
+       2
+      ]
+     },
+     "loc_831B9DB0:",
+     {
+      "copy": [
+       "831B9DB0",
+       2,
+       2
+      ]
+     },
+     "loc_831B9DB4:",
+     {
+      "copy": [
+       "831B9180",
+       231,
+       2
+      ]
+     },
+     "loc_831B9DB8:",
+     {
+      "copy": [
+       "831B8AD0",
+       41,
+       2
+      ]
+     },
+     "loc_831B9DBC:",
+     {
+      "copy": [
+       "831B944C",
+       4,
+       2
+      ]
+     },
+     "loc_831B9DC0:",
+     {
+      "copy": [
+       "831B8AD0",
+       41,
+       2
+      ]
+     }
+    ]
+   },
+   {
+    "function": "831B9CDC",
+    "offset": 30,
+    "old": {
+     "count": 94,
+     "sha256": "12285c3c94eb4353bd2b1e40ecbc802e17b458f41908a19497d87757539feacd"
+    },
+    "new": [
+     {
+      "copy": [
+       "831B8B38",
+       259,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "831B8AD0",
+       42,
+       1
+      ]
+     }
+    ]
+   }
+  ],
+  "268": [
+   {
+    "function": "832144D0",
+    "offset": 23,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Original seven-instruction case at 0x8321459C; retain live target validation.",
+     "\tif ((ctx.r11.u32 == 8 || ctx.r11.u32 == 22 || ctx.r11.u32 == 25 || ctx.r11.u32 == 29 || ctx.r11.u32 == 37 || ctx.r11.u32 == 39) && ctx.ctr.u32 == 0x8321459CU) {",
+     {
+      "copy": [
+       "832144FC",
+       82,
+       15
+      ],
+      "indent": 1
+     },
+     "\t// Original shared BLR at 0x832147A0.",
+     "\tif ((ctx.r11.u32 == 2 || ctx.r11.u32 == 3 || ctx.r11.u32 == 4 || ctx.r11.u32 == 5 || ctx.r11.u32 == 6 || ctx.r11.u32 == 7 || ctx.r11.u32 == 9 || ctx.r11.u32 == 12 || ctx.r11.u32 == 14 || ctx.r11.u32 == 15 || ctx.r11.u32 == 16 || ctx.r11.u32 == 17 || ctx.r11.u32 == 18 || ctx.r11.u32 == 19 || ctx.r11.u32 == 20 || ctx.r11.u32 == 21 || ctx.r11.u32 == 23 || ctx.r11.u32 == 24 || ctx.r11.u32 == 26 || ctx.r11.u32 == 27 || ctx.r11.u32 == 28 || ctx.r11.u32 == 30 || ctx.r11.u32 == 31 || ctx.r11.u32 == 32 || ctx.r11.u32 == 33 || ctx.r11.u32 == 34 || ctx.r11.u32 == 35 || ctx.r11.u32 == 36 || ctx.r11.u32 == 38) && ctx.ctr.u32 == 0x832147A0U) return;"
+    ]
+   }
+  ],
+  "281": [
+   {
+    "function": "832D3170",
+    "offset": 23,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Original local cases; keep the live CTR and loaded selector paired.",
+     "\tif ((ctx.r11.u32 == 0 || ctx.r11.u32 == 1 || ctx.r11.u32 == 3 || ctx.r11.u32 == 11 || ctx.r11.u32 == 12 || ctx.r11.u32 == 13) && ctx.ctr.u32 == 0x832D31CCU) {",
+     {
+      "copy": [
+       "832D3194",
+       30,
+       11
+      ],
+      "indent": 1
+     },
+     "\tif ((ctx.r11.u32 == 2 || ctx.r11.u32 == 5 || ctx.r11.u32 == 6 || ctx.r11.u32 == 7 || ctx.r11.u32 == 9 || ctx.r11.u32 == 10) && ctx.ctr.u32 == 0x832D3220U) {",
+     "\t\t// li r3,0; blr",
+     {
+      "copy": [
+       "832D3170",
+       9,
+       3
+      ]
+     }
+    ]
+   }
+  ],
+  "321": [
+   {
+    "function": "835B51C0",
+    "offset": 87,
+    "old": {
+     "count": 1,
+     "sha256": "c35445a0c447965638bd306342c565aa76eecfce07289ff80452b3b63382794f"
+    },
+    "new": []
+   }
+  ],
+  "322": [
+   {
+    "function": "835CDB10",
+    "offset": 20,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Recovered inline-table case; the original first case was misclassified",
+     "\t// as the tail of the data at 0x835CDB30. Preserve the live target check.",
+     "\tif (ctx.r3.u32 == 0 && ctx.ctr.u32 == 0x835CDC2Cu) {",
+     "\t\t// 0x835CDC2C: lis r11,-32242",
+     {
+      "copy": [
+       "835CDB30",
+       129,
+       1
+      ],
+      "indent": 1
+     },
+     "\t\t// 0x835CDC30: addi r3,r11,-14428",
+     {
+      "copy": [
+       "835CDB30",
+       131,
+       1
+      ],
+      "indent": 1
+     },
+     "\t\t// 0x835CDC34: blr",
+     {
+      "copy": [
+       "835CDB10",
+       7,
+       2
+      ]
+     }
+    ]
+   }
+  ],
+  "327": [
+   {
+    "function": "83622DF0",
+    "offset": 88,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Original fallthrough tail at 0x83622E80..0x83622E90.",
+     {
+      "copy": [
+       "83622E80",
+       2,
+       2
+      ]
+     },
+     {
+      "copy": [
+       "83622DF0",
+       85,
+       1
+      ],
+      "indent": 0,
+      "trim": true
+     },
+     {
+      "copy": [
+       "83622DF0",
+       22,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "83622DF0",
+       87,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "83622E88",
+       2,
+       2
+      ]
+     },
+     {
+      "copy": [
+       "83622C28",
+       119,
+       1
+      ],
+      "indent": 0,
+      "trim": true
+     },
+     {
+      "copy": [
+       "83622C20",
+       4,
+       1
+      ]
+     }
+    ]
+   },
+   {
+    "function": "83622E80",
+    "offset": 7,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// Original fallthrough at 0x83622E88, shared with the full memset.",
+     {
+      "copy": [
+       "83622E88",
+       3,
+       1
+      ]
+     },
+     {
+      "copy": [
+       "83622C20",
+       4,
+       1
+      ]
+     }
+    ]
+   }
+  ],
+  "337": [
+   {
+    "function": "HEADER",
+    "offset": 1,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "#include <cstdio>"
+    ]
+   },
+   {
+    "function": "836C08A0",
+    "offset": 123,
+    "old": {
+     "count": 1,
+     "sha256": "4c2705e330880aa8274d84c9b23e81501ad960fdc966a4e73894656a1c731414"
+    },
+    "new": [
+     "\tif (PPCTrapCondition<uint32_t>(6, ctx.r9.u32, 0x0U)) {",
+     "        std::printf(\"PRIVATE_SCALER_TRAP pc=836C0974 r9=%08x r28=%08x r29=%08x sp=%08x\\n\",ctx.r9.u32,ctx.r28.u32,ctx.r29.u32,ctx.r1.u32);",
+     {
+      "copy": [
+       "836B97B0",
+       95,
+       1
+      ],
+      "lead": "        "
+     },
+     {
+      "copy": [
+       "836C08A0",
+       777,
+       1
+      ],
+      "lead": "    "
+     }
+    ]
+   },
+   {
+    "function": "836C08A0",
+    "offset": 351,
+    "old": {
+     "count": 1,
+     "sha256": "4c2705e330880aa8274d84c9b23e81501ad960fdc966a4e73894656a1c731414"
+    },
+    "new": [
+     "\tif (PPCTrapCondition<uint32_t>(6, ctx.r9.u32, 0x0U)) {",
+     "        std::printf(\"PRIVATE_SCALER_TRAP pc=836C0B08 r9=%08x r28=%08x r29=%08x sp=%08x\\n\",ctx.r9.u32,ctx.r28.u32,ctx.r29.u32,ctx.r1.u32);",
+     {
+      "copy": [
+       "836B97B0",
+       95,
+       1
+      ],
+      "lead": "        "
+     },
+     {
+      "copy": [
+       "836C08A0",
+       777,
+       1
+      ],
+      "lead": "    "
+     }
+    ]
+   },
+   {
+    "function": "836C08A0",
+    "offset": 370,
+    "old": {
+     "count": 1,
+     "sha256": "73a8eb58797f5ca5f3bdf952c70ee6b60f2f070f8ca256a0f304017233870280"
+    },
+    "new": [
+     "\tif (PPCTrapCondition<uint32_t>(6, ctx.r28.u32, 0x0U)) {",
+     "        std::printf(\"PRIVATE_SCALER_TRAP pc=836C0B2C r9=%08x r28=%08x r29=%08x sp=%08x\\n\",ctx.r9.u32,ctx.r28.u32,ctx.r29.u32,ctx.r1.u32);",
+     {
+      "copy": [
+       "836B97B0",
+       95,
+       1
+      ],
+      "lead": "        "
+     },
+     {
+      "copy": [
+       "836C08A0",
+       777,
+       1
+      ],
+      "lead": "    "
+     }
+    ]
+   },
+   {
+    "function": "836C0E30",
+    "offset": 206,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "    // D-242 read-only diagnostic of the D-241 observed worker frame. Import",
+     "    // still stops normally; no guest register, predicate, buffer or PC changes.",
+     "    if (ctx.r1.u32 == 0x640AED90 && ctx.r9.u32 == ctx.r1.u32 + 156) {",
+     "        const auto sp = ctx.r1.u32;",
+     "        const auto horizontal = PPC_LOAD_U32(sp + 84), coefficients = PPC_LOAD_U32(sp + 92);",
+     "        const auto destination = PPC_LOAD_U32(sp + 100), capacity = PPC_LOAD_U32(sp + 108);",
+     "        std::printf(\"PRIVATE_SCALER_REQUEST sp=%08x stack=%08x,%08x,%08x,%08x\\n\",sp,horizontal,coefficients,destination,capacity);",
+     "        if (horizontal == sp + 172 && coefficients == sp + 992 && destination == sp + 192 && capacity == 200) {",
+     "            std::printf(\"PRIVATE_SCALER_FILTERS vertical=%08x,%08x,%08x horizontal=%08x,%08x,%08x\\n\",",
+     "                PPC_LOAD_U32(sp+156),PPC_LOAD_U32(sp+160),PPC_LOAD_U32(sp+164),",
+     "                PPC_LOAD_U32(sp+172),PPC_LOAD_U32(sp+176),PPC_LOAD_U32(sp+180));",
+     "            unsigned filled = 0;",
+     "            for (unsigned i=0;i<200;++i) if (PPC_LOAD_U32(destination+4*i)==0x80000000) ++filled;",
+     "            std::printf(\"PRIVATE_SCALER_PRE_FILL words=%u\\n\",filled);",
+     "            // Caller zeroes1408bytes; last observed field is+1404. Keep352words",
+     "            // coefficient/control record in the ignored private protocol only.",
+     "            std::printf(\"PRIVATE_SCALER_COEFFICIENTS words=352 data=\");",
+     "            for (unsigned i=0;i<352;++i) std::printf(\"%08x%s\",PPC_LOAD_U32(coefficients+4*i),i==351?\"\\n\":\",\");",
+     {
+      "copy": [
+       "836C0E30",
+       232,
+       1
+      ],
+      "lead": "        "
+     },
+     {
+      "copy": [
+       "836C0E30",
+       232,
+       1
+      ],
+      "lead": "    "
+     }
+    ]
+   },
+   {
+    "function": "836C0E30",
+    "offset": 207,
+    "old": {
+     "count": 0,
+     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "new": [
+     "\t// D-245 read-only producer result; no guest registers/buffers changed.",
+     "\tstd::printf(\"PRIVATE_SCALER_ISSUED words=%u command_virtual=%08x device=%08x\\n\",ctx.r3.u32,ctx.r30.u32+4,ctx.r31.u32);"
+    ]
+   }
+  ]
+ }
+}

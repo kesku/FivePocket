@@ -40,6 +40,14 @@ xcuserdata/
 local.properties
 .gradle/
 build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+build.ninja
+.ninja_*
+compile_commands.json
 out/
 work/
 private/

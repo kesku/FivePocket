@@ -102,9 +102,6 @@ public:
         for(unsigned i=0;i<1024;++i)out[i]=word(shadow+i*4);
     }
     std::size_t size()const noexcept{return state_.count;}
-    // v599 (thor-fixer, census diagnostic): a submitted word (index 0-2047: vertex 0-1023, pixel 1024-2047) and whether one was submitted.
-    std::uint32_t wordAt(unsigned index)const noexcept{return index<2048?state_.words(index):0;}
-    bool presentAt(unsigned index)const noexcept{return index<2048 && ((state_.present[index/64]>>(index%64))&1);}
 private:
     static std::uint32_t word(const std::uint8_t* p) {
         return (std::uint32_t{p[0]}<<24)|(std::uint32_t{p[1]}<<16)|(std::uint32_t{p[2]}<<8)|p[3];

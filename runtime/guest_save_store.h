@@ -202,8 +202,6 @@ struct ContentKey {
 };
 
 // closeContent() results (diagnostic; the guest never sees them).
-// trainer (2026-10-25, trainer_glue.inc): weak, so builds without the trainer link unchanged.
-extern "C" __attribute__((weak)) void recomp_trainer_note_save(const char* name) noexcept;
 namespace content_close {
 inline constexpr std::uint32_t NothingPending = 0;  // the content was not a replacement
 inline constexpr std::uint32_t Committed = 1;       // the replacement is now the content (atomic exchange); the old one is gone
@@ -852,9 +850,6 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             result = closeContentLocked(key, mount);
         } catch (...) {}
-        // trainer (2026-10-25): a save committed with trainer toggles on is logged (RENDER_TRAINER save; the owner allows it)
-        if ((result == content_close::Committed || result == content_close::CommittedByRenames) && recomp_trainer_note_save)
-            recomp_trainer_note_save(key.fileName.c_str());
 #if defined(RECOMP_SAVE_STORE_LOG)
         const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
         __android_log_print(result == content_close::CommitFailed ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "RecompSaves",
@@ -1095,22 +1090,6 @@ public:
             const int error = errno;
             noteFailure(handle->contentDir);
             return detail::ntFromErrno(error);
-        } catch (...) { return nt::NoMemory; }
-    }
-
-    // save-failure-paths (v545): the caller opened fd but cannot hand it to the guest (no guest handle, no memory).
-    // Closes it and, if it was opened for writing, keeps its content's staged replacement from ever being committed:
-    // an open for writing may already have truncated the staged file, so the old content must stay.
-    std::uint32_t abandon(int fd) noexcept {
-        try {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const auto found = handles_.find(fd);
-            if (found == handles_.end()) { return nt::InvalidHandle; }
-            const auto closing = found->second;
-            handles_.erase(found);
-            if (closing.write) { noteFailure(closing.contentDir); }
-            (void)::close(fd);
-            return nt::Success;
         } catch (...) { return nt::NoMemory; }
     }
 

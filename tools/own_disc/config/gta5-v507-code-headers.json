@@ -1,0 +1,155 @@
+{
+ "schema": "code-headers/1",
+ "headers": [
+  {
+   "path": "android-private-trace-window/api26/validated-ppc/native_shader_selection_original.h",
+   "bytes": 52019,
+   "sha256": "1fa5b8639ae15cb39253a178ecaea624e259e741a96c8dd8caa68ae22cfdda12",
+   "parts": [
+    "PPC_EXTERN_FUNC(__restgprlr_14);\nPPC_EXTERN_FUNC(__restgprlr_19);\nPPC_EXTERN_FUNC(__savegprlr_14);\nPPC_EXTERN_FUNC(__savegprlr_19);\nPPC_EXTERN_FUNC(sub_8235E218);\nPPC_EXTERN_FUNC(sub_823AFDA8);\nPPC_EXTERN_FUNC(sub_823BB448);\nPPC_EXTERN_FUNC(sub_823BB4F8);\nPPC_EXTERN_FUNC(sub_823BB650);\nPPC_EXTERN_FUNC(sub_823BDBB8);\nPPC_EXTERN_FUNC(sub_823BDC30);\nPPC_EXTERN_FUNC(sub_823C3A88);\nPPC_EXTERN_FUNC(sub_836233C0);\nPPC_EXTERN_FUNC(sub_836B7C98);\nPPC_EXTERN_FUNC(__imp__KeBugCheck);\n",
+    {
+     "function": "823BAAC8",
+     "chunk": 18,
+     "first_line": "PPC_FUNC(sub_823BAAC8) {",
+     "direct_calls": true,
+     "edits": [
+      {
+       "at": 5,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tconst bool trackShaderSelection=tracksNativeShaderBinding(ctx.r3.u32);",
+        "\tstd::uint32_t selectedPhysical=0,selectedWords=0;"
+       ]
+      },
+      {
+       "at": 57,
+       "remove": 1,
+       "removed_sha256": "460dd4cfc94f80ba05f9f698350cb29b62ee5a1d99e6e94f9c488d3c4171f795",
+       "insert": [
+        "\tif (ctx.cr6.eq) { if(trackShaderSelection) invalidateNativeVertexShader(ctx.r31.u32); goto loc_823BB43C; }"
+       ]
+      },
+      {
+       "at": 856,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\t// Predicated multi-bind history must not become an unconditional last bind.",
+        "\tif(trackShaderSelection) invalidateNativeVertexShader(ctx.r31.u32);"
+       ]
+      },
+      {
+       "at": 1385,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tselectedPhysical=ctx.r11.u32;"
+       ]
+      },
+      {
+       "at": 1397,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tselectedWords=ctx.r11.u32;"
+       ]
+      },
+      {
+       "at": 1407,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tif(trackShaderSelection) observeNativeVertexShader(ctx.r31.u32,ctx.r30.u32,ctx.r15.u32,selectedPhysical,selectedWords*4,false);"
+       ]
+      },
+      {
+       "at": 1416,
+       "remove": 1,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": []
+      }
+     ]
+    },
+    "\n",
+    {
+     "function": "823BDC30",
+     "chunk": 18,
+     "first_line": "PPC_FUNC(sub_823BDC30) {",
+     "direct_calls": true,
+     "edits": [
+      {
+       "at": 2,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tconst bool trackShaderSelection=tracksNativeShaderBinding(ctx.r3.u32);",
+        "\tif(trackShaderSelection) invalidateNativeVertexShader(ctx.r3.u32);"
+       ]
+      },
+      {
+       "at": 117,
+       "remove": 1,
+       "removed_sha256": "3bd5bd61caf0628517bbc018158af71ff5f2c4dfadd4cbedfee6db6e5278a3bf",
+       "insert": []
+      },
+      {
+       "at": 192,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tif(trackShaderSelection) observeNativeVertexShader(ctx.r30.u32,ctx.r31.u32,ctx.r23.u32,ctx.r26.u32,ctx.r27.u32,true);"
+       ]
+      },
+      {
+       "at": 199,
+       "remove": 1,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": []
+      }
+     ]
+    },
+    "\n"
+   ]
+  },
+  {
+   "path": "native-loading-recursion/codex-native-geometry-integration-v3/native_prepared_indexed_original.h",
+   "bytes": 20025,
+   "sha256": "e27b2bfc7d9ed2520b67627d09103256082974f90fafd76138aa5c5681a75048",
+   "parts": [
+    "PPC_EXTERN_FUNC(__restgprlr_17);\nPPC_EXTERN_FUNC(__savegprlr_17);\nPPC_EXTERN_FUNC(sub_8235E218);\nPPC_EXTERN_FUNC(sub_823AEE08);\nPPC_EXTERN_FUNC(sub_823B9FD0);\nPPC_EXTERN_FUNC(sub_823BA1A8);\nPPC_EXTERN_FUNC(sub_823BA300);\nPPC_EXTERN_FUNC(sub_823BAAC8);\nPPC_EXTERN_FUNC(sub_823CCEB8);\nPPC_EXTERN_FUNC(sub_82431888);\nPPC_EXTERN_FUNC(sub_824F9C98);\n",
+    {
+     "function": "823B9B58",
+     "chunk": 18,
+     "first_line": "PPC_FUNC(nativePreparedIndexedOriginal) {",
+     "direct_calls": true,
+     "edits": [
+      {
+       "at": 349,
+       "remove": 0,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": [
+        "\tif(finishNativeBoundIndexed(ctx,base)) goto loc_823B9FC4;"
+       ]
+      },
+      {
+       "at": 673,
+       "remove": 1,
+       "removed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "insert": []
+      }
+     ]
+    },
+    "\n"
+   ]
+  },
+  {
+   "path": "android-private-trace-window/api26/validated-ppc/native_prepared_indexed_original.h",
+   "bytes": 192,
+   "sha256": "5964ad0fe1d5c105f86af140becfbcb69c5343234b260e9e6c28b92164041676",
+   "parts": [
+    "// Private original-body hook. Callback executes before raw draw emission.\n#include \"../../../native-loading-recursion/codex-native-geometry-integration-v3/native_prepared_indexed_original.h\"\n"
+   ]
+  }
+ ]
+}

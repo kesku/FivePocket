@@ -1,0 +1,18 @@
+{
+ "schema": "jc-loop-locals/1",
+ "flag": "recomp_jc_loop",
+ "chunks": [
+  251
+ ],
+ "loops": {
+  "8310E4B0": [
+   "loc_8310EACC"
+  ],
+  "8310E118": [
+   "loc_8310E1BC"
+  ],
+  "83118F10": [
+   "loc_831190A0"
+  ]
+ }
+}

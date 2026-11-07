@@ -70,6 +70,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -78,6 +79,15 @@
 #include <android/log.h>
 #endif
 #include "recomp_app_dir.h" // data-paths: the app's files directory.
+#if defined(__APPLE__)
+// ios-draw-distance (Claude, 2026-10-20): the iPad launcher's saved Draw Distance in percent (100 = Original or no saved choice),
+// defined by generic_renderer.cpp from the launcher word. The owner made it a player option ("Original by default, down to
+// 70 %"), so it needs no diag-wl-lod-unlock; the lower of it and an unlocked settings-file lod counts; a test switch decides alone.
+extern "C" unsigned recomp_ios_wl_launcher_lod() noexcept;
+// ios-traffic (Claude, 2026-10-20): the launcher's saved Traffic Density in percent (100 = Original), for the random and
+// parked vehicle sliders; the lower of it and the settings file counts; a test switch decides alone.
+extern "C" unsigned recomp_ios_wl_launcher_traffic() noexcept;
+#endif
 #ifndef RECOMP_WL_FILES_DIR // the app's files directory (the one place this header names the package)
 #define RECOMP_WL_PATH(rel) RECOMP_APP_PATH(rel) // data-paths (host tests: recomp_app_dir.h)
 #endif
@@ -100,7 +110,7 @@ static_assert(DensityFloor > 0 && LodFloor > 0 && TestDensity >= DensityFloor &&
 
 enum Switch : unsigned {
     SwTest = 1u, SwTestMin = 2u, SwTestVehicles = 4u, SwTestPeds = 8u, SwTestParked = 16u, SwTestScenario = 32u, SwTestLod = 64u,
-    SwLodUnlock = 128u, SwAnyTest = 127u, SwAll = 255u
+    SwLodUnlock = 128u, SwPedsHalf = 256u, SwLod85 = 512u, SwAnyTest = 127u, SwAll = 1023u
 };
 
 // ---- logging -------------------------------------------------------------------------------------------------------------
@@ -166,6 +176,15 @@ enum FileState : unsigned { FileAbsent, FileOk, FileUnreadable };
 // counts as unreadable = every slider at the original. Creates nothing.
 inline FileState readSettings(const char* path, FileSettings& out) noexcept {
     out = FileSettings{};
+#if defined(__APPLE__) // ios-wl-text (Claude, 2026-10-20; iOS test runs only): the launch environment's text stands for the settings
+    // file (the iOS shell cannot write the app's files); without the variable the file is read as before
+    if (const char* text = std::getenv("RECOMP_IOS_WL_TEXT")) {
+        const std::size_t size = std::strlen(text);
+        if (size > MaxFileBytes) return FileUnreadable;
+        out = parse(text, size);
+        return FileOk;
+    }
+#endif
     const int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return errno == ENOENT ? FileAbsent : FileUnreadable;
     char text[MaxFileBytes + 1];
@@ -198,7 +217,13 @@ inline Seen pollSwitches() noexcept {
         {RECOMP_WL_PATH("/private-trace/diag-wl-test-parked"), SwTestParked},
         {RECOMP_WL_PATH("/private-trace/diag-wl-test-scenario"), SwTestScenario},
         {RECOMP_WL_PATH("/private-trace/diag-wl-test-lod"), SwTestLod},
-        {RECOMP_WL_PATH("/private-trace/diag-wl-lod-unlock"), SwLodUnlock}};
+        {RECOMP_WL_PATH("/private-trace/diag-wl-lod-unlock"), SwLodUnlock},
+        // ios-wl-peds50 (Claude 2026-10-20, A/B aid): pedestrians and scenario peds at 50 % ON TOP of the settings file (unlike
+        // the diag-wl-test* files it does not replace them), to measure their CPU cost in the now CPU-limited drive
+        {RECOMP_WL_PATH("/private-trace/ios-wl-peds50"), SwPedsHalf},
+        // ios-wl-lod85 (Claude 2026-10-22, A/B aid): draw distance (lod) at 85 % ON TOP of the settings file (the densities stay as
+        // the file sets them), for an in-run A/B of lod 85 against the play settings' 70 (the owner: "the draw distance is atrocious")
+        {RECOMP_WL_PATH("/private-trace/ios-wl-lod85"), SwLod85}};
     Seen seen;
     for (const auto& f : files) {
         if (::access(f.path, F_OK) == 0) seen.present |= f.bit;
@@ -238,6 +263,9 @@ inline Effective resolve(const FileSettings& file, unsigned switches) noexcept {
     e.percent[Parked] = file.percent[Parked];
     e.percent[Scenario] = file.percent[Scenario];
     if (switches & SwLodUnlock) e.percent[Lod] = file.percent[Lod]; // locked: see the header comment
+    if (switches & SwPedsHalf) // (ios-wl-peds50)
+        for (const Slider s : {Peds, Scenario}) if (e.percent[s] > TestDensity) e.percent[s] = std::uint8_t(TestDensity);
+    if (switches & SwLod85) e.percent[Lod] = std::uint8_t(85); // (ios-wl-lod85)
     return e;
 }
 
@@ -366,7 +394,7 @@ inline void observeWord(const std::uint8_t* base, unsigned word) noexcept {
 // ---- the renderer's 60-present window poll -------------------------------------------------------------------------------------
 [[gnu::noinline]] inline void window() noexcept {
     struct Totals { std::uint64_t entries, observes, samples, lodForeign, lodLost, writes[DensityWords + 1], kept[DensityWords], lower[DensityWords], other, notOne; };
-    struct Poll { unsigned live = 0, seenAbsent = 0; Effective effective{}; Totals last{}; };
+    struct Poll { unsigned live = 0, seenAbsent = 0; Effective effective{}; Totals last{}; bool launcher = false; };
     static Poll poll;
     State& s = shared;
     // the next window's setting (a switch file left by an earlier run counts for nothing: launchScope)
@@ -374,7 +402,19 @@ inline void observeWord(const std::uint8_t* base, unsigned word) noexcept {
     const unsigned live = scoped.live;
     FileSettings parsed;
     const FileState file = readSettings(RECOMP_WL_PATH("/settings/world-load.txt"), parsed);
-    const Effective next = resolve(parsed, live);
+    Effective next = resolve(parsed, live);
+    bool launcherLod = false; // (ios-draw-distance / ios-traffic: a slider of this window came from the launcher)
+#if defined(__APPLE__)
+    if (!(live & SwAnyTest)) {
+        unsigned launcher = recomp_ios_wl_launcher_lod();
+        if (launcher < LodFloor) launcher = LodFloor;
+        if (launcher < next.percent[Lod]) { next.percent[Lod] = std::uint8_t(launcher); launcherLod = true; }
+        unsigned traffic = recomp_ios_wl_launcher_traffic();
+        if (traffic < DensityFloor) traffic = DensityFloor;
+        for (const Slider s : {Vehicles, Parked})
+            if (traffic < next.percent[s]) { next.percent[s] = std::uint8_t(traffic); launcherLod = true; }
+    }
+#endif
     s.control.store(pack(next) | SampleBit, std::memory_order_relaxed);
     // the window that just ended
     const unsigned whole = poll.live & live; // (a file that counted at both ends)
@@ -412,7 +452,7 @@ inline void observeWord(const std::uint8_t* base, unsigned word) noexcept {
             "lod_foreign=%llu lod_lost=%llu lod_held=%.2f bad=%u clamped=%u sampled=%llu "
             "now_vehicles=%.3f now_parked=%.3f now_peds=%.3f now_scen0=%.3f now_scen1=%.3f root=%.3f "
             "eff_veh=%.4f veh_live=%d parked_live=%d ped_want=%d ped_want2=%d scen_base=%d lod_eff=%.4f",
-            original ? "original" : (poll.live & SwAnyTest) ? "test" : "file",
+            original ? "original" : (poll.live & SwAnyTest) ? "test" : poll.launcher ? "launcher" : "file",
             file == FileOk ? "ok" : file == FileAbsent ? "absent" : "unreadable", scoped.leftover,
             unsigned(was.percent[Vehicles]), unsigned(was.percent[Peds]), unsigned(was.percent[Parked]), unsigned(was.percent[Scenario]),
             unsigned(was.percent[Lod]), d(now.entries, l.entries), d(now.observes, l.observes), writes,
@@ -426,6 +466,7 @@ inline void observeWord(const std::uint8_t* base, unsigned word) noexcept {
             int(sampled(3)), int(sampled(4)), int(sampled(5)), double(asFloat(sampled(6))));
     poll.live = live;
     poll.effective = next;
+    poll.launcher = launcherLod;
     poll.last = now;
 }
 } // namespace recomp::wl

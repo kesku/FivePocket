@@ -1,0 +1,757 @@
+{
+ "schema": "own-disc-pipeline/1",
+ "id": "fivepocket-duo-source",
+ "flavour": "apple",
+ "paths": {},
+ "min_free_bytes": 21474836480,
+ "games": [
+  {
+   "id": "gta5-x360-disc",
+   "label": "GTA V, Xbox 360 disc release without title update (play disc executable)",
+   "executable": "default.xex",
+   "executable_sha256": "f0ca93fbe6b3dfbf50c026e0d77a71e8294b13a5a775af1b6a64f07b0fc10a3d",
+   "executable_size": 26628096,
+   "decoded_image_sha256": "0b1c81507f827c29a7dccf5fc58dc23c8142ff4177efe66df21c790a8f65f3b2"
+  }
+ ],
+ "prerequisites": [
+  {
+   "id": "python",
+   "kind": "python",
+   "min": "3.9"
+  },
+  {
+   "id": "ndk-clang",
+   "kind": "command",
+   "argv": [
+    "${ndk}/toolchains/llvm/prebuilt/${ndkhost}/bin/clang++${exe}",
+    "--version"
+   ],
+   "match": "clang version 18\\.0\\.3"
+  },
+  {
+   "id": "generator",
+   "kind": "file",
+   "path": "${hosttools}/XenonRecomp${exe}"
+  }
+ ],
+ "stages": [
+  {
+   "id": "extract-xex",
+   "adapter": "disc-file",
+   "disc": "play",
+   "path": "default.xex",
+   "description": "Copy the game executable out of the play disc.",
+   "outputs": {
+    "xex": "input/default.xex"
+   },
+   "expect": {
+    "xex": "${game:executable_sha256}"
+   }
+  },
+  {
+   "id": "decode-xex",
+   "adapter": "command",
+   "description": "Decode this run extracted executable using the existing lane-built decoder.",
+   "tools": [
+    "${hosttools}/xex_image${exe}"
+   ],
+   "inputs": {
+    "xex": "${out:extract-xex:xex}"
+   },
+   "outputs": {
+    "image": "decode/default.image.bin"
+   },
+   "expect": {
+    "image": "${game:decoded_image_sha256}"
+   },
+   "argv": [
+    "${hosttools}/xex_image${exe}",
+    "${out:extract-xex:xex}",
+    "${work}/decode/default.image.bin"
+   ],
+   "make_dirs": [
+    "decode"
+   ]
+  },
+  {
+   "id": "codegen",
+   "adapter": "command",
+   "heavy": true,
+   "description": "Generate from this run extracted executable. Recorded configuration only supplies parameters.",
+   "tools": [
+    "${repo}/tools/own_disc/regen_check.py",
+    "${hosttools}/XenonRecomp${exe}",
+    "${repo}/runtime/ppc_context.h",
+    "${repo}/tools/own_disc/compile_rehearsal.py"
+   ],
+   "inputs": {
+    "xex": "${out:extract-xex:xex}",
+    "config": "${repo}/tools/own_disc/config/recomp.toml",
+    "switch_tables": "${repo}/tools/own_disc/config/switch_tables.toml"
+   },
+   "clean": [
+    "codegen"
+   ],
+   "outputs": {
+    "tree": "codegen/ppc",
+    "report": "codegen-report.json"
+   },
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/compile_rehearsal.py",
+    "codegen",
+    "--repo",
+    "${repo}",
+    "--work",
+    "${work}",
+    "--generator",
+    "${hosttools}/XenonRecomp${exe}",
+    "--context",
+    "${repo}/runtime/ppc_context.h",
+    "--config",
+    "${repo}/tools/own_disc/config/recomp.toml"
+   ]
+  },
+  {
+   "id": "recipe",
+   "adapter": "command",
+   "description": "Reconstruct all 374 corpus chunks from this run generator plus recorded base passes; stitch this run decoded image; replay recipe v455 and require v507 chunk hashes.",
+   "tools": [
+    "${repo}/tools/fp_codegen/recipe_build.py",
+    "${repo}/tools/fp_codegen/recipe",
+    "${repo}/tools/fp_codegen/stitch_split_functions.py",
+    "${repo}/tools/own_disc/compile_rehearsal.py",
+    "${repo}/tools/fp_codegen/fence_pass.py",
+    "${repo}/tools/fp_codegen/recipe/fence_duplicate.py",
+    "${repo}/tools/fp_codegen/recipe/anchored_insert.py",
+    "${repo}/tools/fp_codegen/recipe/jump_table_repair.py",
+    "${repo}/tools/fp_codegen/recipe/gpr_helpers_v243_pass.py",
+    "${repo}/tools/fp_codegen/leaf_locals.py",
+    "${repo}/tools/fp_codegen/direct_calls.py",
+    "${repo}/tools/fp_codegen/gpr_fastpath.py",
+    "${repo}/tools/fp_codegen/vmx_all.py",
+    "${repo}/tools/fp_codegen/main_code/dcbt_build.py",
+    "${repo}/tools/fp_codegen/auto_prefetch/ap_pass.py",
+    "${repo}/tools/fp_codegen/render_guest/rg_pass.py",
+    "${repo}/tools/fp_codegen/job_code/loop_locals_pass.py",
+    "${repo}/tools/fp_codegen/recipe/case_label_flush.py",
+    "${repo}/tools/fp_codegen/recipe/case_blocks.py",
+    "${repo}/tools/fp_codegen/recipe/switch_expand.py",
+    "${repo}/tools/fp_codegen/recipe/error_sites.py",
+    "${repo}/tools/fp_codegen/recipe/vmx_unpack_call.py",
+    "${repo}/tools/fp_codegen/recipe/vmx_helper_includes.py",
+    "${repo}/tools/fp_codegen/recipe/eof_blank.py",
+    "${repo}/tools/fp_codegen/recipe/recorded_hunks.py"
+   ],
+   "inputs": {
+    "recipe": "${work}/prepared-recipe.json",
+    "generated": "${out:codegen:tree}",
+    "image": "${out:decode-xex:image}",
+    "param_0_roots": "${repo}/tools/own_disc/config/stitch-roots-v447.json",
+    "param_2_records": "${repo}/tools/own_disc/config/fence-dup-v28.json",
+    "param_3_records": "${repo}/tools/own_disc/config/xma-diag-v97.json",
+    "param_4_records": "${repo}/tools/own_disc/config/jump-tables-v101.json",
+    "param_6_targets": "${repo}/tools/own_disc/config/leaf-locals-v349.json",
+    "param_7_hooked": "${repo}/tools/own_disc/config/hooked-v393.txt",
+    "param_7_chunks": "${repo}/tools/own_disc/config/direct-chunks-v399-v401.json",
+    "param_9_exclusions": "${repo}/tools/own_disc/config/manifest.json",
+    "param_10_exclusions": "${repo}/tools/own_disc/config/dcbt-build.json",
+    "param_11_sites": "${repo}/tools/own_disc/config/ap-sites-v439.json",
+    "param_12_sites": "${repo}/tools/own_disc/config/rg-sites-v444.json",
+    "param_13_sites": "${repo}/tools/own_disc/config/jc-loop-locals-v452.json",
+    "param_14_records": "${repo}/tools/own_disc/config/case-label-flush-v452-pgo.json",
+    "param_15_records": "${repo}/tools/own_disc/config/case-blocks.json",
+    "param_16_records": "${repo}/tools/own_disc/config/switch-expand.json",
+    "param_17_records": "${repo}/tools/own_disc/config/error-sites-published-1.json",
+    "param_18_scope": "${repo}/tools/own_disc/config/scope.json",
+    "param_19_scope": "${repo}/tools/own_disc/config/scope.json",
+    "param_20_scope": "${repo}/tools/own_disc/config/scope.json",
+    "param_21_records": "${repo}/tools/own_disc/config/recorded-hunks-published-1.json"
+   },
+   "outputs": {
+    "chunks": "recipe/chunks",
+    "corpus": "recipe/corpus",
+    "connected_recipe": "recipe/connected-recipe.json",
+    "base_check": "recipe/base-check.json"
+   },
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/compile_rehearsal.py",
+    "recipe",
+    "--repo",
+    "${repo}",
+    "--work",
+    "${work}",
+    "--recipe",
+    "${work}/prepared-recipe.json"
+   ],
+   "heavy": true,
+   "clean": [
+    "recipe"
+   ]
+  },
+  {
+   "id": "shader-extract",
+   "adapter": "command",
+   "heavy": false,
+   "description": "Read both disc filesystems, recurse game RPFs and install packages, recover RPF secret only in memory from this run codegen, and inventory all FXCs; unknown classes remain explicit.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${repo}/tools/host_guest_trace/stfs_inventory.py",
+    "${repo}/tools/rpf7_inventory",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${hosttools}/xmem-lzx${exe}"
+   ],
+   "inputs": {
+    "generated": "${out:codegen:tree}"
+   },
+   "outputs": {
+    "inventory": "shader-extract/inventory.json",
+    "containers": "shader-extract/containers",
+    "effects": "shader-extract/fxc",
+    "packages": "shader-extract/packages"
+   },
+   "clean": [
+    "shader-extract"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "--repo",
+    "${repo}",
+    "extract",
+    "--play",
+    "${disc:play}",
+    "--install",
+    "${disc:install}",
+    "--generated",
+    "${out:codegen:tree}",
+    "--xmem",
+    "${hosttools}/xmem-lzx${exe}",
+    "--key-address",
+    "0x83bd4c98",
+    "--title-id",
+    "0x545408a7",
+    "--output",
+    "${work}/shader-extract"
+   ]
+  },
+  {
+   "id": "shader-pack",
+   "adapter": "command",
+   "heavy": true,
+   "description": "Translate every bounded disc container with the declared XenosRecomp, descriptor32 DXC flags and spirv-val, then production GSP2 packer. Refuses completion on deferred sources or failed translations; no supplied shader records.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${repo}/tools/rpf7_inventory",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${hosttools}/xenos/main/XenosRecomp${exe}",
+    "${hosttools}/xenos/main/XenosShaderPreflight${exe}",
+    "${hosttools}/xenos/main/shader_common.h",
+    "${hosttools}/dxc/bin/dxc-3.7${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}",
+    "${hosttools}/dxc/lib",
+    "${repo}/tools/own_disc/shader_toolchain.py"
+   ],
+   "inputs": {
+    "inventory": "${out:shader-extract:inventory}",
+    "containers": "${out:shader-extract:containers}"
+   },
+   "outputs": {
+    "pack": "shader-translation/generic-shaders.bin",
+    "report": "shader-translation/translation.json",
+    "records": "shader-translation"
+   },
+   "clean": [
+    "shader-translation"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "--repo",
+    "${repo}",
+    "translate",
+    "--inventory",
+    "${work}/shader-extract",
+    "--host-tools",
+    "${hosttools}",
+    "--ndk",
+    "${ndk}",
+    "--output",
+    "${work}/shader-translation",
+    "--jobs",
+    "4",
+    "--unresolved-ok"
+   ]
+  },
+  {
+   "id": "shader-select",
+   "adapter": "command",
+   "description": "The pack v507 is pinned to: the listed runtime keys out of the full translation, by the production packer.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${repo}/tools/own_disc/disc_builder.py"
+   ],
+   "inputs": {
+    "translation": "${out:shader-pack:report}",
+    "records": "${out:shader-pack:records}",
+    "keys": "${repo}/tools/own_disc/config/gta5-v507-shader-keys.json"
+   },
+   "outputs": {
+    "pack": "shader-select/generic-shaders.bin",
+    "record": "shader-select/selection.json"
+   },
+   "expect": {
+    "pack": "17fc51a8b382fa84904e10ad8e86c9bdb7d98a90866f5e1c7851abcf11f93fa2"
+   },
+   "clean": [
+    "shader-select"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "--repo",
+    "${repo}",
+    "select",
+    "--translation",
+    "${work}/shader-translation",
+    "--keys",
+    "${repo}/tools/own_disc/config/gta5-v507-shader-keys.json",
+    "--output",
+    "${work}/shader-select",
+    "--expect-sha256",
+    "17fc51a8b382fa84904e10ad8e86c9bdb7d98a90866f5e1c7851abcf11f93fa2"
+   ]
+  },
+  {
+   "id": "shader-overrides",
+   "adapter": "command",
+   "heavy": true,
+   "description": "Generate private v507 override headers and container swizzles from this run disc records; original baseline and repair-delta controls, DXC and validator required.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${repo}/tools/own_disc/build_shader_extras.py",
+    "${repo}/tools/own_disc/shader_override_rules.py",
+    "${hosttools}/xenos/main/XenosRecomp${exe}",
+    "${hosttools}/xenos/main/XenosShaderPreflight${exe}",
+    "${hosttools}/xenos/main/shader_common.h",
+    "${hosttools}/dxc/bin/dxc-3.7${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}",
+    "${hosttools}/dxc/lib",
+    "${hosttools}/xenos/gradient/XenosRecomp${exe}",
+    "${hosttools}/xenos/gradient/shader_common.h",
+    "${hosttools}/xenos/reglod/XenosRecomp${exe}",
+    "${hosttools}/xenos/reglod/shader_common.h",
+    "${repo}/tools/own_disc/shader_toolchain.py"
+   ],
+   "inputs": {
+    "inventory": "${out:shader-extract:inventory}",
+    "containers": "${out:shader-extract:containers}",
+    "records": "${out:shader-pack:records}"
+   },
+   "outputs": {
+    "tree": "shader-overrides",
+    "denorm": "shader-overrides/generic_denorm_overrides.inc",
+    "gradient": "shader-overrides/generic_gradient_overrides.inc",
+    "reglod": "shader-overrides/generic_reglod_overrides.inc",
+    "swizzles": "shader-overrides/generic_container_swizzles.inc",
+    "report": "shader-overrides/report.json"
+   },
+   "clean": [
+    "shader-overrides"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_extras.py",
+    "--repo",
+    "${repo}",
+    "--inventory",
+    "${work}/shader-extract",
+    "--translations",
+    "${out:shader-pack:records}",
+    "--host-tools",
+    "${hosttools}",
+    "--ndk",
+    "${ndk}",
+    "--output",
+    "${work}/shader-overrides",
+    "--jobs",
+    "4"
+   ]
+  },
+  {
+   "id": "shader-fixes",
+   "adapter": "command",
+   "heavy": true,
+   "description": "The renderer's later fix tables (ptx, cloth, co-issue, co-issue with register LOD) re-translated from this run disc records with the fix translators; a v41 (register-LOD) control must reproduce each pack (table) module first.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_fixes.py",
+    "${repo}/tools/own_disc/shader_toolchain.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${hosttools}/xenos/v41/XenosRecomp${exe}",
+    "${hosttools}/xenos/v41/shader_common.h",
+    "${hosttools}/xenos/coissue/XenosRecomp${exe}",
+    "${hosttools}/xenos/coissue/shader_common.h",
+    "${hosttools}/xenos/coissue-reglod/XenosRecomp${exe}",
+    "${hosttools}/xenos/coissue-reglod/shader_common.h",
+    "${hosttools}/xenos/reglod/XenosRecomp${exe}",
+    "${hosttools}/xenos/reglod/shader_common.h",
+    "${hosttools}/dxc/bin/dxc-3.7${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}",
+    "${hosttools}/dxc/lib"
+   ],
+   "inputs": {
+    "records": "${out:shader-pack:records}",
+    "pack": "${out:shader-select:pack}",
+    "overrides": "${out:shader-overrides:tree}",
+    "recipes": "${repo}/tools/own_disc/config/thor-shader-fixes-v852.json"
+   },
+   "outputs": {
+    "tree": "shader-fixes",
+    "report": "shader-fixes/report.json",
+    "ptx": "shader-fixes/generic_ptx_overrides.inc",
+    "cloth": "shader-fixes/generic_cloth_overrides.inc",
+    "coissue": "shader-fixes/generic_coissue_overrides.inc",
+    "coissue_reglod": "shader-fixes/generic_coissue_reglod_overrides.inc"
+   },
+   "expect": {
+    "ptx": "b11159abdf0df4ce0d226839544162f92258824281888520936db71f81d5eb60",
+    "cloth": "7e3ef00e3a370676562a186e03d65dff009f3d7a90cf34cba584c4fb89681d7e",
+    "coissue": "1f165a41544f89fd9201dfcd1dd57e06539bb40133422dc569b70c2cfcadba30",
+    "coissue_reglod": "144c0acb622b7e42e366bd56b2a78c668dce54f8875c46db4ef6575d7132612f"
+   },
+   "clean": [
+    "shader-fixes"
+   ],
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/build_shader_fixes.py",
+    "--repo",
+    "${repo}",
+    "--translations",
+    "${out:shader-pack:records}",
+    "--pack",
+    "${out:shader-select:pack}",
+    "--overrides",
+    "${out:shader-overrides:tree}",
+    "--recipes",
+    "${repo}/tools/own_disc/config/thor-shader-fixes-v852.json",
+    "--host-tools",
+    "${hosttools}",
+    "--ndk",
+    "${ndk}",
+    "--output",
+    "${work}/shader-fixes",
+    "--jobs",
+    "4"
+   ]
+  },
+  {
+   "id": "nan-overrides",
+   "adapter": "command",
+   "heavy": false,
+   "description": "The NaN overrides of the iOS build: the two pack modules whose clamped RSQ Metal fast math turns into NaN, rewritten to InverseSqrt(FMax(x, FLT_MIN)) from this run's shader pack (disassembled, patched, reassembled, validated).",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_nan_overrides.py",
+    "${ndk}/shader-tools/${ndkhost}/spirv-dis${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-as${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}"
+   ],
+   "inputs": {
+    "pack": "${out:shader-select:pack}"
+   },
+   "outputs": {
+    "tree": "nan-overrides",
+    "table": "nan-overrides/generic_nan_overrides.inc",
+    "report": "nan-overrides/report.json"
+   },
+   "expect": {
+    "table": "8fc85b8d1485a3b169b644696e7e8fd935908c26fa182ce485349be139d03b11"
+   },
+   "clean": [
+    "nan-overrides"
+   ],
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/build_nan_overrides.py",
+    "--pack",
+    "${out:shader-select:pack}",
+    "--spirv-tools",
+    "${ndk}/shader-tools/${ndkhost}",
+    "--out",
+    "${work}/nan-overrides"
+   ]
+  },
+  {
+   "id": "boot-shaders",
+   "adapter": "command",
+   "heavy": true,
+   "description": "Five boot translations and guest companions from disc FXCs / decoded executable, declared vertex binding metadata and bounded project adapters; four authored compute modules compiled alongside.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${repo}/tools/own_disc/build_boot_shaders.py",
+    "${repo}/tools/rpf7_inventory",
+    "${repo}/tools/vulkan_probe",
+    "${ndk}/shader-tools/${ndkhost}/glslc${exe}",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}"
+   ],
+   "inputs": {
+    "inventory": "${out:shader-extract:inventory}",
+    "containers": "${out:shader-extract:containers}",
+    "image": "${out:decode-xex:image}",
+    "configuration": "${repo}/tools/own_disc/config/boot-config.json"
+   },
+   "outputs": {
+    "tree": "boot-shaders",
+    "report": "boot-shaders/report.json",
+    "copy_dataflow_spv": "boot-shaders/copy/dataflow.spv",
+    "depth_store_dataflow_spv": "boot-shaders/depth/store/dataflow.spv",
+    "depth_vertex_dataflow_spv": "boot-shaders/depth/vertex/dataflow.spv",
+    "depth_vertex_guest_code_bin": "boot-shaders/depth/vertex/guest-code.bin",
+    "load_dataflow_spv": "boot-shaders/load/dataflow.spv",
+    "r8_fragment_dataflow_spv": "boot-shaders/r8/fragment/dataflow.spv",
+    "r8_fragment_guest_code_bin": "boot-shaders/r8/fragment/guest-code.bin",
+    "r8_vertex_dataflow_spv": "boot-shaders/r8/vertex/dataflow.spv",
+    "r8_vertex_guest_code_bin": "boot-shaders/r8/vertex/guest-code.bin",
+    "small_fragment_dataflow_spv": "boot-shaders/small/fragment/dataflow.spv",
+    "small_fragment_guest_code_bin": "boot-shaders/small/fragment/guest-code.bin",
+    "small_vertex_dataflow_spv": "boot-shaders/small/vertex/dataflow.spv",
+    "small_vertex_guest_code_bin": "boot-shaders/small/vertex/guest-code.bin",
+    "store_dataflow_spv": "boot-shaders/store/dataflow.spv"
+   },
+   "clean": [
+    "boot-shaders"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_boot_shaders.py",
+    "--repo",
+    "${repo}",
+    "--inventory",
+    "${work}/shader-extract",
+    "--image",
+    "${out:decode-xex:image}",
+    "--config",
+    "${repo}/tools/own_disc/config/boot-config.json",
+    "--glslc",
+    "${ndk}/shader-tools/${ndkhost}/glslc${exe}",
+    "--spirv-validator",
+    "${ndk}/shader-tools/${ndkhost}/spirv-val${exe}",
+    "--output",
+    "${work}/boot-shaders"
+   ],
+   "expect": {
+    "copy_dataflow_spv": "96112b93f8ab99fb31735690d89d38ee29da070d4ddd6ef7f192af3242591a95",
+    "depth_store_dataflow_spv": "8b484936ccda1d1bcc6aa325b4492c17017c8a8db5e616cd730797818f3b89da",
+    "depth_vertex_dataflow_spv": "abe7ba53ce3ceeba286adb1224633eec0acfb27a16a59c6428bc1b1f33497bc9",
+    "depth_vertex_guest_code_bin": "abfec28e9858fd1b9b27afd527f08421c38f288e9333cc7fc10d6391ac190fa9",
+    "load_dataflow_spv": "a7621aebb6da67fb08fc66b462dc41b1fd0c524c8ae7d1c06e21b6e53e6246e5",
+    "r8_fragment_dataflow_spv": "a07036fa52d2a66d937ceb952d41813ffa52e1abb2b74a158cb3852fc5676eac",
+    "r8_fragment_guest_code_bin": "a05a7c15f140b8435b86a9da4abf91a92e7eca4c2a451916bad3719863e31845",
+    "r8_vertex_dataflow_spv": "de64b536dcd4e8f3f595addd903569d7f84387188a027745a7cfb790719bb21a",
+    "r8_vertex_guest_code_bin": "d2b5d5f65ad1fdbbf8698ee980c1439cf1a84d67c03a5fe321d3046c547fd75f",
+    "small_fragment_dataflow_spv": "577793b75259eef8732313417579a19107b7ac7aab54669dc4b27491319ea75c",
+    "small_fragment_guest_code_bin": "6b56ae19cb07e38961a7eec2870cb3450f62bbc79ca07c4b1de4802ae6ea58e4",
+    "small_vertex_dataflow_spv": "116d15decaa113cd65182f612c98a4de0cff3d93e36e5fc5e4c47f931310d56d",
+    "small_vertex_guest_code_bin": "e14114efbb2c72d5780dbf08ea4e6ec5f0dd9cc3196a447bff2dcaf2e080c9e2",
+    "store_dataflow_spv": "b1b44cabdafe8639ed69ee0017d7f25820d44c06602ef605745343703ca2e508"
+   }
+  },
+  {
+   "id": "catalogs",
+   "adapter": "command",
+   "description": "The six small catalogs from the discs; timestamps from the table.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_catalogs.py",
+    "${repo}/tools/own_disc/disc_builder.py",
+    "${repo}/tools/host_guest_trace/file_metadata_catalog.py",
+    "${repo}/tools/host_guest_trace/content_catalog.py",
+    "${repo}/tools/host_guest_trace/stfs_inventory.py"
+   ],
+   "inputs": {
+    "inventory": "${out:shader-extract:inventory}",
+    "packages": "${out:shader-extract:packages}",
+    "times": "${repo}/tools/own_disc/config/gta5-v507-catalog-times.json"
+   },
+   "outputs": {
+    "file_metadata": "catalogs/file-metadata.bin",
+    "installed_content": "catalogs/installed-content.bin",
+    "installed_package_1": "catalogs/installed-package-1.bin",
+    "installed_package_2": "catalogs/installed-package-2.bin",
+    "installed_package_3": "catalogs/installed-package-3.bin",
+    "installed_package_4": "catalogs/installed-package-4.bin",
+    "report": "catalogs/report.json"
+   },
+   "expect": {
+    "file_metadata": "79ddaf54aa2444dcd483aed955ed0cf97387a9ba38330e8feb19c8b539bd8d06",
+    "installed_content": "e640d9edc295f389a90c5c1f66e16235a0f2cb6d919965e89784500157778669",
+    "installed_package_1": "fbe6bc13646b0b7f5b526727d649e2e4c7a65a136f9c438db1590a85807b1536",
+    "installed_package_2": "4ec81dc527edbc4b2a9d011ebad2888cc374e4ba1fa67ea662368b6609de42bd",
+    "installed_package_3": "9104eda921076bb0602a7a813592be62a158487c2c54bac24c0584194ab82cb8",
+    "installed_package_4": "b22b488e9760f1af2a9766ead7922fd16279f96f858f5b8f7a754b8aa3278880"
+   },
+   "clean": [
+    "catalogs"
+   ],
+   "argv": [
+    "${python}",
+    "${repo}/tools/own_disc/build_catalogs.py",
+    "--play",
+    "${disc:play}",
+    "--inventory",
+    "${work}/shader-extract",
+    "--times",
+    "${repo}/tools/own_disc/config/gta5-v507-catalog-times.json",
+    "--title-id",
+    "0x545408a7",
+    "--output",
+    "${work}/catalogs"
+   ]
+  },
+  {
+   "id": "native-packs",
+   "adapter": "command",
+   "heavy": false,
+   "description": "The runtime's native shader pack headers (57 packs, 16 module headers, 18 forwarding headers) from this run's disc shader inventory: shader bytes by canonical form and fetch numbers, SPIR-V by the tracked translators (one header by the tracked revision of 10 September) and the kit's glslc, each header checked against the hash its recipe names.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_native_packs.py",
+    "${repo}/tools/own_disc/build_boot_shaders.py",
+    "${repo}/tools/own_disc/build_shader_pack.py",
+    "${repo}/tools/iter/generic_shader_pack.py",
+    "${repo}/tools/rpf7_inventory",
+    "${ndk}/shader-tools/${ndkhost}/glslc${exe}"
+   ],
+   "inputs": {
+    "inventory": "${out:shader-extract:inventory}",
+    "containers": "${out:shader-extract:containers}",
+    "recipes": "${repo}/tools/own_disc/config/gta5-v507-native-packs.json"
+   },
+   "outputs": {
+    "tree": "native-packs",
+    "report": "native-packs/report.json"
+   },
+   "clean": [
+    "native-packs"
+   ],
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/build_native_packs.py",
+    "--inventory",
+    "${work}/shader-extract",
+    "--recipes",
+    "${repo}/tools/own_disc/config/gta5-v507-native-packs.json",
+    "--glslc",
+    "${ndk}/shader-tools/${ndkhost}/glslc${exe}",
+    "--output",
+    "${work}/native-packs"
+   ],
+   "expect": {
+    "tree": "3e20f3888a3b334fd019918f4de2e6265d014cdc109138334997eaba5f885433"
+   }
+  },
+  {
+   "id": "code-headers",
+   "adapter": "command",
+   "heavy": false,
+   "description": "The runtime's hooked copies of game functions from this run's recipe output: the generated function with this project's lines put in by rule, each header checked against the hash its recipe names.",
+   "tools": [
+    "${python}",
+    "${repo}/tools/own_disc/build_code_headers.py"
+   ],
+   "inputs": {
+    "chunks": "${out:recipe:chunks}",
+    "recipes": "${repo}/tools/own_disc/config/gta5-v507-code-headers.json"
+   },
+   "outputs": {
+    "tree": "code-headers",
+    "report": "code-headers/report.json"
+   },
+   "clean": [
+    "code-headers"
+   ],
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/build_code_headers.py",
+    "--chunks",
+    "${out:recipe:chunks}",
+    "--recipes",
+    "${repo}/tools/own_disc/config/gta5-v507-code-headers.json",
+    "--output",
+    "${work}/code-headers"
+   ],
+   "expect": {
+    "tree": "aea2b48ec9204f73379ef83608b32a73d0bdba3ab65915cae2bb30726f6234d2"
+   }
+  },
+  {
+   "id": "ios-payload",
+   "adapter": "command",
+   "heavy": false,
+   "description": "The app's data seed: this run's decoded image, boot modules, catalogs and shader pack (each checked by hash) and the runtime's switch files, with the manifest whose SHA-256 the shell checks before it seeds Library/r.",
+   "tools": [
+    "${repo}/tools/own_disc/ios_app.py"
+   ],
+   "inputs": {
+    "payload_map": "${repo}/tools/own_disc/config/payload-map-243.json",
+    "stage_decode": "${out:decode-xex:image}",
+    "stage_boot-shaders": "${out:boot-shaders:tree}",
+    "stage_catalogs": "${out:catalogs:report}",
+    "stage_shader-select": "${out:shader-select:pack}"
+   },
+   "outputs": {
+    "tree": "ios-payload",
+    "manifest": "ios-payload/manifest.txt",
+    "sha": "ios-payload/manifest.sha256"
+   },
+   "clean": [
+    "ios-payload"
+   ],
+   "argv": [
+    "${python}",
+    "-B",
+    "${repo}/tools/own_disc/ios_app.py",
+    "payload",
+    "--payload-map",
+    "${repo}/tools/own_disc/config/payload-map-243.json",
+    "--out",
+    "${work}/ios-payload",
+    "--stage",
+    "decode=${work}/decode",
+    "--stage",
+    "boot-shaders=${work}/boot-shaders",
+    "--stage",
+    "catalogs=${work}/catalogs",
+    "--stage",
+    "shader-select=${work}/shader-select"
+   ]
+  }
+ ],
+ "output": {
+  "name": "generated-source.json",
+  "stage": "code-headers",
+  "output": "report"
+ }
+}

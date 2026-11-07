@@ -1,0 +1,22 @@
+[main]
+file_path = "../../Disc2-Play/default.xex"
+out_directory_path = "./ppc"
+switch_table_file_path = "./switch_tables.toml"
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+invalid_instructions = [{ data = 0x00000000, size = 4 }]
+restgprlr_14_address = 0x83622940
+savegprlr_14_address = 0x836228F0
+restfpr_14_address = 0x83622D6C
+savefpr_14_address = 0x83622D20
+restvmx_14_address = 0x83623128
+savevmx_14_address = 0x83622E90
+restvmx_64_address = 0x836231BC
+savevmx_64_address = 0x83622F24
+functions = [{ address = 0x82332868, size = 0x2B0 }, { address = 0x831B1E38, size = 0x74 }, { address = 0x83217D38, size = 0x180 }, { address = 0x83226070, size = 0x120 }, { address = 0x83226190, size = 0x98 }]

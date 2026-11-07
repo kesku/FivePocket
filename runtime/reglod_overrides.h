@@ -64,10 +64,8 @@ template<class Override>
         }
         if(found==packCount){r.why="override-key-missing";return r;}
         std::uint32_t stage;std::memcpy(&stage,pack.data()+16+std::size_t{found}*sizeof(Entry)+offsetof(Entry,stage),4);
-        // stageMask: the pack stages (0 vertex, 1 pixel) an override may replace. Default pixel only (register-LOD fetches exist in
-        // pixel shaders only); v595 (fold-fixer3): the co-issue table passes 0x3, since 133 of its keys are vertex shaders (v593/v594
-        // refused the whole table with override-stage; the iPad's c524b log, build 206 fix).
-        if(stage>31 || !((stageMask>>stage)&1u)){r.why="override-stage";return r;}
+        if(stage>31 || !((stageMask>>stage)&1u)){r.why="override-stage";return r;} // (register-LOD fetches exist in pixel shaders only:
+        // the default mask is stage 1; iPad 2026-10-22: the co-issue table holds 133 vertex (stage 0) and 26 pixel modules and passes 0x3)
         target[i]=found;total+=std::size_t{o.words}*4+3;
     }
     if(pack.size()+total>std::size_t{0xFFFFFFFFu}){r.why="pack-size";return r;}

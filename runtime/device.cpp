@@ -1,8 +1,12 @@
+#if defined(__APPLE__)
+#include "apple/vulkan_extensions.h"
+#endif
 #include "vk11_gate.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
 #include "device.h"
+#include "apple/ios_gpu_lifecycle.h"
 #include <atomic>
 #include "recomp_app_dir.h" // data-paths: the app's files directory. v293: VK_EXT_load_store_op_none enabled on the device this file creates (read by the generic renderer, weak there).
 extern "C" { std::atomic<bool> recomp_v293_store_none{false}; }
@@ -20,6 +24,7 @@ extern "C" { std::atomic<unsigned> recomp_df_bias_float{0}; }
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -141,6 +146,7 @@ namespace {
 std::mutex dedicatedQueuesMutex;
 std::map<VkDevice,VkQueue> dedicatedQueues;
 std::map<VkDevice,VkQueue> presentQueues; // v259
+std::map<VkDevice,std::pair<VkQueue,uint32_t>> sideQueues; // ios-side-queue
 std::atomic<unsigned> familyQueueCount{0}; // v259 (logged by the direct present)
 }
 VkQueue probePresentQueue(VkDevice device) { // v259
@@ -149,6 +155,14 @@ VkQueue probePresentQueue(VkDevice device) { // v259
     return it==presentQueues.end()?VK_NULL_HANDLE:it->second;
 }
 unsigned probeFamilyQueueCount() { return familyQueueCount.load(std::memory_order_relaxed); } // v259
+// ios-side-queue (Claude 2026-10-21; MEASUREMENT ONLY, RECOMP_IOS_SIDE_QUEUE set when the device is made): MoltenVK offers four
+// families of one queue each (VULKAN_QUEUE_FAMILY, c438), each its own Metal command queue; the device then also gets the
+// queue of another family, for the presenter's experiments (does GPU work on a second queue overlap the game's frame?).
+std::pair<VkQueue,uint32_t> probeSideQueue(VkDevice device) {
+    std::lock_guard lock(dedicatedQueuesMutex);
+    const auto it=sideQueues.find(device);
+    return it==sideQueues.end()?std::pair<VkQueue,uint32_t>{VK_NULL_HANDLE,0u}:it->second;
+}
 // Attempt v255 (direct present): with files/private-trace/diag-direct-present present when the device is made, the instance
 // also enables VK_KHR_surface + VK_KHR_android_surface and the device VK_KHR_swapchain (each only when offered), so the
 // library can present to the app's window itself (direct_present.h). Without the file: v254 (no extensions).
@@ -162,7 +176,14 @@ bool offered(const std::vector<VkExtensionProperties>& all,const char* name) {
 }
 }
 bool directPresentWanted() {
+#if defined(__APPLE__)
+    // ios-direct-present (Claude, 2026-10-16): the iOS shell selects V6 with RECOMP_IOS_DIRECT_PRESENT=1 (its private-trace folder
+    // is not writable by the shell), so the same choice enables the surface extensions here.
+    static const bool on = access(RECOMP_APP_PATH("/private-trace/diag-direct-present"), F_OK) == 0 ||
+        [] { const char* e = std::getenv("RECOMP_IOS_DIRECT_PRESENT"); return e && e[0] == '1' && !e[1]; }();
+#else
     static const bool on = access(RECOMP_APP_PATH("/private-trace/diag-direct-present"), F_OK) == 0;
+#endif
     return on;
 }
 bool displayTimingEnabled() {return recomp_v318_display_timing.load(std::memory_order_acquire);} // v318
@@ -181,6 +202,14 @@ bool checkVulkan(VkResult result, const char* operation) {
     return false;
 }
 ProbeDevice::~ProbeDevice() {
+    if (device && ::recomp::apple::iosGpuLifecycle().snapshot().phase !=
+            ::recomp::apple::IosGpuLifecycle::Phase::Disabled) {
+        if (!::recomp::apple::iosGpuLifecycle().retireDevice(device) ||
+                vkDeviceWaitIdle(device) != VK_SUCCESS) {
+            std::fprintf(stderr,"APPLE_IOS_LIFECYCLE_TEARDOWN_FAILED owner=ProbeDevice\n");
+            std::_Exit(4);
+        }
+    }
 #if !defined(RECOMP_PCACHE_MUTANT_STOP_LATE) // host-test mutant: the saver is stopped only after the cache is destroyed
     if (device) pcacheStop(device); // boot-stall: the saver thread's last save, then no more use of the cache
 #endif
@@ -209,6 +238,10 @@ bool ProbeDevice::inspect() {
     info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     info.pApplicationInfo = &app;
     std::vector<const char*> instanceExtensions; // v255
+#if defined(__APPLE__)
+    const bool appleSurface = directPresentWanted();
+    if (!recomp::apple::instanceExtensions(appleSurface, instanceExtensions, info.flags)) return false;
+#else
     if (directPresentWanted()) {
         uint32_t n = 0;
         std::vector<VkExtensionProperties> all;
@@ -221,10 +254,15 @@ bool ProbeDevice::inspect() {
             instanceExtensions = {"VK_KHR_surface", "VK_KHR_android_surface"};
         std::printf("VULKAN_V255_DIRECT_INSTANCE surface_extensions=%u\n", unsigned(!instanceExtensions.empty()));
     }
+#endif
     info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
     info.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
     if (!checkVulkan(vkCreateInstance(&info, nullptr, &instance), "create-instance")) return false;
+#if defined(__APPLE__)
+    surfaceInstanceEnabled.store(appleSurface, std::memory_order_release);
+#else
     surfaceInstanceEnabled.store(!instanceExtensions.empty(), std::memory_order_release);
+#endif
     const auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
         vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
     if (!features2) return false;
@@ -343,6 +381,8 @@ bool ProbeDevice::create(const ShaderRequirements& requirements,bool samplerAnis
     if (count == 0 || count > 256) return false;
     std::vector<VkQueueFamilyProperties> queues(count);
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, queues.data());
+    for (uint32_t i = 0; i < count; ++i) // ios-queue-families (Claude 2026-10-21; diagnostic): what the driver offers for a second queue
+        std::printf("VULKAN_QUEUE_FAMILY index=%u count=%u flags=%#x families=%u\n", i, queues[i].queueCount, unsigned(queues[i].queueFlags), count);
     bool found = false;
     for (uint32_t i = 0; i < count; ++i) {
         if (queues[i].queueCount &&
@@ -359,6 +399,9 @@ bool ProbeDevice::create(const ShaderRequirements& requirements,bool samplerAnis
     const unsigned renderQueues = secondQueue ? 2u : 1u;
     const bool presentQueue = surfaceInstanceEnabled.load(std::memory_order_acquire) && queues[queueFamily].queueCount > renderQueues;
     const float priorities[3] = {1.0f, secondQueue ? 0.0f : 1.0f, 1.0f};
+    const bool sideQueue = std::getenv("RECOMP_IOS_SIDE_QUEUE") != nullptr && count >= 2; // ios-side-queue
+    const uint32_t sideFamily = queueFamily == 0 ? 1u : 0u;
+    const float sidePriority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{};
     queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     queueInfo.queueFamilyIndex = queueFamily;
@@ -384,8 +427,11 @@ bool ProbeDevice::create(const ShaderRequirements& requirements,bool samplerAnis
     VkDeviceCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     info.pNext = &addresses;
-    info.queueCreateInfoCount = 1;
-    info.pQueueCreateInfos = &queueInfo;
+    VkDeviceQueueCreateInfo queueInfos[2] = {queueInfo, {}}; // ios-side-queue: the other family's queue as a second entry
+    queueInfos[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;queueInfos[1].queueFamilyIndex = sideFamily;
+    queueInfos[1].queueCount = 1;queueInfos[1].pQueuePriorities = &sidePriority;
+    info.queueCreateInfoCount = sideQueue ? 2u : 1u;
+    info.pQueueCreateInfos = queueInfos;
     info.pEnabledFeatures = &enabled;
     const char* swapchainExtension = "VK_KHR_swapchain"; // v255
     const char* storeNoneExtension = "VK_EXT_load_store_op_none"; // v293
@@ -402,6 +448,9 @@ bool ProbeDevice::create(const ShaderRequirements& requirements,bool samplerAnis
         }
     }
     std::vector<const char*> extensions;
+#if defined(__APPLE__)
+    recomp::apple::appendDevicePortability(all, extensions);
+#endif
     if (surfaceInstanceEnabled.load(std::memory_order_acquire)) {
         swapchain = offered(all, swapchainExtension);
         if (swapchain) extensions.push_back(swapchainExtension);
@@ -494,16 +543,26 @@ bool ProbeDevice::create(const ShaderRequirements& requirements,bool samplerAnis
         "runtimeDescriptorArray=%u\n", enabled.shaderInt64,
         enabled.shaderSampledImageArrayDynamicIndexing, indexing.runtimeDescriptorArray);
     vkGetDeviceQueue(device, queueFamily, 0, &queue);
+    if(!::recomp::apple::iosGpuLifecycle().registerQueue(device,queue))return false;
     std::printf("VULKAN_V78_QUEUES family=%u family_queues=%u created=%u\n", queueFamily, queues[queueFamily].queueCount, secondQueue ? 2u : 1u);
     if (secondQueue) {
         VkQueue second = VK_NULL_HANDLE;
         vkGetDeviceQueue(device, queueFamily, 1, &second);
+        if(!::recomp::apple::iosGpuLifecycle().registerQueue(device,second))return false;
         if (second) {std::lock_guard lock(dedicatedQueuesMutex); dedicatedQueues[device] = second;}
     }
     if (presentQueue) { // v259
         VkQueue present = VK_NULL_HANDLE;
         vkGetDeviceQueue(device, queueFamily, renderQueues, &present);
+        if(!::recomp::apple::iosGpuLifecycle().registerQueue(device,present))return false;
         if (present) {std::lock_guard lock(dedicatedQueuesMutex); presentQueues[device] = present;}
+    }
+    if (sideQueue) { // ios-side-queue
+        VkQueue side = VK_NULL_HANDLE;
+        vkGetDeviceQueue(device, sideFamily, 0, &side);
+        if(!::recomp::apple::iosGpuLifecycle().registerQueue(device,side))return false;
+        if (side) {std::lock_guard lock(dedicatedQueuesMutex); sideQueues[device] = {side, sideFamily};}
+        std::printf("VULKAN_SIDE_QUEUE family=%u queue=%p\n", sideFamily, (void*)side);
     }
     familyQueueCount.store(queues[queueFamily].queueCount, std::memory_order_relaxed);
     // boot-stall (2026-10-06): the cache is seeded from this app's own files/private-trace/pipeline-cache.bin when that file

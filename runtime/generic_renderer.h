@@ -113,7 +113,9 @@ struct ResolveInput {
     unsigned mip=0,slice=0;             // v40: adapter r8 / r9 (destination level and slice)
     float clearDepth=1;std::uint32_t clearStencil=0; // v40: f1 and caller stack word 92 (RB_DEPTH_CLEAR)
     std::uint32_t parameters=0;         // v40: caller stack word 100 (logged only)
-    std::uint32_t caller=0,caller2=0;   // v580 (census only): the guest return address of 82388A38's call and its caller's (G7 tile resolves)
+#ifdef RECOMP_THOR_EDITION
+    std::uint32_t caller=0,caller2=0;   // v580 (census only): the guest return address of 82388A38's call and its caller's (G7 tile resolves) (ios-duo: hud3's radar resolve test reads it)
+#endif /* RECOMP_THOR_EDITION */
 };
 
 struct Stats {

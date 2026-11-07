@@ -9,7 +9,6 @@
 #include <vector>
 #include <array>
 #include "indirect_call_resolver.h"
-#include "generic_texture_decode.h" // v613: tex::tiled2D (the water telemetry)
 #include "bot_vision_scan.h" // bot-vision (2026-10-03): RENDER_DIAG_NEAR, read-only entity pool scan
 #include "recomp_app_dir.h" // data-paths: the app's files directory.
 #include "guest_execution_guard.h"
@@ -341,54 +340,12 @@ void noteLabel(std::uint32_t hash,const char* label) {
     bot_vision::format(snap,now,us,line,sizeof line);
     __android_log_print(ANDROID_LOG_INFO,"RecompRenderer","%s",line);
 }
-// v591 (main's request, 2026-10-22): the player's live health / max health / armour read from guest memory each telemetry tick
-// (hp= is the last result a SCRIPT got from get_entity_health for the player: stale while no script polls it, e.g. off mission).
-// The same reads as v585's hud_game_state.h, from our validated asm comments of the native handlers: player_ped_id fa92e226 ->
-// ped = *( *(0x8394B8B0) + 4 ); get_entity_health 8e3222b7 -> sub_82D71078: float at entity + 192; get_entity_max_health
-// c7ae6aa1 -> float at entity + 384; get_ped_armour 2ce311a7 -> float at ped + 3588; entity type byte +20 = 4 (ped).
-// Read-only relaxed loads; -1 when there is no ped. Printed as hpl=health/max arm=armour.
-struct Live {float hp=-1,hpMax=-1,armour=-1;};
-Live liveHealth(const std::uint8_t* base) noexcept {
-    Live l;if(!base)return l;
-    const auto ok=[](std::uint32_t a){return a>=0x10000u && a<=0xFFFF0000u && !(a&3u);};
-    const auto u32=[&](std::uint32_t a)->std::uint32_t{return ok(a)?__builtin_bswap32(__atomic_load_n(reinterpret_cast<const std::uint32_t*>(base+a),__ATOMIC_RELAXED)):0u;};
-    const auto f32=[&](std::uint32_t a){const auto w=u32(a);float v;std::memcpy(&v,&w,4);return v;};
-    const std::uint32_t slot=u32(0x8394B8B0u);if(!ok(slot))return l;
-    const std::uint32_t ped=u32(slot+4);if(!ok(ped) || __atomic_load_n(base+ped+20,__ATOMIC_RELAXED)!=4)return l;
-    l.hp=f32(ped+192);l.hpMax=f32(ped+384);l.armour=f32(ped+3588);
-    return l;
-}
-// v613 (swim-fixer, 2026-10-22): the water state the CPU's buoyancy reads at the player's cell, the same reads as the game's
-// grid sampler sub_828F1FF8 (from its asm comments): the grid origin is 2*floor(o/2) of the floats behind the pointers at
-// 0x83956234 (x) and 0x83958588 (y); the cell is the player's 2*floor(p/2) minus the origin, valid in (0, 256); column/row =
-// cell/2 & 127; height = float at *(0x83954D5C) + 4*(row*128 + column) (linear), water vertical velocity = float at
-// *(0x839585C4) + XGAddress2DTiledOffset(column, row, 128, 4)*4 (tex::tiled2D with 4-byte texels). Also over the whole
-// velocity map: the largest |v| and the number of non-zero texels. Printed as wat=h,v,vmax,nonzero ("wat=-" when the maps
-// do not exist or the player is outside the grid). Read-only relaxed loads, once per telemetry tick (100 ms).
-[[gnu::noinline]] void waterAt(const std::uint8_t* base,float px,float py,char* out,std::size_t n) noexcept {
-    std::snprintf(out,n,"-");if(!base)return;
-    const auto ok=[](std::uint32_t a){return a>=0x10000u && a<=0xFFFF0000u && !(a&3u);};
-    const auto u32=[&](std::uint32_t a)->std::uint32_t{return ok(a)?__builtin_bswap32(__atomic_load_n(reinterpret_cast<const std::uint32_t*>(base+a),__ATOMIC_RELAXED)):0u;};
-    const auto f32=[&](std::uint32_t a){const auto w=u32(a);float v;std::memcpy(&v,&w,4);return v;};
-    const std::uint32_t heights=u32(0x83954D5Cu),velocity=u32(0x839585C4u),oxp=u32(0x83956234u),oyp=u32(0x83958588u);
-    if(!ok(heights) || !ok(velocity) || !ok(oxp) || !ok(oyp))return;
-    const auto even=[](float f){return 2*static_cast<long>(std::floor(f*0.5f));};
-    const long cx=even(px)-even(f32(oxp)),cy=even(py)-even(f32(oyp));
-    float vmax=0;unsigned nonzero=0;
-    for(std::uint32_t i=0;i<128u*128u;++i){const float v=f32(velocity+4*i);if(v!=0.0f)++nonzero;if(std::fabs(v)>vmax)vmax=std::fabs(v);}
-    if(cx<=0 || cx>=256 || cy<=0 || cy>=256){std::snprintf(out,n,"out,out,%.3f,%u",double(vmax),nonzero);return;}
-    const unsigned col=unsigned(cx>>1)&127u,row=unsigned(cy>>1)&127u;
-    const float h=f32(heights+4*(row*128u+col)),v=f32(velocity+static_cast<std::uint32_t>(::recomp::gpu::generic::tex::tiled2D(col,row,128,2)));
-    std::snprintf(out,n,"%.3f,%.3f,%.3f,%u",double(h),double(v),double(vmax),nonzero);
-}
 void maybeLog(std::uint32_t player,const std::array<std::atomic<std::uint32_t>,3>& xyz,const std::uint8_t* base) {
     const auto now=nowMs();
     if(!enabled.load(std::memory_order_relaxed))return;
     auto next=nextLogMs.load(std::memory_order_relaxed);
     if(now<next || !nextLogMs.compare_exchange_strong(next,now+100,std::memory_order_relaxed))return;
     logNear(player,base,now); // (bot-vision: before this tick's telemetry line; no branch here, see logNear)
-    const Live live=liveHealth(base); // v591
-    char water[64];waterAt(base,asFloat(xyz[0].load(std::memory_order_relaxed)),asFloat(xyz[1].load(std::memory_order_relaxed)),water,sizeof water); // v613
     char targets[1400];std::size_t used=0;targets[0]=0;unsigned shown=0;
     char texts[240];std::size_t textUsed=0;texts[0]=0;
     char pedText[900];std::size_t pedUsed=0;pedText[0]=0;unsigned pedShown=0;
@@ -418,10 +375,9 @@ void maybeLog(std::uint32_t player,const std::array<std::atomic<std::uint32_t>,3
         }
     }
     __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",
-        "RENDER_DIAG_TELEMETRY ms=%lld ped=%08x pos=%.2f,%.2f,%.2f hp=%d wanted=%d veh=%d cut=%d fade=%d ctl=%d hpl=%.1f/%.1f arm=%.1f wat=%s targets=%s text=%s peds=%s",
+        "RENDER_DIAG_TELEMETRY ms=%lld ped=%08x pos=%.2f,%.2f,%.2f hp=%d wanted=%d veh=%d cut=%d fade=%d ctl=%d targets=%s text=%s peds=%s",
         now,player,asFloat(xyz[0].load(std::memory_order_relaxed)),asFloat(xyz[1].load(std::memory_order_relaxed)),
-        asFloat(xyz[2].load(std::memory_order_relaxed)),hp.load(),stars.load(),veh.load(),cut.load(),fade.load(),ctl.load(),
-        double(live.hp),double(live.hpMax),double(live.armour),water,targets,texts,pedText);
+        asFloat(xyz[2].load(std::memory_order_relaxed)),hp.load(),stars.load(),veh.load(),cut.load(),fade.load(),ctl.load(),targets,texts,pedText);
 }
 } // namespace telemetry
 std::uint32_t beWord(const std::uint8_t* base,std::uint32_t a) {
@@ -450,8 +406,9 @@ extern "C" void recomp_v273_set_probe_trim(bool on) {
     if(probeTrim.exchange(on,std::memory_order_acq_rel)!=on)clearIndirectCache();
 }
 extern "C" void recomp_trainer_note_native(std::uint32_t hash,std::uint32_t handler) noexcept; // (trainer_glue.inc)
+extern "C" void recomp_trainer_after_native(std::uint32_t hash,std::uint64_t callerLr,PPCContext& c,std::uint8_t* base) noexcept; // (trainer_glue.inc)
 extern "C" void recomp_native_probe_register(std::uint32_t hash,std::uint32_t handler) {
-    recomp_trainer_note_native(hash,handler); // trainer (2026-10-25): the handlers of the natives it calls, by hash
+    recomp_trainer_note_native(hash,handler); // trainer (iPad 237): the handlers of the natives it calls, by hash
     const auto count=std::min(recomp::bootstrap::validatedMappingCount.load(std::memory_order_acquire),nativeSlotCount);
     std::size_t first=0,last=count;
     while(first<last){const auto m=first+(last-first)/2;if(PPCFuncMappings[m].guest<handler)first=m+1;else last=m;}
@@ -489,7 +446,6 @@ extern "C" void recomp_native_probe_dump() {
 
 
 extern "C" void recomp_host_guest_call_indirect(std::uint32_t guestTarget,PPCContext& context,std::uint8_t* base);
-extern "C" void recomp_trainer_after_native(std::uint32_t hash,std::uint64_t callerLr,PPCContext& c,std::uint8_t* base) noexcept; // (trainer_glue.inc)
 namespace {
 // v216: everything but a fast cache hit (binary search, fills, invalid targets, native probes and telemetry).
 [[gnu::noinline]] void indirectCallSlow(
@@ -592,9 +548,9 @@ namespace {
                 if(!ok || n<3 || n>=27)telemetryLabel[0]=0; else telemetryLabel[n]=0;
             }
         }
-        const auto callerLr=context.lr; // trainer: the script VM's native call is the safe point
+        const auto callerLr=context.lr; // trainer (iPad 237, trainer-mods v952): the script VM's native call is the safe point
         PPCFuncMappings[first].host(context, base);
-        recomp_trainer_after_native(hash,callerLr,context,base); // (a plain call: no new branch in this profiled function)
+        recomp_trainer_after_native(hash,callerLr,context,base); // (a plain call: no new branch in this function)
         if(telemetryLabel[0])telemetry::noteLabel(hash,telemetryLabel);
         if(plausibleArg(cxt)) {
             if(telemetryCall){const auto ret=beWord(base,cxt);
@@ -712,5 +668,5 @@ extern "C" void recomp_host_guest_call_indirect(std::uint32_t guestTarget,PPCCon
     indirectCallSlow(guestTarget, context, base);
 }
 
-// trainer (2026-10-25, local-analysis/trainer-mods): the safe point, the native calls and the app API.
+// trainer (iPad 237, 2026-10-25; local-analysis/trainer-mods v952): the safe point, the native calls and the app API.
 #include "trainer_glue.inc"

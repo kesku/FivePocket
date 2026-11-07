@@ -1,6 +1,7 @@
 #include "vulkan_queue_lock_all.h" // v177: every VkQueue call in this file holds the shared queue lock
 #include "recomp_app_dir.h" // data-paths: the app's files directory. v179: vulkan_engine.h, native_tile_command_interrupt.h and native_tile_scene_handoff.h are attempt copies (the journal fix).
 #include "vulkan_engine.h"
+#include "apple/ios_gpu_lifecycle.h"
 #include "vulkan_queue_lock.h" // v119
 #include <unistd.h> // v170: access()
 #include "native_display_information.h"
@@ -1038,6 +1039,14 @@ bool VulkanEngine::executeExperimentalNativeDisplayOutput(const NativeDisplayOut
 }
 
 VulkanEngine::~VulkanEngine() {
+    if (context_.device && ::recomp::apple::iosGpuLifecycle().snapshot().phase !=
+            ::recomp::apple::IosGpuLifecycle::Phase::Disabled) {
+        if (!::recomp::apple::iosGpuLifecycle().retireDevice(context_.device) ||
+                vkDeviceWaitIdle(context_.device) != VK_SUCCESS) {
+            std::fprintf(stderr,"APPLE_IOS_LIFECYCLE_TEARDOWN_FAILED owner=VulkanEngine\n");
+            std::_Exit(4);
+        }
+    }
     if (mapped_) vkUnmapMemory(context_.device, bootstrapMemory_);
     if (fence_) vkDestroyFence(context_.device, fence_, nullptr);
     if (commands_) vkDestroyCommandPool(context_.device, commands_, nullptr);

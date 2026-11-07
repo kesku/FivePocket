@@ -6,7 +6,7 @@
                    [--version TEXT] [--display-name TEXT] [--sdk-label SDK[:BUILD]] [--icon FILE.png]
 
 payload: made before the compile, because the shell seeds Library/r only when the SHA-256 of payload/manifest.txt
-equals the RECOMP_PAYLOAD_MANIFEST_SHA256 compiled into it (ios_compile.py --define). The payload map (ios-payload/1)
+equals the RECOMP_PAYLOAD_MANIFEST_SHA256 compiled into it (the CMake source target). The payload map (ios-payload/1)
 names, for every file of the seed, the stage and path it comes from and its SHA-256 (the decoded image, the boot modules,
 the catalogs, the shader pack), checked when it is placed, and the runtime's switch files (one byte "1" each: the app's
 own settings, not game data). It writes NEW_DIR/r/<path> for each, NEW_DIR/manifest.txt ("<sha256> <bytes> <path>",

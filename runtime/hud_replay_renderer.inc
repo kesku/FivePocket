@@ -586,8 +586,13 @@ void hud4Replay() {
        it->second.image.k!=rscale::One || it->second.width<16 || it->second.height<16){++hud4Stats.noResolved;return;}
     Resolved& real=it->second;
     // geometry: the radar pass's reach, the box's overlay, the scale (chosen once)
-    if(!hud4Scale){const auto e=recomp::gpu::hud2::screen().extentHint();hud4Scale=hudrep::scaleFor13(e.width,e.height);hud8Rows=hudrep::shownRows(e.height,hud4Scale);
-        hud8Shift=hudrep::radarShift(e.height,hud4Scale);} // (hud13 v638: the box aligned, its bottom at the screen's bottom: every row above it from above row 0) // (first: the rows set the reach below; hud8 v625: the box region's width, rows from 0)
+    // (2026-11-03, the real Duo: the map stayed 1240x1080-sized in a 2007x1428 lower screen) the scale was chosen once, from the hint's
+    // 1240x1080 default before the second screen's swapchain existed; now it is chosen again whenever the hint changes (the shadow images
+    // follow k: hud4Shadow re-creates them for a new k, hud7BoxK resets).
+    {static std::uint32_t hud4HintW=0,hud4HintH=0;const auto e=recomp::gpu::hud2::screen().extentHint();
+     if(!hud4Scale || e.width!=hud4HintW || e.height!=hud4HintH){hud4HintW=e.width;hud4HintH=e.height;
+        hud4Scale=hudrep::scaleFor13(e.width,e.height);hud8Rows=hudrep::shownRows(e.height,hud4Scale);
+        hud8Shift=hudrep::radarShift(e.height,hud4Scale);}} // (hud13 v638: the box aligned, its bottom at the screen's bottom: every row above it from above row 0) // (first: the rows set the reach below; hud8 v625: the box region's width, rows from 0)
     std::int32_t reachX=0,reachY=0;
     for(unsigned i=0;i<hud4Radar.n;++i){const auto& op=hud4Radar.ops[i];const auto& r=op.rect;
         if(op.clear && r.x0<=0 && r.y0<=0 && r.x1>=256 && r.y1>=256)continue; // (v623: the pass's full clear is clipped to the shadow; it sets no reach)

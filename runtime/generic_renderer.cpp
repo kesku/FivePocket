@@ -1,3 +1,21 @@
+#include "ios_renderer_failure_capture.hpp"
+#include "ios_sampler_enumeration.hpp"
+#include "ios_se_big_policy.hpp"
+#include "render_wait_timing.hpp"
+#include "ios_gpu_frame_bridge.h"
+#include "ios_async_shared_dispatch.hpp"
+#include "ios_shared_source_pool.hpp"
+#include "ios_guest_frame_limit.hpp"
+#include "ios_pass_profiling.hpp"
+#include "fan_indices.hpp"
+#include "fan_large.hpp"
+#include "view_reuse.hpp"
+#include "resolve_identity.hpp"
+#include <cstdlib>
+#include <stdexcept>
+#if defined(__APPLE__)
+#include "apple/thread_policy.h"
+#endif
 // Attempt v16 generic renderer (see generic_renderer.h). DIAGNOSTIC ONLY.
 // v24 (inefficiency audit, local-analysis/inefficiency-audit/report.md): same draws and state
 // mapping as v23, less CPU per draw and per frame:
@@ -88,10 +106,30 @@ extern "C" std::atomic<bool> recomp_v407_swap_delay; // v407 (guest_cooperative_
 #include "diag_log_sample.h" // v218
 #include "vulkan_queue_lock_all.h" // v177: every VkQueue call in this file holds the shared queue lock
 #include "generic_renderer.h"
+#ifdef RECOMP_THOR_EDITION
+#include "phone_call.h" // ios-duo: recomp_phone_state_v1 from the Thor's phone state (v852)
+#endif
 #include "vulkan_queue_lock.h" // v119
 #include "direct_present.h" // v255
-#include "pace_caps.h"
-#include "sens_jobs.h" // sens-jobs (v535 -> v559, measurement only): diag-sens-jobs // pace-caps (lane A): diag-pace-* (paceWindow; the queued present's tag)
+#if defined(__APPLE__)
+#include "apple_launcher_display_bridge.h"
+#if defined(__APPLE__)
+#include <mach-o/dyld.h> // recipe seed: _NSGetExecutablePath
+#include <sys/resource.h> // ios-rusage: rusage_info_v4
+#include <mach/mach_time.h>
+#include <unistd.h>
+extern "C" int proc_pid_rusage(int pid,int flavor,rusage_info_t* buffer); // (libsystem; no iOS header declares it)
+static inline int recomp_proc_pid_rusage(int pid,int flavor,rusage_info_t* b) {return proc_pid_rusage(pid,flavor,b);}
+extern "C" std::atomic<std::uint32_t> recomp_ios_render_guest_token; // (ios-qos-guest-low; guest_cooperative_executor.cpp)
+extern "C" { std::atomic<int> recomp_ios_drawable_half{0}; } // (ios-drawable-half: Main.mm sets it, ios_frame_presenter.mm lays out)
+extern "C" { std::atomic<int> recomp_ios_settings_upscaler{0}; }
+extern "C" { std::atomic<unsigned> recomp_ios_layout_gen{0}; } // (build 192: ios_frame_presenter.mm bumps it when the drawable size changes; direct_present.h re-checks the extent at once and discards an audit that straddled it) // (2026-10-21: direct_present.h: 1 while files/settings/scaler.txt picks cubic, fsr1 or gsr1; Main.mm keeps the full-size drawable then)
+extern "C" { std::atomic<float> recomp_ios_visible_x{1.0f}, recomp_ios_visible_y{1.0f}; std::atomic<int> recomp_ios_screen_fill{-1};
+               std::atomic<std::uint64_t> recomp_ios_last_present_ns{0}; } // (ios-stall-sampler: steady-clock ns of the last present) // (screen-fit: ios_layer_geometry.h stores them)
+namespace recomp::bootstrap { std::uint32_t currentGuestThreadToken() noexcept; }
+#endif
+#endif
+#include "pace_caps.h" // pace-caps (lane A): diag-pace-* (paceWindow; the queued present's tag)
 #include "latency_lat2.h" // latency-path (lat2 events, L1 worker nice policy)
 #include "submit_early.h" // submit-early (package Q): diag-se-big / diag-se-idle and the chunk trace
 #include <cerrno> // latency-path L1
@@ -133,9 +171,53 @@ namespace { // latency-path (lat2): out of line so the calling functions keep th
 #include "audio_ahead.h" // audio-ahead: diag-au-ahead (-1/-2/-4): the switch and its counters (RENDER_DIAG_AU_AHEAD, V210Z)
 #include "generic_texture_decode.h"
 #include "census_af_diag.h" // artifacts-1: census-only constants / texture bytes (diag-census-constants, diag-census-textures)
+#if defined(__APPLE__) // ios-switches (Claude, 2026-10-20): world_load.h's diag-wl-* checks also answer to the launch environment
+#define RECOMP_IOS_SWITCHES_NO_MACRO
+#include "ios_switches.h"
+#undef RECOMP_IOS_SWITCHES_NO_MACRO
+#define access(path,mode) recomp_ios_switches_access(path,mode)
+#endif
 #include "world_load.h" // world-load: files/settings/world-load.txt and diag-wl-* (recomp::wl::window; the sliders default to the original)
+#if defined(__APPLE__)
+#undef access
+// ios-draw-distance (Claude, 2026-10-20): world_load.h's view of the launcher's saved Draw Distance (percent; 100 = Original)
+#include <atomic>
+#include <chrono>
+// ios-fps (iPad 237d; SPEC 12.5 v2, the Fold's v714; owner 2026-10-25: "that fps counter is not clean. it needs to be minimalistic and
+// much smaller"): the frame-rate counter's rates for the app's own label, and when the app last read them (fps_overlay.h v714).
+std::atomic<float> recomp_fps_shown{0.0f},recomp_fps_real{0.0f},recomp_fps_ms{0.0f};std::atomic<int> recomp_fps_on{0};
+std::atomic<long long> recomp_fps_app_ms{0};
+static long long fpsNowMs() noexcept {return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+// The app's read: {shown fps, real fps, frame ms} of the last half-second window into out[0..2] (n >= 3); returns 1 while the Frame-Rate
+// Counter setting is on (the app then draws the label and the library draws none), 0 when it is off. Lock-free; any thread.
+extern "C" __attribute__((visibility("default"))) int recomp_fps_v1(float* out,int n) {
+    recomp_fps_app_ms.store(fpsNowMs(),std::memory_order_relaxed);
+    if(out && n>=3){out[0]=recomp_fps_shown.load(std::memory_order_relaxed);out[1]=recomp_fps_real.load(std::memory_order_relaxed);out[2]=recomp_fps_ms.load(std::memory_order_relaxed);}
+    return recomp_fps_on.load(std::memory_order_relaxed);
+}
+// v717 (the Fold's phone pad; owner 2026-10-25: "when the phone comes up, we need the touch controls to change also. all builds."; iPad
+// 239): bit 0 = the game's phone is up (one of its two screen quads drawn in the last 8 presents: the Thor's PhoneTracker rule; the quads
+// are the iPad's own build-219 identification), bits 1 / 2 = ringing / a call ongoing (trainer_glue.inc, read only with the phone up).
+std::atomic<int> recomp_phone_bits{0};
+extern "C" {extern std::atomic<bool> recomp_phone_poll;extern std::atomic<int> recomp_phone_call;} // (trainer_glue.inc: the call natives)
+extern "C" __attribute__((visibility("default"))) int recomp_phone_state_v1(void) {
+#ifdef RECOMP_THOR_EDITION
+    return int(recomp::phonecall::state()); // ios-duo: the Thor's PhoneTracker (Up) + the safe point's call bits (trainer_glue.inc)
+#endif
+    const int up=recomp_phone_bits.load(std::memory_order_relaxed);
+    return up|(up?recomp_phone_call.load(std::memory_order_relaxed)&6:0); // (bits 1 / 2 only with the phone up)
+}
+extern "C" unsigned recomp_ios_wl_launcher_lod() noexcept {return recomp::apple::launcher::bridge::drawDistance();}
+extern "C" unsigned recomp_ios_wl_launcher_traffic() noexcept {return recomp::apple::launcher::bridge::traffic();} // (ios-traffic)
+static bool iosLauncherShadowNear() noexcept {return recomp::apple::launcher::bridge::shadowNear();} // (Shadow Distance row)
+#else
+static bool iosLauncherShadowNear() noexcept {return false;}
+#endif
 #include "generic_resolve_writeback.h" // v75
-#include "generic_async_queue.h" // v111
+#include "generic_async_queue.h"
+#if defined(__APPLE__)
+#include "ios_async_worker_qos.hpp"
+#endif // v111
 #include "generic_pipeline_recipes.h" // v139
 #include "generic_swap_neon.h" // v123
 #include "edram_tile_alias.h"
@@ -144,6 +226,14 @@ namespace { // latency-path (lat2): out of line so the calling functions keep th
 #include "image_set.h"
 #include "arena_free_list.h"
 #include "fps_overlay.h"
+#ifndef RECOMP_THOR_EDITION
+#if defined(__APPLE__) && !defined(RECOMP_TOUCH_MAPTAP)
+#define RECOMP_TOUCH_MAPTAP 1 // ios-qol (iPad build 231): the single-screen edition's map-tap macro (android-qol v700), no Thor code
+#endif
+#endif /* RECOMP_THOR_EDITION */
+#if defined(RECOMP_THOR_EDITION) || defined(RECOMP_TOUCH_MAPTAP)
+#include "map_tap.h" // thor-maptap (v658): the map-tap macro and the MAP-tab frames hidden (qol-touch v700 / iPad 231: RECOMP_TOUCH_MAPTAP)
+#endif /* RECOMP_THOR_EDITION || RECOMP_TOUCH_MAPTAP */
 #include "resolved_vertex_fetch.h"
 #include "resolved_layout_remap.h" // v586: fetches of a resolve destination in another memory layout (F1, the water height map)
 #include "msaa_alias_v591.h" // v591: a 1x surface over a 4x MSAA surface's EDRAM (F5, the half-res water depth)
@@ -193,13 +283,6 @@ namespace { struct HostActivityScope { const char* p; explicit HostActivityScope
 #include "pipeline_cache_signal.h" // boot-stall: the persistent pipeline cache's two signals (atomics only; device.cpp owns the file and its thread). On the blank line that was here: no line of this file moves.
 #include "recomp_app_dir.h" // data-paths: the app's files directory. v216 A/B: the indirect-call resolver's fast-form flag (indirect_call_resolver.cpp).
 extern "C" { __attribute__((weak)) std::atomic<bool> recomp_indirect_fast{true}; } // (weak: host harnesses link no resolver)
-// v611: whether this thread holds the registry lock R (strong definition: guest_registry_concurrency.inc, in the library's registry
-// TU; this weak default answers for host harnesses that link no registry; a harness modelling R defines RECOMP_REGISTRY_HELD_PROVIDED)
-#if defined(RECOMP_REGISTRY_HELD_PROVIDED)
-extern "C" bool recomp_registry_held_by_this_thread() noexcept;
-#else
-extern "C" __attribute__((weak)) bool recomp_registry_held_by_this_thread() noexcept {return false;}
-#endif
 // v217 A/B: the registry's exact scan cuts (guest_import_registry.cpp: range-bounded critical-section query, no
 // broadcast wake for a returning thread that signals no handle and abandons no mutant) and the resolver's index-entry
 // upgrade are off while files/private-trace/diag-v217-baseline exists. Scene-worker placement (trace_runner.cpp
@@ -214,7 +297,6 @@ extern "C" { __attribute__((weak)) std::atomic<bool> recomp_v304b_baseline{false
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v293_store_none; } // v293 (device.cpp: VK_EXT_load_store_op_none enabled)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v294_ubo_banks; } // v294 (device.cpp: scalarBlockLayout enabled for the banks)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_ocq_precise; } // occlusion (device.cpp: occlusionQueryPrecise enabled)
-#include "frame_facts.h" // fixer2: diag-frame-facts (a ring of per-frame facts, logged when the glitch detector asks)
 #include "occlusion_queries.h" // occlusion package: diag-oc-queries (precise occlusion queries for the draws of ZPD intervals)
 extern "C" { __attribute__((weak)) extern std::atomic<unsigned> recomp_df_bias_float; } // depth-float (device.cpp: VK_EXT_depth_bias_control)
 #include "spirv_ubo_banks.h" // v294
@@ -237,17 +319,16 @@ extern "C" { RecompApCfg recomp_ap_cfg{}; } // all words 0 = off until apSwitch(
 #include "rg_cfg.h" // render-guest: per-draw parameter / geometry prefetch blocks (rg_prefetch.h in chunk 18)
 extern "C" { __attribute__((visibility("hidden"))) std::atomic<unsigned> recomp_jc_loop{0}; } /* job-code: diag-jc-loop / diag-jc-all -> 1: the loop_locals twins in chunk 251 (8310E4B0 / 8310E118 / 83118F10) run; 0 = the original bodies */ extern "C" { RecompRgCfg recomp_rg_cfg{}; } // all words 0 = off until rgSwitch() below sets them
 extern "C" { extern std::atomic<unsigned> recomp_calls_gpr; extern std::atomic<unsigned> recomp_calls_dispatch; }
-extern "C" std::atomic<bool> recomp_imports_fast; namespace recomp::native_imports { void window() noexcept; } // imports-fast (agent F; guest_import_registry.cpp); native-imports (native_imports.h: its window poll, defined in the registry's native_imports.inc)
+extern "C" std::atomic<bool> recomp_imports_fast; // imports-fast (agent F; guest_import_registry.cpp)
 #include "mw_cs_spin.h" // main-wait: diag-mw-cs-spin
 extern "C" { __attribute__((weak)) std::atomic<unsigned> recomp_mw_cs_spin_us{0}; } // main-wait (strong in guest_import_registry.cpp; weak here for renderer-only host builds)
-#include "scene_wait_sw.h" // scene-wait: diag-sw-watch / diag-sw-watch-500
-#include "park_watch.h" // park-watch (v531): diag-park-watch / diag-park-watch-idle
-#include <fcntl.h>
-extern "C" { __attribute__((weak)) std::atomic<unsigned> recomp_sw_watch_us{0}; } // scene-wait (strong in guest_import_registry.cpp; weak here for renderer-only host builds)
 // audio-cost: the XMA fast-path switch bits and pump counters (strong in native_xma_context_pool.cpp; weak here for renderer-only builds)
 extern "C" { __attribute__((weak)) std::atomic<unsigned> recomp_au_switches{0};
              __attribute__((weak)) std::atomic<unsigned long long> recomp_au_pump_skipped{0}, recomp_au_pump_decoded{0}; }
 extern "C" { __attribute__((weak)) std::atomic<bool> recomp_jp_park_poll{false}; } // job-path: diag-jp-park-poll (strong in guest_cooperative_executor.cpp, park_poll_jp.h; weak here for renderer-only host builds)
+#if defined(__APPLE__)
+extern "C" __attribute__((weak)) void recomp_ios_mtl_audit(void* vkImage,const char* tag,unsigned vkFormat,unsigned vkUsage); // Main.mm
+#endif
 // async-wake: diag-aw-* state and counters (strong in guest_cooperative_executor.cpp, aw_waker.h; weak here for renderer-only host builds)
 extern "C" { __attribute__((weak)) std::atomic<unsigned> recomp_aw_mode{0}; __attribute__((weak)) std::atomic<unsigned> recomp_aw_spin_us{500};
              __attribute__((weak)) std::atomic<int> recomp_aw_waker_tid{0};
@@ -285,7 +366,8 @@ extern "C" { __attribute__((weak)) std::atomic<bool> recomp_v232_baseline{false}
 extern "C" { __attribute__((weak)) std::atomic<bool> recomp_v233_baseline{false}; } // v233 (also read by trace_runner.cpp)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v278_baseline; } // v278 (renderer_boundary_trace.cpp; absent in host tests)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v279_worker_isr; } // v279 (trace_runner.cpp; absent in host tests)
-extern "C" { __attribute__((weak)) void recomp_v280_apply_limiter(bool on); } // v280 (trace_runner.cpp; absent in host tests)
+extern "C" { __attribute__((weak)) void recomp_v280_apply_limiter(bool on); }
+extern "C" { __attribute__((weak)) unsigned recomp_ios_guest_frame_limit_mode(); } // v280 (trace_runner.cpp; absent in host tests)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v282_baseline; } // v282 (trace_runner.cpp; absent in host tests)
 extern "C" { __attribute__((weak)) extern std::atomic<bool> recomp_v284_baseline; } // v284 (trace_runner.cpp; absent in host tests)
 std::atomic<bool> recompV276Baseline{false}; // v276: diag-v276-baseline = every changed constant bank copied whole (no delta chain)
@@ -296,6 +378,18 @@ extern "C" { __attribute__((weak)) std::atomic<unsigned> recomp_v346_main_spin_u
              __attribute__((weak)) std::atomic<int> recomp_v346_audio_little_applied{0}; } // v346 (strong in trace_runner.cpp)
 extern "C" { std::atomic<unsigned> recomp_v348_audio_spin_us{0}; } // v348 (read by guest_import_registry.cpp's dispatch)
 #include "fast_tls_v362.h" // v362: diag-v362-render-trims sets recomp::v362::fastThread.on (renderer_boundary_trace / executor / registry)
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#include <mach/mach.h> // ios-rcpu (thread_info)
+#include <atomic>
+static std::atomic<unsigned> recompIosWindowGpuUs{0}; // ios-qos-adaptive: the last timing window's GPU ms per frame (x1000)
+// ios-qos-main-scaled (Claude, 2026-10-18): the applied render scale in sixteenths (16 = 100 %), set once by rsLoad; the executor's
+// main-wait QoS rule reads it (main at default QoS below 100 %: c197/c198; utility at 100 %: c199/c200)
+extern "C" { std::atomic<int> recomp_ios_render_sixteenths{16}; }
+#endif
+#include "ios_vs_trim.h" // ios-vs-trim (Claude): vertex modules without the outputs the fragment stage does not read
+#include "ios_switches.h" // ios-switches (Claude): launch-environment overrides of this file's switch files (iOS test runs)
 // v366 (exact; diag-v366-render-trims2, off by default, applied at the 60-present switch poll): the second round of render-thread
 // per-draw trims. Here (AsyncFront): (a) draw packets carry raw shader-code pointers kept alive by a capture-side generation count
 // instead of three shared_ptr copies per draw; (b) a code cache generation that is cleared is destroyed by a low-priority helper
@@ -387,7 +481,7 @@ VkQueue probeDedicatedQueue(VkDevice device);
 }
 namespace recomp::gpu::generic {
 namespace {
-#define GLOG(...) RECOMP_PLAY_GLOG(__VA_ARGS__) // play-config-2 (v527; play_build.h): __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",...) as before; in the play build the line types of recomp::diag::PlayMutedLines go through recomp::diag::quietLog
+#define GLOG(...) __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",__VA_ARGS__)
 // main-wait: the diag-mw-cs-spin poll and its counters, out of line so the window poll keeps its CFG (and PGO record)
 // audio-cost: files/private-trace/diag-au-bits (bit 0), -pcm (bit 1), -pump (bit 2), -all (0-2) -> recomp_au_switches, polled
 // at the window boundary like diag-imports-fast; RENDER_DIAG_AU logs the pump counters of the window that just ended.
@@ -539,7 +633,11 @@ constexpr unsigned HeapSlots=16;
 watch::WriteWatch& writeWatch(){static watch::WriteWatch w;return w;}
 constexpr VkDeviceSize RingBytes=VkDeviceSize{GENERIC_RENDERER_RING_KB}*1024;
 constexpr unsigned MaxSetsPerFrame=8192;
+#if defined(__APPLE__)
+constexpr unsigned FrameSlots=3;                 // v24: frames in flight (ios: a third slot with RECOMP_IOS_FRAMES_IN_FLIGHT=2)
+#else
 constexpr unsigned FrameSlots=2;                 // v24: frames in flight
+#endif
 // occlusion package (occlusion_queries.h): per frame slot, one precise occlusion query per draw counted for a ZPD interval
 // (reset at the slot's begin, read after its fence). Outside Renderer: its layout (and so its PGO records) stays v436's.
 constexpr unsigned OcqPoolQueries=512;
@@ -612,54 +710,6 @@ struct VfiRenderer {
     std::array<std::vector<std::uint8_t>,24> big,copies,composed; // layouts not kept; streams read through the Reader; streams read at several indices
 };
 VfiRenderer vfiR; // (rendererMutex)
-// v606 (thor-fixer2, G14 DIAGNOSTIC: Michael's torn shirt hem, ped_cloth#3v). For every cloth draw the vfetch-index path lays
-// out: the simulated-vertex stream (POSITION1) as the draw read it (records, all-zero records, NaN, largest |coordinate|) and,
-// for the cloth-path vertices (BLENDINDICES.x * 255.001953 > 254, as the microcode tests it), how many of the records their three
-// computed indices select lie past the stream or are all zero (a zero record puts the vertex on the model's root). A copy of
-// the stream is kept until the next guest ring submission (guestReadBarrier: the point after which the console GPU may read
-// it) and compared there with guest memory: a stream the game changed between our read and the kick was read too early.
-// Lines: RENDER_CLOTH_WATCH (a draw with bad records, or the first 2 of a window), RENDER_CLOTH_LATE (a stream that changed
-// before the kick), RENDER_CLOTH_WATCH_SUM per 60-present window. Read-only; nothing a draw uses changes.
-struct ClothWatchEntry {std::uint64_t vs=0,present=0;std::uint32_t address=0,size=0;std::vector<std::uint8_t> bytes;
-    std::array<std::uint64_t,4> selZero{};unsigned selZeroCount=0,cloth=0;};
-struct ClothWatch {
-    std::array<ClothWatchEntry,8> e;unsigned n=0;
-    std::uint64_t draws=0,clothVertices=0,badDraws=0,selZero=0,outside=0,nanDraws=0,checked=0,changed=0,changedRecords=0,fixed=0,
-        unreadable=0,dropped=0,lines=0,refused=0,refusedLines=0,skipped=0;const char* skipWhy="-";
-} clothW; // (rendererMutex)
-std::atomic<bool> clothWatchPending{false};
-std::atomic<std::uint64_t> clothKickDeferred{0}; // v611: kicks left pending because the barrier's thread held R
-[[gnu::noinline]] void clothWatchKick(const Viewer& viewer) noexcept { // (rendererMutex, guest thread, queue drained)
-    auto& W=clothW;
-    for(unsigned k=0;k<W.n;++k) {
-        auto& x=W.e[k];++W.checked;
-        const std::uint8_t* p=viewer?viewer(x.address,x.size):nullptr;
-        if(!p){++W.unreadable;continue;}
-        const unsigned records=x.size/16;unsigned changed=0,zeroNow=0,fixed=0,stillZero=0;
-        for(unsigned r=0;r<records;++r) {
-            const std::uint8_t* a=x.bytes.data()+std::size_t{r}*16;const std::uint8_t* b=p+std::size_t{r}*16;
-            const bool diff=std::memcmp(a,b,16)!=0;changed+=diff;
-            bool z=true;for(unsigned i=0;i<16;++i)z&=b[i]==0;zeroNow+=z;
-            if(r<256 && ((x.selZero[r>>6]>>(r&63))&1)){if(z)++stillZero;else ++fixed;}
-        }
-        if(changed){++W.changed;W.changedRecords+=changed;}
-        W.fixed+=fixed;
-        if((changed || x.selZeroCount) && W.lines<16){++W.lines;
-            GLOG("RENDER_CLOTH_LATE draw_p=%llu vs=%016llx addr=%08x records=%u changed_records=%u zero_now=%u sel_zero_then=%u sel_zero_fixed=%u sel_zero_still=%u",
-                 (unsigned long long)x.present,(unsigned long long)x.vs,x.address,records,changed,zeroNow,x.selZeroCount,fixed,stillZero);}
-    }
-    W.n=0;clothWatchPending.store(false,std::memory_order_relaxed);
-}
-[[gnu::noinline]] void clothWatchWindow() noexcept {
-    auto& W=clothW;
-    GLOG("RENDER_CLOTH_WATCH_SUM draws=%llu cloth_vertices=%llu bad_draws=%llu sel_zero=%llu outside=%llu nan_draws=%llu checked=%llu changed_at_kick=%llu "
-         "changed_records=%llu sel_zero_fixed_at_kick=%llu unreadable=%llu dropped=%llu kick_deferred_under_r=%llu refused=%llu watch_skipped=%llu skip_why=%s",(unsigned long long)W.draws,(unsigned long long)W.clothVertices,
-         (unsigned long long)W.badDraws,(unsigned long long)W.selZero,(unsigned long long)W.outside,(unsigned long long)W.nanDraws,(unsigned long long)W.checked,
-         (unsigned long long)W.changed,(unsigned long long)W.changedRecords,(unsigned long long)W.fixed,(unsigned long long)W.unreadable,(unsigned long long)W.dropped,
-         (unsigned long long)clothKickDeferred.exchange(0,std::memory_order_relaxed),(unsigned long long)W.refused,(unsigned long long)W.skipped,W.skipWhy); // (v611: kick_deferred_under_r appended)
-    W.draws=W.clothVertices=W.badDraws=W.selZero=W.outside=W.nanDraws=W.checked=W.changed=W.changedRecords=W.fixed=W.unreadable=W.dropped=W.lines=0;
-    W.refused=W.refusedLines=W.skipped=0;W.skipWhy="-";
-}
 // v599: the GPU particle gather's counters per log window (RENDER_GENERIC_PTX_GATHER, with the vfetch-index line)
 struct PtxGatherStats {std::uint64_t draws=0,vertices=0,refused=0,dispatches=0;const char* why="-";} ptxGStats; // (rendererMutex)
 [[gnu::noinline]] bool vfiSwitchFile(){return access(RECOMP_APP_PATH("/private-trace/diag-generic-no-vfetch-index"),F_OK)==0;}
@@ -708,7 +758,16 @@ struct PtxGatherStats {std::uint64_t draws=0,vertices=0,refused=0,dispatches=0;c
     static unsigned file=0;static unsigned long long last[14]{};
     const unsigned window=file;
     const auto has=[](const char* n){return access(n,F_OK)==0;};
-    file=(has(RECOMP_APP_PATH("/private-trace/diag-aw-dedupe"))?1u:0u)|
+#if defined(__APPLE__)
+    // ios-aw-dedupe (Claude 2026-10-17, ADOPTED by c140-c142): on iOS the dedupe is the default (exact: a repeat notify of a park
+    // wait whose predicate is already true is skipped; Darwin's pthread_cond_broadcast still traps while the first notify's
+    // waiter has not run). c139: 16.7k notifies/s, main spent 16 % of its time in that syscall; c140/c141: 5-8k/s deduped,
+    // render-thread CPU -2..-7 ms/frame. files/private-trace/ios-aw-dedupe-off (or RECOMP_IOS_SWITCHES_*) restores every notify.
+    const bool iosDedupe=!has(RECOMP_APP_PATH("/private-trace/ios-aw-dedupe-off"));
+#else
+    const bool iosDedupe=false;
+#endif
+    file=(iosDedupe || has(RECOMP_APP_PATH("/private-trace/diag-aw-dedupe"))?1u:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-aw-all"))?2u:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-aw-all2k"))?4u:0u);
     const bool waker=(file&6u)!=0;
@@ -787,139 +846,6 @@ static_assert(recomp_ms::PrimeNice==-20,"prime_swap_v245.h boostTo default");
          d[0],d[1],d[2],d[3],d[4],d[6]?double(d[5])/1e6/double(d[6]):0.0,d[6]);
     for(unsigned i=0;i<7;++i)last[i]=now[i];
 }
-// main-wait (scene_wait_main.h, guest_import_registry.cpp; attempt v528): the modifiers of the scene-item watch, polled with
-// the watch's own files at the 60-present window; a change applies from main's next Sleep(0).
-//   diag-sw-spin-first     a watch begins with a spin of N us (the file's text; empty = 20): the yield hint only
-//   diag-sw-flag-mark      the idle wait ends at once on either word (the producers' hook sends an event after its store)
-//   diag-sw-producer-wake  after N us of a watch (the file's text; empty = 150) main sleeps in the kernel and the
-//                          producers' hook wakes it
-//   diag-sw-no-yield       off the prime core a watch yields the processor once, not at every check
-//   diag-sw-late           measurement only: how long after the producer's store a watch returned
-// When none of diag-sw-watch / -500 / -wfe stands, a modifier stands for the 500 us watch with the idle wait; the returned
-// word is what recomp_sw_watch_us takes. RENDER_GENERIC_V210Z sw_flag_mark / sw_spin_first / sw_producer_wake / sw_no_yield /
-// sw_late = 1 when that file was present for the whole window (the flag names drive_ab.sh / fast_exp.sh derive), then
-// RENDER_GENERIC_SWAIT: the state in numbers (spin_first = the spin's microseconds, 0 = off; sleep_after_us = producer_wake's
-// number; stable = 1 when every file of the watch and both numbers were the same at both ends of the window) and that
-// window's counters (deltas): watches; spun_only = ended inside the spin; idled / slept = watches with an idle wait / a
-// sleep in the kernel; woken_by_producer = sleeps a producer ended; expired; late_us_p50 / p99 over late_n watches = from
-// the producer's hook (which follows its store) to the watch's return; by_count / by_flag = what ended the changed ones;
-// yields = host yields inside watches; idle_waits, sleeps; hook_wakes / hook_events = wakes and events the producers sent
-// (hook_other of the reported stores were to neither of main's two words: another queue, or a call with nothing published);
-// watch_ms, spin_ms, prime_ms = time in watches, of it in the spin, in watches begun on the prime core; len_lt10 ... len_ge200
-// = the changed watches by their length in us (what a spin of that length would answer). Out of line, called by swWindow.
-// park-watch (park_watch.h, guest_cooperative_executor.cpp; attempt v531): main's watch before it parks, polled at the
-// 60-present window; a change applies from main's next park.
-//   diag-park-watch       the watch's length in microseconds = the file's text (empty = 300; inside 20 .. 2000)
-//   diag-park-watch-idle  the watch waits for an event between two checks instead of spinning
-// Returns what recomp_v346_main_spin_us takes. RENDER_GENERIC_V210Z park_watch / park_watch_idle = 1 when that file was
-// present for the whole window, then RENDER_GENERIC_PARKWATCH: the length in force, the idle switch, whether both were
-// stable over the window, and the window's pauses (idle waits, marks that found the word already moved, yield hints).
-[[gnu::noinline]] unsigned parkWatchPoll(unsigned olderUs) noexcept {
-    static bool lastWatch=false,lastIdle=false;static unsigned lastUs=0;static std::uint64_t lastIdleWaits=0,lastMoved=0,lastYields=0;
-    char text[16];std::size_t size=0;bool watch=false;
-    if(const int fd=::open(RECOMP_APP_PATH("/private-trace/diag-park-watch"),O_RDONLY|O_CLOEXEC);fd>=0){
-        watch=true;const auto n=::read(fd,text,sizeof(text));if(n>0)size=static_cast<std::size_t>(n);::close(fd);}
-    const bool idle=access(RECOMP_APP_PATH("/private-trace/diag-park-watch-idle"),F_OK)==0;
-    const unsigned us=recomp::park_watch::chosenUs(watch,recomp::park_watch::parseUs(text,size),olderUs);
-    ::recomp_park_watch_idle.store(idle,std::memory_order_relaxed);
-    auto& c=recomp::park_watch::counters();
-    const std::uint64_t idleWaits=c.idleWaits.load(std::memory_order_relaxed),moved=c.movedAtMark.load(std::memory_order_relaxed),yields=c.yields.load(std::memory_order_relaxed);
-    GLOG("RENDER_GENERIC_V210Z park_watch=%d park_watch_idle=%d",watch&&lastWatch?1:0,idle&&lastIdle?1:0);
-    GLOG("RENDER_GENERIC_PARKWATCH us=%u idle=%d stable=%d idle_waits=%llu moved_at_mark=%llu yields=%llu",us,idle?1:0,
-         watch==lastWatch&&idle==lastIdle&&us==lastUs?1:0,static_cast<unsigned long long>(idleWaits-lastIdleWaits),
-         static_cast<unsigned long long>(moved-lastMoved),static_cast<unsigned long long>(yields-lastYields));
-    lastWatch=watch;lastIdle=idle;lastUs=us;lastIdleWaits=idleWaits;lastMoved=moved;lastYields=yields;
-    { // sens-jobs (sens_jobs.h, v535, measurement only): diag-sens-jobs = microseconds of spinning per producer call
-        static bool lastJobs=false;static std::uint64_t lastCalls=0;
-        char jt[16];std::size_t js=0;bool jobs=false;
-        if(const int fd=::open(RECOMP_APP_PATH("/private-trace/diag-sens-jobs"),O_RDONLY|O_CLOEXEC);fd>=0){
-            jobs=true;const auto n=::read(fd,jt,sizeof(jt));if(n>0)js=static_cast<std::size_t>(n);::close(fd);}
-        auto& sj=recomp::sens_jobs::state();const unsigned jus=jobs?recomp::sens_jobs::parseUs(jt,js):0u;
-        sj.us.store(jus,std::memory_order_relaxed);
-        const std::uint64_t calls=sj.calls.load(std::memory_order_relaxed);
-        GLOG("RENDER_GENERIC_V210Z sens_jobs=%d",jobs&&lastJobs?1:0);
-        GLOG("RENDER_GENERIC_SENS jobs_us=%u stable=%d calls=%llu",jus,jobs==lastJobs?1:0,static_cast<unsigned long long>(calls-lastCalls));
-        lastJobs=jobs;lastCalls=calls;
-    }
-    return us;
-}
-[[gnu::noinline]] unsigned swMainPoll(unsigned baseFile,unsigned baseWord) noexcept {
-    static unsigned file=0,spinUs=0,sleepUs=0,base=0;
-    static unsigned long long last[21]{},lastLate[recomp_sw::LateBuckets]{},lastLasted[recomp_sw::LastedBuckets]{};
-    const unsigned windowFile=file,windowSpin=spinUs,windowSleep=sleepUs,windowBase=base;
-    const auto has=[](const char* n){return access(n,F_OK)==0;};
-    const auto number=[](const char* path,unsigned fallback)->unsigned{ // the file's text: microseconds
-        char text[16];std::size_t n=0;
-        if(std::FILE* f=std::fopen(path,"rb")){n=std::fread(text,1,sizeof text,f);std::fclose(f);}
-        return recomp_sw::parseFileUs(text,n,fallback);};
-    const bool spin=has(RECOMP_APP_PATH("/private-trace/diag-sw-spin-first")),wake=has(RECOMP_APP_PATH("/private-trace/diag-sw-producer-wake"));
-    file=recomp_sw::switchMode(has(RECOMP_APP_PATH("/private-trace/diag-sw-flag-mark")),spin,wake,
-        has(RECOMP_APP_PATH("/private-trace/diag-sw-no-yield")),has(RECOMP_APP_PATH("/private-trace/diag-sw-late")));
-    spinUs=spin?number(RECOMP_APP_PATH("/private-trace/diag-sw-spin-first"),recomp_sw::DefaultSpinUs):0u;
-    sleepUs=wake?number(RECOMP_APP_PATH("/private-trace/diag-sw-producer-wake"),recomp_sw::DefaultSleepAfterUs):0u;
-    base=baseFile;
-    auto& w=recomp_sw::mainWait();
-    w.spinUs.store(spinUs,std::memory_order_relaxed);w.sleepAfterUs.store(sleepUs,std::memory_order_relaxed);
-    w.mode.store(file,std::memory_order_relaxed);
-    const unsigned word=recomp_sw::switchWatchWord(baseWord,file);
-    const unsigned held=windowFile&file; // present at both ends of the window
-    const bool stable=windowFile==file && windowSpin==spinUs && windowSleep==sleepUs && windowBase==base;
-    GLOG("RENDER_GENERIC_V210Z sw_flag_mark=%u sw_spin_first=%u sw_producer_wake=%u sw_no_yield=%u sw_late=%u",
-         unsigned((held&recomp_sw::ModeFlagMark)!=0),unsigned((held&recomp_sw::ModeSpinFirst)!=0 && windowSpin==spinUs),
-         unsigned((held&recomp_sw::ModeProducerWake)!=0 && windowSleep==sleepUs),unsigned((held&recomp_sw::ModeNoYield)!=0),
-         unsigned((held&recomp_sw::ModeMeasure)!=0));
-    const auto get=[](const std::atomic<unsigned long long>& c){return c.load(std::memory_order_relaxed);};
-    const unsigned long long now[21]{get(w.watches),get(w.spunOnly),get(w.idled),get(w.slept),get(w.sleepsWoken),get(w.expired),
-        get(w.changed),get(w.unquiet),get(w.byCount),get(w.byFlag),get(w.yields),get(w.idleWaits),get(w.sleeps),get(w.hookWakes),
-        get(w.hookEvents),get(w.hookStamps),get(w.watchNs),get(w.spinNs),get(w.primeNs),get(w.lateCount),get(w.hookOther)};
-    unsigned long long d[21];for(unsigned i=0;i<21;++i)d[i]=now[i]-last[i];
-    unsigned long long late[recomp_sw::LateBuckets];
-    for(unsigned b=0;b<recomp_sw::LateBuckets;++b){const auto v=get(w.late[b]);late[b]=v-lastLate[b];lastLate[b]=v;}
-    unsigned long long len[recomp_sw::LastedBuckets];
-    for(unsigned b=0;b<recomp_sw::LastedBuckets;++b){const auto v=get(w.lasted[b]);len[b]=v-lastLasted[b];lastLasted[b]=v;}
-    GLOG("RENDER_GENERIC_SWAIT flag_mark=%u spin_first=%u producer_wake=%u no_yield=%u late=%u sleep_after_us=%u budget_us=%u idle_wait=%u "
-         "stable=%u watches=%llu spun_only=%llu idled=%llu slept=%llu woken_by_producer=%llu expired=%llu late_us_p50=%.1f late_us_p99=%.1f "
-         "late_n=%llu changed=%llu unquiet=%llu by_count=%llu by_flag=%llu yields=%llu idle_waits=%llu sleeps=%llu hook_wakes=%llu "
-         "hook_events=%llu hook_stamps=%llu hook_other=%llu watch_ms=%.2f spin_ms=%.2f prime_ms=%.2f len_lt10=%llu len_lt20=%llu "
-         "len_lt50=%llu len_lt100=%llu len_lt200=%llu len_ge200=%llu",
-         unsigned((file&recomp_sw::ModeFlagMark)!=0),spinUs,unsigned((file&recomp_sw::ModeProducerWake)!=0),
-         unsigned((file&recomp_sw::ModeNoYield)!=0),unsigned((file&recomp_sw::ModeMeasure)!=0),sleepUs,word&~recomp_sw::WfeBit,
-         unsigned((word&recomp_sw::WfeBit)!=0),unsigned(stable),
-         d[0],d[1],d[2],d[3],d[4],d[5],recomp_sw::lateQuantileUs(late,0.50),recomp_sw::lateQuantileUs(late,0.99),d[19],d[6],d[7],
-         d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15],d[20],double(d[16])/1e6,double(d[17])/1e6,double(d[18])/1e6,
-         len[0],len[1],len[2],len[3],len[4],len[5]);
-    for(unsigned i=0;i<21;++i)last[i]=now[i];
-    return word;
-}
-// scene-wait (scene_wait_sw.h, guest_import_registry.cpp): files/private-trace/diag-sw-watch (main's Sleep(0) in the scene-item
-// poll sub_8239DF60 watches the poll's count / flag words for up to 50 us instead of returning to re-check them), diag-sw-watch-500
-// (500 us; overrides), polled at the 60-present window boundary; a change applies from the next Sleep(0). RENDER_GENERIC_V210Z
-// sw_watch / sw_watch_500 = 1 when that file was present for the whole window (the flag names drive_ab.sh / fast_exp.sh derive),
-// then RENDER_DIAG_SW: that window's counters (deltas): identified = the poll's Sleep(0)s recognised (switch on), ready = of
-// those, the loop could proceed already (returned without the yield step), watches, ended
-// by changed (item published / flag cleared) / unquiet (the executor needed main) / expired (budget), watch_ms, max_us (longest
-// watch so far). Out of line: the window poll keeps its CFG (and PGO record).
-[[gnu::noinline]] void swWindow() noexcept {
-    static unsigned file=0;static unsigned long long last[9]{};
-    const unsigned window=file;
-    const auto has=[](const char* n){return access(n,F_OK)==0;};
-    file=(has(RECOMP_APP_PATH("/private-trace/diag-sw-watch"))?1u:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-sw-watch-500"))?2u:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-sw-wfe"))?4u:0u); // idle-wait (v511): alone it means the 500 us watch with the idle wait
-    const unsigned us=recomp_sw::switchBudgetUs((file&1u)!=0,(file&6u)!=0);
-    ::recomp_sw_watch_us.store(swMainPoll(file,us|((file&4u)?recomp_sw::WfeBit:0u)),std::memory_order_relaxed); // main-wait (v528): with none of its files the word is the base files' as before
-    const unsigned w=window==file?window:0u;
-    GLOG("RENDER_GENERIC_V210Z sw_watch=%u sw_watch_500=%u sw_wfe=%u",unsigned((w&3u)==1u),(w>>1)&1u,(w>>2)&1u);
-    const auto& c=recomp_sw::counters();
-    const unsigned long long now[9]{c.identified.load(std::memory_order_relaxed),c.ready.load(std::memory_order_relaxed),
-        c.watches.load(std::memory_order_relaxed),c.changed.load(std::memory_order_relaxed),c.unquiet.load(std::memory_order_relaxed),
-        c.expired.load(std::memory_order_relaxed),c.watchNs.load(std::memory_order_relaxed),c.wfe.load(std::memory_order_relaxed),
-        c.wfeSlow.load(std::memory_order_relaxed)};
-    unsigned long long d[9];for(unsigned i=0;i<9;++i)d[i]=now[i]-last[i];
-    GLOG("RENDER_DIAG_SW budget_us=%u identified=%llu ready=%llu watches=%llu changed=%llu unquiet=%llu expired=%llu watch_ms=%.2f "
-         "max_us=%.1f wfe=%llu wfe_slow=%llu",us,d[0],d[1],d[2],d[3],d[4],d[5],double(d[6])/1e6,double(c.maxNs.load(std::memory_order_relaxed))/1e3,d[7],d[8]);
-    for(unsigned i=0;i<9;++i)last[i]=now[i];
-}
 // prime-exchange (prime_exchange_px.h, prime_swap_v245.h): files/private-trace/diag-px-exchange (at its kick main keeps cpu7 and
 // the render thread runs the first d ms of its frame on {3-6}, d from the slack controller), diag-px-fixed-4 / diag-px-fixed-8
 // (fixed d of 4 / 8 ms for calibration; the larger wins, either wins over the controller), polled at the 60-present window
@@ -975,23 +901,40 @@ static_assert(recomp_ms::PrimeNice==-20,"prime_swap_v245.h boostTo default");
 // for the whole window that just ended (the flag names fast_exp.sh derives) and pace = the cap in effect at its end (fps; 0 = none);
 // then RENDER_DIAG_PACE: that window's counters (printed without a cap too: disp = refreshes between consecutive displayed frames is
 // the uncapped baseline). Out of line: the window poll keeps its CFG (and PGO record).
-// pace-low: the files diag-pace-20 / diag-pace-15 (fixed caps: 6 / 8 refreshes at ~120 Hz, 3 / 4 at 60 Hz) and diag-pace-auto-low
-// (the automatic cap's ladder goes on to 20 and 15; inert without diag-pace-auto). New fields at the END of the two lines (no
-// existing field renamed or moved): V210Z pace_20 / pace_15 / pace_auto_low (as the other flags); RENDER_DIAG_PACE disp_long =
-// disp's last bin (7 refreshes or more) by length, 7 .. 13 exactly and 14 = 14 or more (an even 15 fps at 120 Hz is 8). pace / cap
-// read 20 / 15 under these caps, auto_i 4 / 5.
-// pace-delay: the modifier diag-pace-delay (the display feedback is judged against the learned whole-refresh display delay);
-// V210Z pace_delay and RENDER_DIAG_PACE delay / delay_timed (the delay in refreshes of untimed / timed frames), all at the END.
-// v560 (measurement only): the GPU burden's switch state, shared between the window poll and the renderer's chunk submit.
+// ios-spin-worker-items (Claude 2026-10-21; MEASUREMENT ONLY, ported from the Fold's v562): files/private-trace/diag-spin-worker-items
+// holds N (empty = 1, at most 20): N us of spinning before every draw item on the Vulkan worker (~N x 2,400 us per heavy driving
+// frame). Question (c400/c402 vs c401): heavy-route late frames follow renderer CPU (12.8 vs 6.4 ms) more than GPU; is the worker's
+// per-draw cost on the frame's path? Read at the pacer window; RENDER_GENERIC_V562_W logs on/us/spun_items.
+static std::atomic<unsigned> v562ItemSpinUs{0};static std::atomic<unsigned long long> v562Items{0};
+// ios-gpu-burden (Claude 2026-10-21; MEASUREMENT ONLY, ported from the Fold's v561): files/private-trace/diag-gpu-burden (presence
+// via access(), so the iOS A/B switches drive it): 2 copies of an 8 MB scratch buffer into a second one, recorded after each
+// chunk's last pass, before its submission. Both buffers are ours and never read: the picture is unchanged. Question (c415:
+// render-thread spin 0; c413/c414: worker spin not shown): does the heavy-route driving frame follow GPU time?
 static std::atomic<unsigned> v560BurdenCount{0};static std::atomic<unsigned long long> v560BurdenApplied{0};static std::atomic<bool> v560BurdenFailed{false};
+static void v562SpinUs(unsigned us) noexcept {
+#if defined(__aarch64__)
+    std::uint64_t hz,start,now;asm volatile("mrs %0, cntfrq_el0":"=r"(hz));asm volatile("mrs %0, cntvct_el0":"=r"(start));
+    const std::uint64_t span=std::uint64_t(us)*hz/1000000u;
+    do{asm volatile("yield");asm volatile("mrs %0, cntvct_el0":"=r"(now));}while(now-start<span);
+#endif
+    v562Items.fetch_add(1,std::memory_order_relaxed);
+}
 [[gnu::noinline]] void paceWindow() noexcept {
-    { // v560 (measurement only): diag-gpu-burden, read once per 60-present window; the label line for the in-run A/B
-        unsigned n=0;bool on=false;
-        if(std::FILE* f=std::fopen(RECOMP_APP_PATH("/private-trace/diag-gpu-burden"),"r")){on=true;if(std::fscanf(f,"%u",&n)!=1)n=2;std::fclose(f);}
+    { // ios-gpu-burden (measurement only)
+        const bool on=access(RECOMP_APP_PATH("/private-trace/diag-gpu-burden"),F_OK)==0;
         static unsigned long long lastApplied=0;const unsigned long long applied=v560BurdenApplied.load(std::memory_order_relaxed);
-        GLOG("RENDER_GENERIC_GPU_BURDEN_W on=%u clears=%u applied=%llu failed=%u",unsigned(on),v560BurdenCount.load(std::memory_order_relaxed),
+        GLOG("RENDER_GENERIC_GPU_BURDEN_W on=%u copies=%u applied=%llu failed=%u",unsigned(on),v560BurdenCount.load(std::memory_order_relaxed),
              applied-lastApplied,unsigned(v560BurdenFailed.load(std::memory_order_relaxed)));
-        lastApplied=applied;v560BurdenCount.store(on && !v560BurdenFailed.load(std::memory_order_relaxed)?std::min(n,16u):0u,std::memory_order_relaxed);
+        lastApplied=applied;v560BurdenCount.store(on && !v560BurdenFailed.load(std::memory_order_relaxed)?6u:0u,std::memory_order_relaxed); // (175: 6 copies, ~4.5 ms; 2 gave ~1.5 ms in c418)
+    }
+    { // ios-spin-worker-items (measurement only)
+        unsigned n=0;bool on=false;
+        if(access(RECOMP_APP_PATH("/private-trace/diag-spin-worker-items"),F_OK)==0) { // access(): the iOS virtual switches (A/B) answer it
+            on=true;n=1;if(std::FILE* f=std::fopen(RECOMP_APP_PATH("/private-trace/diag-spin-worker-items"),"r")){if(std::fscanf(f,"%u",&n)!=1)n=1;std::fclose(f);}
+        }
+        static unsigned long long last=0;const unsigned long long items=v562Items.load(std::memory_order_relaxed);
+        GLOG("RENDER_GENERIC_V562_W on=%u us=%u spun_items=%llu",unsigned(on),v562ItemSpinUs.load(std::memory_order_relaxed),items-last);last=items;
+        v562ItemSpinUs.store(on?std::min(std::max(n,1u),20u):0u,std::memory_order_relaxed);
     }
     static unsigned file=0;
     const unsigned window=file;
@@ -1004,34 +947,43 @@ static std::atomic<unsigned> v560BurdenCount{0};static std::atomic<unsigned long
         (has(RECOMP_APP_PATH("/private-trace/diag-pace-dpt"))?pc::SwDpt:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-pace-lowlat"))?pc::SwLowLat:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-pace-nolend"))?pc::SwNoLend:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-pace-20"))?pc::SwCap20:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-pace-15"))?pc::SwCap15:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-pace-auto-low"))?pc::SwAutoLow:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-pace-delay"))?pc::SwDelay:0u);
-    // v558 (driving goal, 2026-10-21; MEASUREMENT ONLY): diag-measure-unpaced = every pace file read as absent (no hold, no
-    // desired present time), with frame generation off too (fgGenWindow); the owner's own switch files are not touched.
-    if(has(RECOMP_APP_PATH("/private-trace/diag-measure-unpaced")))file=0;
+        (has(RECOMP_APP_PATH("/private-trace/ios-pace-backlog2"))?pc::SwShortBacklog:0u); // (Claude 2026-10-18)
+    #if defined(__APPLE__)
+    file=recomp::apple::launcher::bridge::pace(file);
+    // (Claude, 2026-10-18) a saved "30 fps" is the iOS default's even 30: the cap WITH desired present times (ios-defaults, c21-c44),
+    // so a saved file that keeps the original cap runs exactly as no file does
+    if((recomp::apple::launcher::bridge::word()&0x80000007u)==0x80000003u)file|=pc::SwDpt;
+    // ios-direct-present (Claude): RECOMP_IOS_PACE = off | 30 | 30dpt | 40 | auto replaces the cap for the run; without it and
+    // without a saved launcher choice the cap is 30 with desired present times (ios-defaults: an even 30 on the 60 Hz panel).
+    if(!std::getenv("RECOMP_IOS_PACE") && !(recomp::apple::launcher::bridge::word()&0x80000000u))file=(file&~(pc::SwCaps|pc::SwDpt))|pc::SwCap30|pc::SwDpt;
+    // (Claude, 2026-10-18) the launcher's Frame Generation: the 30 fps cap with desired present times, whatever the cap row says
+    if(recomp::apple::launcher::bridge::frameGeneration())file=(file&~(pc::SwCaps|pc::SwDpt))|pc::SwCap30|pc::SwDpt;
+    if(const char* e=std::getenv("RECOMP_IOS_PACE")) {
+        const std::string_view v(e);
+        file&=~(pc::SwCaps|pc::SwDpt);
+        if(v=="30" || v=="30dpt")file|=pc::SwCap30;
+        if(v=="40")file|=pc::SwCap40;
+        if(v=="auto")file|=pc::SwAuto;
+        if(v=="30dpt")file|=pc::SwDpt;
+    }
+    #endif
     pc::pacer().setSwitches(file);
     const unsigned w=window&file;
     const pc::Snapshot s=pc::pacer().take();
-    GLOG("RENDER_GENERIC_V210Z pace=%u pace_40=%u pace_30=%u pace_24=%u pace_auto=%u pace_dpt=%u pace_lowlat=%u pace_nolend=%u "
-         "pace_20=%u pace_15=%u pace_auto_low=%u pace_delay=%u",
+    GLOG("RENDER_GENERIC_V210Z pace=%u pace_40=%u pace_30=%u pace_24=%u pace_auto=%u pace_dpt=%u pace_lowlat=%u pace_nolend=%u",
          (file&pc::SwCaps)?s.fps:0u,unsigned((w&pc::SwCap40)!=0),unsigned((w&pc::SwCap30)!=0),unsigned((w&pc::SwCap24)!=0),
-         unsigned((w&pc::SwAuto)!=0),unsigned((w&pc::SwDpt)!=0),unsigned((w&pc::SwLowLat)!=0),unsigned((w&pc::SwNoLend)!=0),
-         unsigned((w&pc::SwCap20)!=0),unsigned((w&pc::SwCap15)!=0),unsigned((w&pc::SwAutoLow)!=0),unsigned((w&pc::SwDelay)!=0));
+         unsigned((w&pc::SwAuto)!=0),unsigned((w&pc::SwDpt)!=0),unsigned((w&pc::SwLowLat)!=0),unsigned((w&pc::SwNoLend)!=0));
     const auto ms=[](std::uint64_t ns,unsigned n){return n?double(ns)/1e6/double(n):0.0;};
     GLOG("RENDER_DIAG_PACE cap=%u n=%u sw=%u slots=%u held=%u late=%u wait_ms=%.2f/%.2f overshoot_ms=%.3f/%.3f on=%u early=%u tail_late=%u "
          "disp=1:%u,2:%u,3:%u,4:%u,5:%u,6:%u,7:%u held2=%u wait2_ms=%.2f auto_up=%u auto_down=%u auto_i=%u demand_ms=%.2f start_ms=%.2f "
          "holdoff_s=%.0f lead_ms=%.2f path_ms=%.2f trim_ms=%.2f kick_ms=%.2f/%.2f period_us=%.2f refresh_us=%.2f grid=%u no_grid=%u "
-         "unpaced=%u refused=%u clamped=%u overslept=%u bad_times=%u lend=%u main_left=%u cancel=%u lend2=%u main_left2=%u "
-         "disp_long=7:%u,8:%u,9:%u,10:%u,11:%u,12:%u,13:%u,14:%u delay=%u delay_timed=%u",
+         "unpaced=%u refused=%u clamped=%u overslept=%u bad_times=%u lend=%u main_left=%u cancel=%u lend2=%u main_left2=%u",
          s.fps,s.refreshes,s.switches,s.slots,s.held,s.late,ms(s.waitNs,s.held),double(s.waitMaxNs)/1e6,ms(s.overshootNs,s.held),
          double(s.overshootMaxNs)/1e6,s.onSlot,s.early,s.tailLate,s.disp[1],s.disp[2],s.disp[3],s.disp[4],s.disp[5],s.disp[6],s.disp[7],
          s.held2,ms(s.wait2Ns,s.held2),s.autoUp,s.autoDown,s.autoIndex,double(s.demandNs)/1e6,double(s.firstNs)/1e6,double(s.holdoffNs)/1e9,
          double(s.leadNs)/1e6,double(s.pathNs)/1e6,double(s.trimNs)/1e6,double(s.kickNs)/1e6,double(s.kickDevNs)/1e6,s.periodNs/1e3,
          double(s.refreshNs)/1e3,unsigned(s.grid),s.noGrid,s.unpaced,s.refused,s.clamped,s.overslept,s.badTimes,s.lends,s.mainLeft,
-         s.cancels,s.lends2,s.mainLeft2,
-         s.dispLong[0],s.dispLong[1],s.dispLong[2],s.dispLong[3],s.dispLong[4],s.dispLong[5],s.dispLong[6],s.dispLong[7],s.delay,s.delayTimed);
+         s.cancels,s.lends2,s.mainLeft2);
     // pace-fg-tuning: under a cap only, one record per displayed paced frame of the window (v460's window counters could not say
     // why 15-25 % of frames were a refresh early at 30 fps): off:begin:end = refreshes from the slot (0 on it, -1 early, 1 late),
     // then the slot minus the present call's begin and minus its return in 0.1 ms; a trailing t = planned as timed. Also the
@@ -1061,10 +1013,6 @@ static std::atomic<unsigned> v560BurdenCount{0};static std::atomic<unsigned long
 // names fast_exp.sh derives); the counters are the presenter's own RENDER_DIRECT_FG line. Out of line: the window poll keeps its CFG.
 // integrate-v460 (frame-gen/MERGE.md place 4): lane A's plan of a frame for lane B's gate; called by Presenter::fgBefore only
 // while a diag-fg-pair-* file is present.
-// fg-low: the modifier diag-fg-low (fg_pair.h SwLow: pairs also under the pacer's caps of 6 and 8 refreshes, their pictures half
-// the frame apart); V210Z fg_low at the END of the line, by the same whole-window rule.
-// fg-late-relative: diag-fg-late-relative (fg_pair.h SwLateRelative: the generator's slot keeper judges a made picture by its
-// place in its own pair, not by the pacer's slot); V210Z fg_late_relative, at the end.
 bool fgPaceSlot(std::uint32_t tag,recomp::fg::Slot* out) noexcept {return recomp::pace::pacer().slot(tag,&out->target,&out->refreshes,&out->period);}
 [[gnu::noinline]] void fgWindow() noexcept {
     recomp::fg::slotSource.store(&fgPaceSlot,std::memory_order_relaxed); // (the same value every window)
@@ -1073,15 +1021,18 @@ bool fgPaceSlot(std::uint32_t tag,recomp::fg::Slot* out) noexcept {return recomp
     const auto has=[](const char* n){return access(n,F_OK)==0;};
     namespace fg=recomp::fg;
     file=(has(RECOMP_APP_PATH("/private-trace/diag-fg-pair-between"))?fg::SwBetween:0u)|
+    #if defined(__APPLE__)
+        (recomp::apple::launcher::bridge::frameGeneration()?fg::SwBetween:0u)| // (Claude: the launcher's Frame Generation)
+    #endif
         (has(RECOMP_APP_PATH("/private-trace/diag-fg-pair-ahead"))?fg::SwAhead:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-fg-hold"))?fg::SwHold:0u)|
         (has(RECOMP_APP_PATH("/private-trace/diag-fg-nocap"))?fg::SwNoCap:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-fg-low"))?fg::SwLow:0u)|
-        (has(RECOMP_APP_PATH("/private-trace/diag-fg-late-relative"))?fg::SwLateRelative:0u);
+        (has(RECOMP_APP_PATH("/private-trace/ios-fg-drain"))?fg::SwDrain:0u)| // (ios-fg-drain: the opt-in queue drain, c312)
+        (has(RECOMP_APP_PATH("/private-trace/ios-fg-trace-all"))?fg::SwTraceAll:0u); // (ios-fg-trace-all: lost second pictures, c391)
     recomp::gpu::direct::presenter().fgSwitches(file);
     const unsigned w=window&file;
-    GLOG("RENDER_GENERIC_V210Z fg_pair_between=%u fg_pair_ahead=%u fg_hold=%u fg_nocap=%u fg_low=%u fg_late_relative=%u",unsigned((w&fg::SwBetween)!=0),unsigned((w&fg::SwAhead)!=0),
-         unsigned((w&fg::SwHold)!=0),unsigned((w&fg::SwNoCap)!=0),unsigned((w&fg::SwLow)!=0),unsigned((w&fg::SwLateRelative)!=0));
+    GLOG("RENDER_GENERIC_V210Z fg_pair_between=%u fg_pair_ahead=%u fg_hold=%u fg_nocap=%u",unsigned((w&fg::SwBetween)!=0),unsigned((w&fg::SwAhead)!=0),
+         unsigned((w&fg::SwHold)!=0),unsigned((w&fg::SwNoCap)!=0));
 }
 // prewarm-fix (diag-pw-fix, read once by startRecipes before the prewarm thread starts): the v139 prewarm makes a vertex-variant
 // recipe's module as variant() makes the draw path's (adaptInputs of the pack words, then graphicsModule: v294's bank rewrite and
@@ -1278,6 +1229,7 @@ struct PtxLoad {bool enabled=false;unsigned applied=0,mismatched=0;const char* w
 // files/private-trace/diag-generic-no-coissue-fix, read ONCE by initialize(), keeps the pack's modules (v592).
 #include "generic_coissue_overrides.inc"
 #include "generic_coissue_reglod_overrides.inc" // v594
+#include "generic_nan_overrides.inc" // (iPad build 227) finite RSQ under Metal fast math
 [[gnu::noinline]] void coIssueLoad(std::vector<std::uint8_t>& pack) noexcept {
     std::uint64_t taken[std::size(DenormOverrides)+std::size(GradientOverrides)+std::size(RegLodOverrides)+std::size(ClothOverrides)];std::size_t n=0;
     for(const auto& o:DenormOverrides)taken[n++]=o.hash;
@@ -1286,7 +1238,8 @@ struct PtxLoad {bool enabled=false;unsigned applied=0,mismatched=0;const char* w
     for(const auto& o:ClothOverrides)taken[n++]=o.hash;
     const auto r=reglod::applyUnlessSwitch(pack,CoIssueOverrides,std::size(CoIssueOverrides),taken,n,
                                            RECOMP_APP_PATH("/private-trace/diag-generic-no-coissue-fix"),
-                                           0x3u); // v595: vertex and pixel modules (133 of the 165 hazard keys are vertex shaders)
+                                           0x3u); // (iPad 2026-10-22: vertex AND pixel; the default pixel-only mask refused the whole table on
+                                                  // the device, c524b: applied=0 why=override-stage, 133 of its 159 keys are vertex shaders)
     GLOG("RENDER_GENERIC_COISSUE_FIX enabled=%u overrides=%zu applied=%u words=%u why=%s",unsigned(r.enabled),std::size(CoIssueOverrides),
          r.applied,r.words,r.why);
     // v594: the 4 reglod-table keys with a co-issue hazard, re-translated with both fixes (coissue/make_coissue_reglod.py: the reglod
@@ -1451,7 +1404,10 @@ VkComponentSwizzle component(unsigned s){switch(s){case 0:return VK_COMPONENT_SW
 std::uint32_t physicalAddress(std::uint32_t a){return (a&0x1FFFFFFFu)+(((a>>20)+512u)&0x1000u);}
 // v40: `written` orders every write (pass begin, clear, resolve clear) so a resolve reads the target
 // that last wrote its EDRAM base, as the hardware would.
-struct Target {Image image;bool depth=false;unsigned xenosFormat=0,pitch=0,base=0;std::uint64_t serial=0,written=0;
+struct Target {Image image;bool depth=false;unsigned xenosFormat=0,pitch=0,base=0;std::uint64_t serial=0,written=0;std::uint8_t stampSite=0,stampPrev=0; // (build 220, diagnostic) the last two sites that set `written`
+
+    std::int32_t stripY0=0,stripY1=0; // ios-strips (diagnostic): image rows written by depth-restore strip draws (im#78p), not yet cleared
+
     VkImageView stencilView=VK_NULL_HANDLE; // v60: depth targets: the stencil aspect, for the depth word
     // v55: RB_SURFACE_INFO msaa_samples and EDRAM rows (before the next bound base) of the pass that bound it last.
     unsigned samples=0,edramRows=0;
@@ -1476,6 +1432,8 @@ struct Texture {Image image;std::uint64_t fingerprint=0;std::uint64_t lastUse=0;
     // v261 (write watch): the uploaded bytes' hash (base span, then the mip span the upload read) and the spans' stamp it
     // was last shown current at (watch::Dynamic: not yet).
     bool watchHashed=false;std::uint64_t watchHash=0,watchStamp=~0ull;std::uint32_t watchMipBytes=0;};
+struct IosResolveKinds {std::uint64_t total=0,depth=0,depthClear=0,color=0,colorClear=0,colorClearWhole=0,colorClearWholeSame=0,swapCandidates=0,swapTexels=0;};
+static IosResolveKinds iosResolveKinds; // ios-resolve-kinds (logged with RENDER_GENERIC_TIMING)
 struct Resolved {Image image;unsigned width=0,height=0;std::uint64_t frame=0;std::array<unsigned,4> view{0,1,2,3};unsigned seq=0;
     // v74: the destination texture's shape (cube faces / stacked layers and mip levels the resolves write), and
     // the views handed to fetches of another dimension or LOD range (stable addresses: the binding cache keeps
@@ -1526,6 +1484,7 @@ struct V74Counters {
 // v24: one frame in flight per slot. A slot is reused only after its fence has been waited, so the
 // CPU never writes ring bytes, descriptor sets or command buffers the GPU may still read.
 struct FrameSlot {
+    renderwait::Store waitTiming;
     VkCommandPool pool=VK_NULL_HANDLE;VkCommandBuffer cmd=VK_NULL_HANDLE;VkFence fence=VK_NULL_HANDLE;
     Buffer ring;VkDescriptorSet constantSet=VK_NULL_HANDLE;
     VkDescriptorSet constantSetBig=VK_NULL_HANDLE; // v311 (diagnostic measurement): the banks bound with 16 KB ranges
@@ -1554,7 +1513,9 @@ struct FrameSlot {
         int endLine=0;bool sameAsPrevious=false; // v288: the endPass call site; begun on the framebuffer the previous pass ended on
         bool depth=false,depthWritten=false; // v292: a depth attachment; a draw with stencil or z-write, or a depth clear, in the pass
         std::uint64_t lastVs=0,lastPs=0; // v305 (diagnostic): the shader pair of the pass's last draw
-        std::uint32_t rects=0;}; // v342 (diagnostic): clear rectangles issued inside the pass (pending alias clears and in-pass clears)
+        std::uint32_t rects=0; // v342 (diagnostic): clear rectangles issued inside the pass (pending alias clears and in-pass clears)
+        std::array<std::uint32_t,5> bases{},views{};}; // (Claude, diagnostic) each attachment's EDRAM base and view handle (low 32 bits)
+    resolve_identity::Store resolveIdentity;
     VkQueryPool passTimestamps=VK_NULL_HANDLE;bool passProfiled=false,passPoolFailed=false;std::vector<PassInfo> passInfo;unsigned passCount=0;
 };
 constexpr unsigned MaxTimedChunks=48;
@@ -1635,6 +1596,10 @@ std::set<unsigned>* testStateReads=nullptr;bool testInDraw=false;
 class Renderer {
 public:
     ProbeDevice& d;
+    std::optional<RecompIosGpuFrameV1> iosSharedFrame;
+    std::uint64_t iosSourceGeneration=0;
+    recomp::ios_async_shared::SourcePool<Image> iosAsyncSources;
+    std::optional<recomp::ios_async_shared::Mailbox::Producer> iosAsyncProduced;
     std::vector<std::uint8_t> pack;
     // ---- v363 (files/private-trace/diag-v363-flat-maps, applied with the other switches every 60 presents; default OFF):
     // exact front caches and memos in front of the worker's per-draw map probes (v349 drive profile of recomp-render-w:
@@ -1720,7 +1685,7 @@ public:
     bool recipesOn=true;std::unordered_set<std::uint64_t> recipeDigests;unsigned recipeFile=0;std::size_t recipeFileBytes=0;
     std::size_t spareCap=8; // v150 (diag-generic-spares-3: 3)
     std::uint64_t recipesRecorded=0,recipesUnrecordable=0,recipeWriteFailures=0,recipesDuplicate=0,recipesVariant=0; // v142: +dup/variant
-    std::atomic<unsigned> prewarmCompiled{0},prewarmFailed{0},prewarmSkipped{0};std::atomic<bool> prewarmDone{false};
+    std::atomic<unsigned> prewarmCompiled{0},prewarmFailed{0},prewarmSkipped{0};std::atomic<bool> prewarmDone{false}; unsigned fanListPrewarmed=0; // (fan-list prewarm; prewarm thread only, read after prewarmDone)
     std::atomic<std::uint64_t> prewarmNs{0};
     // The current slot's handles (useSlot); v23 had exactly one of each.
     VkDescriptorPool framePool=VK_NULL_HANDLE,staticPool=VK_NULL_HANDLE;
@@ -2036,12 +2001,6 @@ public:
     bool v591Off=false,msaa4xSeen=false;
     struct V591Stats {std::uint64_t copies=0,refused=0,older=0,twoX=0,reverse=0,ns=0;} v591Stats;
     std::uint64_t v591Logged=0;
-    // v587 (F3 diagnostic): files/private-trace/diag-resolve-watch (hex resolve destination addresses, one per line; polled): every
-    // resolve into a listed address logs RENDER_WATCH_RESOLVE with its source target and the last 24 draws into that target
-    // (vs/ps keys, sampled texture bases with bit 0 = tiled fetch, primitive, count, frame). Off: one branch per draw.
-    bool watchOn=false;std::vector<std::uint32_t> watchAddrs;
-    struct WatchDraw {std::uint64_t vs=0,ps=0;std::array<std::uint32_t,4> tex{};unsigned texN=0,prim=0,count=0;std::uint64_t frame=0;};
-    std::map<const Target*,std::deque<WatchDraw>> watchHist;
     std::uint64_t v363ResolvedSetGen=1;
     std::vector<std::uint32_t> v363ResolvedKeys;std::vector<Resolved*> v363ResolvedNodes;std::uint64_t v363ResolvedKeysGen=0;
     void v363ResolvedMirror() {
@@ -2192,6 +2151,56 @@ public:
     bool uboBanks=false;struct V294 {std::uint64_t rewritten=0,unbanked=0,refused=0;} v294;
     static bool uboBanksAvailable(){return &recomp_v294_ubo_banks && recomp_v294_ubo_banks.load(std::memory_order_acquire);}
     VkDescriptorType bankType(unsigned binding)const{return uboBanks && binding<2?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;}
+    // ios-vs-trim (Claude, 2026-10-16; ios_vs_trim.h): files/private-trace/ios-vs-trim (polled with the 60-present switches)
+    // gives every NEW pipeline the vertex module without the outputs its fragment stage does not read (none for a depth-only
+    // pipeline). Exact: the outputs the fragment stage reads are written as before. While on, pipeline keys carry a salt, so
+    // the trimmed and untrimmed pipelines never mix (an in-run A/B compiles each set once). graphicsModule() records the
+    // final words of vertex modules and the input Locations of fragment modules; trimmed modules are kept until shutdown.
+    struct VsTrim {
+        std::mutex m;std::atomic<bool> on{false},noClip{false}; // noClip: ios-vs-noclip (MEASUREMENT ONLY, needs ios-vs-trim)
+        std::unordered_map<VkShaderModule,std::vector<std::uint32_t>> vsWords;std::unordered_map<VkShaderModule,std::uint64_t> psMask;
+        std::unordered_map<std::uint64_t,VkShaderModule> trimmed; // fnv(words) mixed with the mask -> trimmed module (null: unchanged)
+        std::size_t bytes=0;std::uint64_t made=0,hits=0,unchanged=0,failed=0,unknown=0;
+        bool wanted=false; // this run may turn it on (the file at start, or the launch environment names it): the prewarm makes both
+    } vsTrim;
+    void vtForget(VkShaderModule m) {
+        try {std::lock_guard lock(vsTrim.m);
+            if(auto it=vsTrim.vsWords.find(m);it!=vsTrim.vsWords.end()){vsTrim.bytes-=std::min(vsTrim.bytes,it->second.size()*4);vsTrim.vsWords.erase(it);}
+            vsTrim.psMask.erase(m);} catch(...) {}
+    }
+    static constexpr std::size_t VsTrimCapBytes=96u<<20;
+    void vtRecord(VkShaderModule m,const std::uint32_t* code,std::size_t words) {
+        if(!m || !code)return;
+        const int model=recomp::ios_vs_trim::executionModel(code,words);
+        try {
+            std::lock_guard lock(vsTrim.m);
+            if(auto it=vsTrim.vsWords.find(m);it!=vsTrim.vsWords.end()){vsTrim.bytes-=std::min(vsTrim.bytes,it->second.size()*4);vsTrim.vsWords.erase(it);}
+            vsTrim.psMask.erase(m);
+            if(model==int(recomp::ios_vs_trim::ModelVertex) && vsTrim.bytes+words*4<=VsTrimCapBytes)
+                {vsTrim.vsWords[m].assign(code,code+words);vsTrim.bytes+=words*4;}
+            else if(model==int(recomp::ios_vs_trim::ModelFragment))vsTrim.psMask[m]=recomp::ios_vs_trim::inputLocationMask(code,words);
+        } catch(...) {}
+    }
+    VkShaderModule vtFor(VkShaderModule vm,VkShaderModule pm,bool prewarm=false) {
+        if(!vm || !(prewarm?vsTrim.wanted:vsTrim.on.load(std::memory_order_relaxed)))return vm;
+        try {
+            std::lock_guard lock(vsTrim.m);
+            std::uint64_t mask=0;
+            if(pm){const auto p=vsTrim.psMask.find(pm);if(p==vsTrim.psMask.end()){++vsTrim.unknown;return vm;}mask=p->second;}
+            if(mask==recomp::ios_vs_trim::AllLocations){++vsTrim.unchanged;return vm;}
+            const auto w=vsTrim.vsWords.find(vm);if(w==vsTrim.vsWords.end()){++vsTrim.unknown;return vm;}
+            std::uint64_t key=0xcbf29ce484222325ull;for(const auto x:w->second){key^=x;key*=0x100000001b3ull;}
+            key^=mask*0x9E3779B97F4A7C15ull;key^=w->second.size();const bool noClip=vsTrim.noClip.load(std::memory_order_relaxed);if(noClip)key^=0xC11Full;
+            if(const auto t=vsTrim.trimmed.find(key);t!=vsTrim.trimmed.end()){++vsTrim.hits;return t->second?t->second:vm;}
+            const auto t=recomp::ios_vs_trim::trimOutputs(w->second.data(),w->second.size(),mask,noClip);
+            if(t.empty()){vsTrim.trimmed[key]=VK_NULL_HANDLE;++vsTrim.unchanged;return vm;}
+            VkShaderModuleCreateInfo c{};c.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;c.codeSize=t.size()*4;c.pCode=t.data();
+            VkShaderModule tm=VK_NULL_HANDLE;
+            if(vkCreateShaderModule(d.device,&c,nullptr,&tm)!=VK_SUCCESS || !tm){vsTrim.trimmed[key]=VK_NULL_HANDLE;++vsTrim.failed;return vm;}
+            gcRecordModule(d.device,tm,t.data(),t.size()); // (the gpu-cost fold folds the trimmed module as it would the original)
+            vsTrim.trimmed[key]=tm;++vsTrim.made;return tm;
+        } catch(...) {return vm;}
+    }
     VkShaderModule graphicsModule(const std::uint32_t* code,std::size_t words) {
         std::vector<std::uint32_t> rewritten;
         if(uboBanks) {
@@ -2206,6 +2215,7 @@ public:
 #endif
         VkShaderModule m=VK_NULL_HANDLE;if(vkCreateShaderModule(d.device,&c,nullptr,&m)!=VK_SUCCESS)m=VK_NULL_HANDLE;
         gcRecordModule(d.device,m,code,words); // gpu-cost (diag-gc-index-fold)
+        vtRecord(m,code,words); // ios-vs-trim
         return m;
     }
     // v293: a pass whose depth/stencil attachment the previous pass on the same framebuffer did not write begins with that
@@ -2284,6 +2294,8 @@ public:
     // current pass
     bool inPass=false;std::uint64_t passKey=0;VkRenderPass pass=VK_NULL_HANDLE;unsigned passWidth=0,passHeight=0;
     std::array<const Target*,5> passTargets{};
+    std::atomic<bool> noteCacheOff{false}; // (build 202, measurement switch ios-notecache-off, polled every 60 presents)
+    struct {std::uint64_t clock=~0ull;std::int32_t x0=0,y0=0,x1=0,y1=0;} noteCache; // (build 201) the last draw's noteWrite (pass clock, rectangle)
     VkFormat depthFormat=VK_FORMAT_D24_UNORM_S8_UINT;
     Stats counters;
     std::map<std::string,unsigned> logged;
@@ -2496,6 +2508,8 @@ public:
 #else
     unsigned seMode=0;
 #endif
+    const iossebig::Policy seBigPolicy=iossebig::fromEnvironment();
+    const bool samplerSetBits=iossamplerenum::fromEnvironment();
     se::BigPass seBig;std::uint64_t seOpenViews=0,seOpenDraws=0;unsigned seReason=se::Threshold;
     struct SeStats {std::uint64_t bigSubmits=0,bigSmall=0,bigCovered=0,predicted=0,idleCalls=0,idleSubmits=0,idleInPass=0,idleSmall=0,
         idleEmpty=0,earlyItems=0;} seStats;
@@ -3196,10 +3210,6 @@ public:
     std::vector<CompletedWriteback> completedWritebacks;
     struct WritebackStats {std::uint64_t queued=0,published=0,unchanged=0,refused=0,dropped=0,bytes=0,superseded=0;} wbStats; // v613: + superseded
     std::map<std::uint32_t,unsigned> wbLogged; // destination -> first-publication lines logged so far
-    // v840: the fog-of-war mask's revealed cells (bytes > 128, GET_MINIMAP_FOW_COORDINATE_IS_REVEALED's test) at each change, per
-    // wb::cpuWritten destination: does the exploration a save load writes survive the next resolve? (lines capped at 400)
-    std::map<std::uint32_t,std::uint32_t> fowRevealedLogged;unsigned fowLines=0;
-    static std::uint32_t fowRevealed(const std::uint8_t* p,std::size_t n) noexcept {std::uint32_t k=0;for(std::size_t i=0;i<n;++i)k+=p[i]>128;return k;}
     static constexpr unsigned MaxWritebackTexels=4096;static_assert(MaxWritebackTexels==::recomp::gpu::rs::WritebackTexels);static constexpr VkDeviceSize WritebackBytesPerSlot=1024*1024; // v613: 256 KB -> 1 MB (velocity map 4 x 64 KB + height 64 KB a frame)
     // v66: files/private-trace/diag-generic-no-vfetch-swizzle restores v65 (bound vfetch swizzles ignored).
     bool vfetchSwizzle=true;
@@ -3507,15 +3517,9 @@ public:
         bool latched=false,armed=false,active=false;unsigned count=0,seq=0,lines=0,lost=0;
         unsigned skinLogged=0;std::array<std::uint64_t,4> skinShaders{}; // v80: skinned vertex shaders logged (SKIN lines) this census frame
         Buffer probes;std::size_t used=0;std::vector<CensusRecord> records;
-        // v590 (F3 diagnostic): whole resolved images listed in files/private-trace/diag-census-resolved-dump (hex addresses),
-        // copied into the probe buffer at the census frame's end and written as census/resdump-NN-ADDR-WxH-vkF.bin.
-        struct Dump {std::uint32_t address=0;std::size_t offset=0;unsigned width=0,height=0,bytes=0;VkFormat format=VK_FORMAT_UNDEFINED;};
-        std::vector<Dump> dumps;
         std::FILE* file=nullptr;unsigned fileIndex=0;std::size_t fileBytes=0;
         // artifacts-1 (census_af_diag.h): the draws whose constants / sampled texture bytes this census records
         afdiag::KeyFilter afConstants,afTextures;std::vector<std::pair<std::uint32_t,std::uint64_t>> afDumped;std::size_t afDumpBytes=0;
-        // census-split (v607): copy regions recorded since the frame's command buffer was last split; splits done / failed
-        std::size_t splitRegions=0;unsigned splits=0,splitFailures=0;
     } census;
     // artifacts-1: one sampled guest texture of a census draw the diag-census-textures list names, written once per census
     // (address, fetch words) in parts under files/private-trace/census/ (census_af_diag.h); resolve destinations are noted only.
@@ -3523,10 +3527,7 @@ public:
     void afDumpTexture(unsigned seq,unsigned slot,const std::array<std::uint32_t,6>& fetch,const Reader& data) {
         const auto desc=XenosTextureDescription::decode(fetch);
         if(!desc){clog("RENDER_CENSUS AFT i=%u s%u undecodable",seq,slot);return;}
-        // v587 (F3, census only): a resolved address is dumped too: the guest bytes (what a CPU writer left there) next to the
-        // resolved image the draw samples (the AFT line says resolved=1).
-        const bool isResolved=resolved.count(physicalAddress(desc->baseAddress))!=0;
-        if(isResolved)clog("RENDER_CENSUS AFT i=%u s%u f%u resolved=%08x dumping-guest-bytes",seq,slot,desc->format,desc->baseAddress);
+        if(resolved.count(physicalAddress(desc->baseAddress))){clog("RENDER_CENSUS AFT i=%u s%u f%u resolved=%08x",seq,slot,desc->format,desc->baseAddress);return;}
         const std::uint64_t fk=fnvOf(fetch);const std::pair<std::uint32_t,std::uint64_t> id{desc->baseAddress,fk};
         if(std::find(census.afDumped.begin(),census.afDumped.end(),id)!=census.afDumped.end()){
             clog("RENDER_CENSUS AFT i=%u s%u f%u %ux%u base=%08x dumped-before",seq,slot,desc->format,desc->width,desc->height,desc->baseAddress);return;}
@@ -3566,9 +3567,13 @@ public:
     unsigned censusPoints[CensusPointCount][2]{};
     void loadCensusPoints() {
         for(unsigned p=0;p<CensusPointCount;++p){censusPoints[p][0]=CensusPoints[p][0];censusPoints[p][1]=CensusPoints[p][1];}
-        std::FILE* f=std::fopen(RECOMP_APP_PATH("/private-trace/diag-census-points"),"r");
+        char text[256]{};
+#if defined(__APPLE__)
+        if(const char* e=std::getenv("RECOMP_IOS_CENSUS_POINTS")) {std::snprintf(text,sizeof text,"%s",e);} else // (build 224: test runs set the points at launch)
+#endif
+        {std::FILE* f=std::fopen(RECOMP_APP_PATH("/private-trace/diag-census-points"),"r");
         if(!f)return;
-        char text[256]{};const std::size_t n=std::fread(text,1,sizeof text-1,f);std::fclose(f);text[n]=0;
+        const std::size_t n=std::fread(text,1,sizeof text-1,f);std::fclose(f);text[n]=0;}
         const char* at=text;
         for(unsigned p=0;p<CensusPointCount && *at;++p) {
             unsigned x=0,y=0;int used=0;
@@ -3618,7 +3623,7 @@ public:
         vkCmdCopyImageToBuffer(cmd,image.image,VK_IMAGE_LAYOUT_GENERAL,census.probes.buffer,n,regions.data());
         barrier();
         census.records.push_back({seq,label,census.used,image.format,depth,std::move(what)});
-        census.used+=need;census.splitRegions+=n; // census-split (v607)
+        census.used+=need;
     }
     static std::string decodeTexel(const std::uint8_t* p,VkFormat f) {
         char b[96];std::uint32_t w;std::memcpy(&w,p,4);
@@ -3643,9 +3648,8 @@ public:
     void censusBegin() {
         if(!census.probes.buffer && !makeBuffer(CensusProbeBytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT,census.probes)){census.probes={};GLOG("RENDER_CENSUS unavailable probe-buffer");}
         ::mkdir(RECOMP_APP_PATH("/private-trace/census"),0700);
-        ++census.count;census.active=true;census.seq=0;census.lines=0;census.lost=0;census.used=0;census.records.clear();census.fileIndex=0;census.dumps.clear();
+        ++census.count;census.active=true;census.seq=0;census.lines=0;census.lost=0;census.used=0;census.records.clear();census.fileIndex=0;
         census.skinLogged=0; // v80
-        census.splitRegions=0;census.splits=0;census.splitFailures=0; // census-split (v607)
         // artifacts-1: the census-only constant / texture records (census_af_diag.h)
         census.afConstants=afdiag::loadKeyFilter(RECOMP_APP_PATH("/private-trace/diag-census-constants"));
         census.afTextures=afdiag::loadKeyFilter(RECOMP_APP_PATH("/private-trace/diag-census-textures"));
@@ -3668,22 +3672,6 @@ public:
     // Before the census frame's present is submitted: the final content of every target and resolved
     // image this frame wrote.
     void censusFinalProbes() {
-        if(censusSplitDue()){endPass(__LINE__);censusSplit();} // census-split (v607): the final probes start a new command buffer when due
-        { // v590: the listed resolved images, whole (census only)
-            const auto f=afdiag::loadKeyFilter(RECOMP_APP_PATH("/private-trace/diag-census-resolved-dump"));
-            if(f.active && !f.keys.empty() && census.probes.buffer)for(const auto k:f.keys) {
-                const auto it=resolved.find(physicalAddress(std::uint32_t(k)));
-                if(it==resolved.end() || !it->second.image.image){clog("RENDER_CENSUS RESDUMP addr=%08x not-resolved",std::uint32_t(k));continue;}
-                const auto& im=it->second.image;const unsigned bpt=remapTexelBytes(im.format);
-                const std::size_t need=(std::size_t(im.width)*im.height*bpt+15)&~std::size_t{15};
-                if(!bpt || rsKDiffers(im,rscale::One) || census.used+need>census.probes.size){clog("RENDER_CENSUS RESDUMP addr=%08x refused vkfmt=%d",it->first,int(im.format));continue;}
-                endPass(__LINE__);barrier();
-                VkBufferImageCopy c{};c.bufferOffset=census.used;c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};c.imageExtent={im.width,im.height,1};
-                vkCmdCopyImageToBuffer(cmd,im.image,VK_IMAGE_LAYOUT_GENERAL,census.probes.buffer,1,&c);
-                barrier();
-                census.dumps.push_back({it->first,census.used,im.width,im.height,bpt,im.format});census.used+=need;
-            }
-        }
         unsigned n=0;
         for(const auto& [key,t]:targets)if(t.image.image && t.serial==frame && n++<96)censusProbe(census.seq,'F',t.image,targetName(&t));
         for(const auto& [address,r]:resolved)if(r.image.image && r.frame==frame && n++<192) {
@@ -3710,15 +3698,7 @@ public:
             }
             clog("RENDER_CENSUS Q i=%u %c %s vkfmt=%d%s",r.seq,r.label,r.what.c_str(),int(r.format),values.c_str());
         }
-        for(const auto& d:census.dumps) { // v590
-            char path[224];std::snprintf(path,sizeof path,RECOMP_APP_PATH("/private-trace/census/resdump-%02u-%08x-%ux%u-vk%d.bin"),census.count,d.address,
-                                         d.width,d.height,int(d.format));
-            bool ok=false;if(bytes)if(std::FILE* f=std::fopen(path,"wb")){ok=std::fwrite(bytes+d.offset,1,std::size_t(d.width)*d.height*d.bytes,f)==std::size_t(d.width)*d.height*d.bytes;std::fclose(f);}
-            clog("RENDER_CENSUS RESDUMP addr=%08x %ux%u vkfmt=%d bytes=%u written=%u",d.address,d.width,d.height,int(d.format),d.width*d.height*d.bytes,unsigned(ok));
-        }
-        census.dumps.clear();
-        clog("RENDER_CENSUS END n=%u events=%u probes=%zu lost=%u splits=%u split_failed=%u",census.count,census.seq,census.records.size(),census.lost,
-             census.splits,census.splitFailures); // (census-split v607: splits=, split_failed= appended)
+        clog("RENDER_CENSUS END n=%u events=%u probes=%zu lost=%u",census.count,census.seq,census.records.size(),census.lost);
         if(census.file){std::fclose(census.file);census.file=nullptr;}
         census.active=false;census.records.clear();
         censusReleasePools(); // census-crash (a call only; out of line, noexcept)
@@ -3772,90 +3752,6 @@ public:
         } catch(...) {}
         GLOG("RENDER_CENSUS POOLS n=%u replaced=%u reset_only=%u kept=%u slots=%u",census.count,replaced,resetOnly,kept,slotCount);
     }
-    // census-split (v607; crash 2026-10-22 19:12 on the Thor, v600: local-analysis/thor-play-1021/crash-1912). A census frame is one
-    // command buffer (submitChunk refuses while census.active) and every probe adds a 12- or 24-region vkCmdCopyImageToBuffer, ~2.5 KB
-    // of driver recording memory per region (census-crash, 2026-10-05). The pool replacement after each census (censusReleasePools)
-    // keeps no census in a pool afterwards, but one census can still be too big by itself: census n=19 of run 83s_u7ay (4201 draws,
-    // est. 172,000 regions, the largest ever recorded; largest completed 164,760) faulted inside its own vkEndCommandBuffer
-    // (SEGV_ACCERR 48 bytes past a mapping, as crash 2 of 2026-10-05). What the driver runs out of is not known; destroying a pool is
-    // what the device showed gives the memory back (v464: +12..19 MB kept instead of +353).
-    // Here, once CensusSplitRegions copy regions are recorded in the current command buffer, at the next pass begin (no pass open) or
-    // before the final probes: the buffer is ended, submitted with the slot's fence and waited for (the census frame is synchronous
-    // and slow anyway); the slot's pool, now idle, is replaced by a new one (as censusReleasePools; the old one destroyed with all its
-    // buffers) and the frame continues in the new pool's buffer. The ring, descriptor sets, frame number, hazard lists and probe buffer
-    // carry over (submission order; the waited fence completes everything before it); bound state does not (recorded={}, as
-    // submitChunk). So a census frame holds at most about one split's recording memory at a time. Without a census this never runs.
-#if !defined(RECOMP_CENSUS_SPLIT_REGIONS)
-#define RECOMP_CENSUS_SPLIT_REGIONS 24000 // ~60 MB of recording memory at 2.5 KB a region; the faults were at 135,000-172,000
-#endif
-    static constexpr std::size_t CensusSplitRegions=RECOMP_CENSUS_SPLIT_REGIONS; // 0: never split (v602's behaviour)
-    bool censusSplitDue() const noexcept {return census.active && recording && CensusSplitRegions && census.splitRegions>=CensusSplitRegions;}
-    [[gnu::noinline]] void censusSplit() {
-        census.splitRegions=0;
-        if(!recording || inPass)return; // (callers end the pass first)
-        auto& slot=slots[slotIndex];
-        if(slot.timestamps)endChunkTimestamp();
-        const bool ended=vkEndCommandBuffer(cmd)==VK_SUCCESS;
-        bool submitted=false,done=false;
-        if(ended) {
-            VkSubmitInfo si{};si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;si.commandBufferCount=1;si.pCommandBuffers=&cmd;
-            vkResetFences(d.device,1,&fence); // (signalled: begin() waited it; submitCurrent resets it again before the final submission)
-            submitted=queueSubmit(si,fence)==VK_SUCCESS;
-#if !defined(RECOMP_CENSUS_SPLIT_MUTANT_NO_WAIT) // test mutant: the pool replaced without waiting for the submitted buffer
-            done=submitted && vkWaitForFences(d.device,1,&fence,VK_TRUE,10'000'000'000ull)==VK_SUCCESS;
-#else
-            done=submitted;
-#endif
-        }
-        VkCommandBuffer next=VK_NULL_HANDLE;
-        if(done) { // every command of this slot's pool has completed: replace the pool (censusReleasePools' steps for one slot)
-            const VkAllocationCallbacks* callbacks=wfSets[slotIndex].active?&wfSets[slotIndex].callbacks:nullptr; // (worker-fixed)
-            VkCommandPoolCreateInfo cp{};cp.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;cp.queueFamilyIndex=d.queueFamily;
-            VkCommandPool pool=VK_NULL_HANDLE;
-            if(vkCreateCommandPool(d.device,&cp,callbacks,&pool)==VK_SUCCESS) {
-                VkCommandBufferAllocateInfo cb{};cb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;cb.commandPool=pool;
-                cb.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;cb.commandBufferCount=1;
-                if(vkAllocateCommandBuffers(d.device,&cb,&next)==VK_SUCCESS) {
-                    vkDestroyCommandPool(d.device,slot.pool,callbacks); // (all its buffers completed: the fence above)
-                    slot.pool=pool;slot.cmd=next;slot.cmds.assign(1,next);slot.cmdUsed=0;commandPool=pool;
-                } else {next=VK_NULL_HANDLE;vkDestroyCommandPool(d.device,pool,callbacks);}
-            }
-            if(!next && vkResetCommandPool(d.device,slot.pool,VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)==VK_SUCCESS) { // no new pool
-                if(slot.cmds.empty())slot.cmds.push_back(slot.cmd);
-                slot.cmdUsed=0;next=slot.cmds[0];
-            }
-        }
-        if(!done)note("census-split-failed",!ended?"end":!submitted?"submit":"wait");
-        if(!next) { // (not expected) continue in another buffer of the same pool, as submitChunk does
-            if(slot.cmds.empty())slot.cmds.push_back(slot.cmd);
-            if(slot.cmdUsed+1<slot.cmds.size())next=slot.cmds[++slot.cmdUsed];
-            else {
-                VkCommandBufferAllocateInfo cb{};cb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;cb.commandPool=slot.pool;
-                cb.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;cb.commandBufferCount=1;
-                if(vkAllocateCommandBuffers(d.device,&cb,&next)!=VK_SUCCESS){++census.splitFailures;note("census-split-failed","allocate");recording=false;return;}
-                slot.cmds.push_back(next);slot.cmdUsed=unsigned(slot.cmds.size()-1);
-            }
-        }
-        if(!done)++census.splitFailures;else ++census.splits;
-        cmd=next;
-        VkCommandBufferBeginInfo b{};b.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if(vkBeginCommandBuffer(cmd,&b)!=VK_SUCCESS){++census.splitFailures;note("census-split-failed","begin");}
-#if !defined(RECOMP_CENSUS_SPLIT_MUTANT_KEEP_BOUND) // test mutant: the new buffer assumed to keep the old one's bindings
-        recorded={};
-#endif
-        chunkWork=0;++slot.chunks; // (as submitChunk: the new buffer binds its state again)
-        if(slot.timestamps && slot.chunks-1<MaxTimedChunks) { // (submitChunk's chunk timestamps)
-            if(!slot.chunkTimestamps && !slot.chunkTimestampsFailed) {
-                VkQueryPoolCreateInfo q{};q.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2*(MaxTimedChunks-1);
-                if(vkCreateQueryPool(d.device,&q,nullptr,&slot.chunkTimestamps)!=VK_SUCCESS){slot.chunkTimestamps=VK_NULL_HANDLE;slot.chunkTimestampsFailed=true;}
-            }
-            if(slot.chunkTimestamps) {
-                const unsigned k=slot.chunks-1;
-                vkCmdResetQueryPool(cmd,slot.chunkTimestamps,2*(k-1),2);
-                vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,slot.chunkTimestamps,2*(k-1));
-            }
-        }
-    }
 
     // v78: the queue this renderer submits to: the device's own (v71), or the one created for it alone (device.cpp,
     // diag-generic-own-queue at device creation). Only this renderer, under rendererMutex, uses that queue.
@@ -3885,20 +3781,51 @@ public:
     // thread to come by. files/private-trace/diag-generic-submit-proxy (read once) restores v111-v176's proxy.
     static bool submitProxy(){static const bool on=access(RECOMP_APP_PATH("/private-trace/diag-generic-submit-proxy"),F_OK)==0;return on;}
     std::uint64_t directWorkerSubmits=0;
+    VkResult timedQueueSubmit(const VkSubmitInfo& s,VkFence f) {
+        auto& slot=slots[slotIndex];
+        const renderwait::Identity id{slot.seFrame,word64(cmd),word64(f),slotIndex};
+        if(waitTimingEnabled && f!=VK_NULL_HANDLE)slot.waitTiming.submittedCommand=word64(cmd);
+        return VkResult(renderwait::submit(waitTimingEnabled,slot.waitTiming,id,recomp::gpu::sharedQueueMutex(),
+            [&]{return int(recomp::gpu::lockedQueueSubmit(queue,1,&s,f));},
+            [&]{return ::recomp::apple::iosGpuLifecycle().acquire(queue);},
+            [&]{if(!recomp::gpu::genericQueueSubmission)recomp::gpu::nativeSubmissionTickets().fetch_add(1,std::memory_order_acq_rel);},
+            [&]{return int((vkQueueSubmit)(queue,1,&s,f));},renderwait::now,int(VK_ERROR_DEVICE_LOST)));
+    }
     VkResult queueSubmit(const VkSubmitInfo& s,VkFence f) {
         if(asyncPipeline && async::Pipeline::onWorker() && !submitProxy())++directWorkerSubmits;
         else if(asyncPipeline && async::Pipeline::onWorker()) {
             VkResult r=VK_ERROR_INITIALIZATION_FAILED;++proxiedSubmits;
-            if(!asyncPipeline->runOnWaiter([&]{recomp::gpu::GenericSubmissionScope generic;r=recomp::gpu::lockedQueueSubmit(queue,1,&s,f);}))note("async-submit-proxy","refused");
+            if(!asyncPipeline->runOnWaiter([&]{recomp::gpu::GenericSubmissionScope generic;r=timedQueueSubmit(s,f);}))note("async-submit-proxy","refused");
             return r;
         }
         recomp::gpu::GenericSubmissionScope generic; // v170: not a native ticket
-        return recomp::gpu::lockedQueueSubmit(queue,1,&s,f);
+        return timedQueueSubmit(s,f);
     }
     explicit Renderer(ProbeDevice& device):d(device){
         const auto own=probeDedicatedQueue(device.device);
         queue=own?own:device.queue;
         GLOG("RENDER_GENERIC_QUEUE own=%u",unsigned(own!=VK_NULL_HANDLE));
+    }
+    bool retireAsyncSources() {
+        auto box=iosAsyncSources.mailbox();if(!box)return true;
+        box->close();iosAsyncProduced.reset();
+        return iosAsyncSources.retire([&]{
+            {std::lock_guard queueLock(recomp::gpu::sharedQueueMutex());
+             if(vkDeviceWaitIdle(d.device)!=VK_SUCCESS)return false;}
+            // The background helper can itself reset these pools. Wait for every
+            // already queued reset job before doing the terminal recorder reset.
+            {auto& pr=poolResetter;std::unique_lock lock(pr.m);
+             if(!pr.cv.wait_for(lock,std::chrono::seconds(12),[&]{
+                 for(auto state:pr.state)if(state==PoolResetter::Queued)return false;return true;}))return false;}
+            // Idle alone does not dispose of recorded-but-unsubmitted references.
+            // Reset both active and spare pools, including a currently recording pool.
+            std::set<VkCommandPool> pools;
+            for(auto& slot:slots)if(slot.pool)pools.insert(slot.pool);
+            for(auto& spare:wfSets)if(spare.pool)pools.insert(spare.pool);
+            for(auto pool:pools)if(vkResetCommandPool(d.device,pool,0)!=VK_SUCCESS)return false;
+            recording=false;
+            return true;
+        },[&](Image& image){destroyImageNow(image);});
     }
     void note(const char* what,const char* detail="") {
         const auto key=std::string(what)+"/"+detail;
@@ -3956,17 +3883,13 @@ public:
         VkBufferCreateInfo b{};b.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;b.size=size;b.usage=usage;
         if(vkCreateBuffer(d.device,&b,nullptr,&out.buffer)!=VK_SUCCESS)return false;
         VkMemoryRequirements r{};vkGetBufferMemoryRequirements(d.device,out.buffer,&r);
-        // v545: a failure after the buffer exists releases what was made (before: the buffer, and after a bind or map
-        // failure its memory, were dropped by callers that reset out, e.g. the census, and never freed).
-        const auto fail=[&]{out.mapped=nullptr;destroyBuffer(out);return false;};
         const auto type=memoryType(r.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if(!type)return fail();
+        if(!type)return false;
         VkMemoryAllocateInfo a{};a.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;a.allocationSize=r.size;a.memoryTypeIndex=*type;
-        if(!allocateMemory(a,out.memory,true,"buffer"))return fail();
+        if(!allocateMemory(a,out.memory,true,"buffer"))return false;
         out.bytes=r.size;
-        out.mapped=nullptr;
         if(vkBindBufferMemory(d.device,out.buffer,out.memory,0)!=VK_SUCCESS ||
-           vkMapMemory(d.device,out.memory,0,size,0,&out.mapped)!=VK_SUCCESS)return fail();
+           vkMapMemory(d.device,out.memory,0,size,0,&out.mapped)!=VK_SUCCESS)return false;
         out.size=size;return true;
     }
     void destroyBuffer(Buffer& b) {
@@ -4016,7 +3939,13 @@ public:
         v.format=format;v.components=swizzle;v.subresourceRange={aspect==(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT)?
             VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT):aspect,0,mips,0,layers};
         if(!makeView(v,out.view))return failedImage(out);
-        out.format=format;out.width=w;out.height=h;out.layers=layers;out.aspect=aspect;out.cube=cube;out.array=array;out.levels=mips;return true;
+        out.format=format;out.width=w;out.height=h;out.layers=layers;out.aspect=aspect;out.cube=cube;out.array=array;out.levels=mips;
+#if defined(__APPLE__)
+        { static const bool audit=std::getenv("RECOMP_IOS_MTL_AUDIT")!=nullptr; // ios-mtl-audit (measurement only; Main.mm)
+          if(audit && recomp_ios_mtl_audit)recomp_ios_mtl_audit((void*)out.image,
+              (usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)?"rt":(usage&VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)?"ds":"tex",unsigned(format),unsigned(usage)); }
+#endif
+        return true;
     }
     // v96: a creation failed part way: its objects never reached a command buffer, so they go now (v71
     // left them to the caller, which dropped the handles). Returns false for the caller.
@@ -4127,10 +4056,12 @@ public:
         if(!s.pending){wfSwap(k);return true;} // (worker-fixed: the idle slot may change its command pools)
         const auto t0=Clock::now();
         recomp::diag::timeline::mark(recomp::diag::timeline::GpuWaitBegin,2); // v159: slot fence
-        const auto result=vkWaitForFences(d.device,1,&s.fence,VK_TRUE,10'000'000'000ull);
+        const auto result=[&]{renderwait::Span timing(waitTimingEnabled,s.waitTiming,{s.seFrame,s.waitTiming.submittedCommand,word64(s.fence),k},renderwait::FenceWait);
+            return vkWaitForFences(d.device,1,&s.fence,VK_TRUE,10'000'000'000ull);}();
         recomp::diag::timeline::mark(recomp::diag::timeline::GpuWaitEnd,2);
         {const auto w=nsSince(t0);perf.waitNs+=w;slowWaitNs+=w;} // v134
-        if(result!=VK_SUCCESS)return false;
+        if(result!=VK_SUCCESS){rendererfailure::notify("renderer-wait-slot",int(result),counters.presents);return false;}
+        renderwait::Span postFence(waitTimingEnabled,s.waitTiming,{s.seFrame,s.waitTiming.submittedCommand,word64(s.fence),k},renderwait::PostFence);
         s.pending=false;wfSwap(k); // (worker-fixed)
         if(s.timed) {
             // v78: the GPU time of every timed command buffer of the frame (v71: one start/end pair); the gaps
@@ -4178,12 +4109,26 @@ public:
                 if(v338PassDump) // v338 (diagnostic, diag-v338-pass-dump): every pass of the profiled frame, in order
                     for(unsigned i=0;i<s.passCount;++i) {
                         const auto& pi=s.passInfo[i];
-                        GLOG("RENDER_DIAG_V338_PASS f=%llu i=%u us=%.0f gap=%.0f w=%u h=%u fmt=%d,%d,%d,%d,%d d=%u c=%u r=%u end=%d same=%u dep=%u dw=%u vs=%016llx ps=%016llx",
+                        GLOG("RENDER_DIAG_V338_PASS f=%llu i=%u us=%.0f gap=%.0f w=%u h=%u fmt=%d,%d,%d,%d,%d d=%u c=%u r=%u end=%d same=%u dep=%u dw=%u vs=%016llx ps=%016llx bases=%x,%x,%x,%x,%x views=%x,%x,%x,%x,%x",
                              (unsigned long long)frame,i,us(t[2*i],t[2*i+1]),i?us(t[2*i-1],t[2*i]):0.0,pi.w,pi.h,pi.formats[0],pi.formats[1],pi.formats[2],pi.formats[3],pi.formats[4],
                              pi.draws,pi.clears,pi.rects,pi.endLine,unsigned(pi.sameAsPrevious),unsigned(pi.depth),unsigned(pi.depthWritten),
-                             (unsigned long long)pi.lastVs,(unsigned long long)pi.lastPs);
+                             (unsigned long long)pi.lastVs,(unsigned long long)pi.lastPs,pi.bases[0],pi.bases[1],pi.bases[2],pi.bases[3],pi.bases[4],
+                             pi.views[0],pi.views[1],pi.views[2],pi.views[3],pi.views[4]);
                     }
                 gcProfileReport(k,(unsigned long long)frame,s.passCount,t.data(),timestampMask,timestampPeriod,v338PassDump); // gpu-cost (diag-gc-profile)
+                if(resolveIdentityEnabled) {
+                    const auto& ledger=s.resolveIdentity;
+                    GLOG("RENDER_DIAG_RESOLVE_IDS report_frame=%llu recording_frame=%llu slot=%u records=%u overflow=%llu abandoned_total=%llu late_total=%llu capacity=128",
+                        (unsigned long long)frame,(unsigned long long)ledger.recording.frame,ledger.recording.slot,ledger.used,
+                        (unsigned long long)ledger.overflow,(unsigned long long)ledger.abandoned,(unsigned long long)ledger.late);
+                    for(unsigned n=0;n<ledger.used;++n) {const auto& e=ledger.events[n];
+                        GLOG("RENDER_DIAG_RESOLVE_ID report_frame=%llu n=%u gap=%u slot=%u end_slot=%u recording_frame=%llu end_frame=%llu cmd=%llx end_cmd=%llx chunk=%u end_chunk=%u source=%llx destination=%llx sfmt=%d dfmt=%d src=%ux%u dst=%ux%u sx=%d sy=%d dx=%d dy=%d cw=%u ch=%u mip=%u slice=%u mode=%u exponent=%d branch=%u complete=%u clock_valid=%u join_valid=%u post_endpass_cpu_ns=%llu",
+                            (unsigned long long)frame,n,e.gap,e.begin.slot,e.end.slot,(unsigned long long)e.begin.frame,(unsigned long long)e.end.frame,
+                            (unsigned long long)e.begin.command,(unsigned long long)e.end.command,e.begin.chunk,e.end.chunk,
+                            (unsigned long long)e.source,(unsigned long long)e.destination,e.srcFormat,e.dstFormat,e.srcW,e.srcH,e.dstW,e.dstH,
+                            e.sx,e.sy,e.dx,e.dy,e.cw,e.ch,e.mip,e.slice,e.mode,e.exponent,e.branch,unsigned(e.complete),unsigned(e.clockValid),unsigned(resolve_identity::gapJoined(e,s.passCount)),(unsigned long long)e.ns);
+                    }
+                }
                 std::sort(order.begin(),order.end(),[](const auto& a,const auto& b){return a.first>b.first;});
                 for(unsigned r=0;r<order.size() && r<16;++r) {
                     const auto& pi=s.passInfo[order[r].second];
@@ -4197,8 +4142,8 @@ public:
         for(auto& g:s.garbage)g();s.garbage.clear();
         ocqSlotDone(k); // occlusion package (out of line): the slot's counted draws' sample counts
         takeWritebacks(s); // v75
-        ffSlotDone(k); // v579: the sun pass probe's texels
         if(s.readbackPending) {
+            renderwait::Span readback(waitTimingEnabled,s.waitTiming,{s.seFrame,s.waitTiming.submittedCommand,word64(s.fence),k},renderwait::Readback);
             const auto t1=Clock::now();
             if(!s.readbackCoherent) {
                 VkMappedMemoryRange range{};range.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;range.memory=s.readback.memory;range.size=VK_WHOLE_SIZE;
@@ -4213,7 +4158,7 @@ public:
                 opaqueRgbaInto(frame,static_cast<const std::uint8_t*>(s.readback.mapped),s.readbackBytes);
                 ready=std::move(frame);
             }
-            s.readbackPending=false;perf.readbackNs+=nsSince(t1);
+            s.readbackPending=false;perf.readbackNs+=nsSince(t1);if(waitTimingEnabled)waitCompletedReadback=renderwait::Identity{s.seFrame,s.waitTiming.submittedCommand,word64(s.fence),k};
         }
         if(s.midPending) { // v158: the interpolated frame of the same present, converted the same way
             if(!s.midCoherent) {
@@ -4235,17 +4180,19 @@ public:
         if(asyncPoolResetEnabled() && takePoolReset(k)){slots[k].preReset=false;++perf.asyncResets;} // v204: reset by the helper
         else if(slots[k].preReset)slots[k].preReset=false; // v123: reset after its fence by prepareNextSlot (nothing recorded since)
         else if(vkResetCommandPool(d.device,commandPool,0)!=VK_SUCCESS)return false;
-        {auto& slot=slots[slotIndex];slot.cmdUsed=0;slot.chunks=1;slot.timedChunks=0;cmd=slot.cmd;slot.seFrame=frame;} // v78: chunk 0 is the slot's first buffer (submit-early: its frame number)
+        {auto& slot=slots[slotIndex];slot.cmdUsed=0;slot.chunks=1;slot.timedChunks=0;cmd=slot.cmd;slot.seFrame=frame;if(waitTimingEnabled)slot.waitTiming.reset({frame,word64(cmd),word64(slot.fence),slotIndex});} // v78: chunk 0 is the slot's first buffer (submit-early: its frame number)
         VkCommandBufferBeginInfo b{};b.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if(vkBeginCommandBuffer(cmd,&b)!=VK_SUCCESS)return false;
         recording=true;ringOffset=0;recorded={};writtenSince.clear();readSince.clear();chunkWork=0;++ringEpoch; // (v123)
 #if !defined(RECOMP_V382_MUTANT_EPOCH) // test mutant: a gather output of an earlier frame (its ring bytes reallocated) kept
         v382Prev.valid=false;v382Prev.why=0; // v382: a new ring epoch (the kept output's ring bytes are gone)
 #endif
-        if(auto q=slots[slotIndex].timestamps){vkCmdResetQueryPool(cmd,q,0,2);vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,q,0);}
+        tsThisFrame=!iosNoGpuTs && (iosGpuTsAll || (frame&15)==0); // ios-gpu-ts: GPU timestamps on 1 frame in 16 (ADOPTED c133/c134)
+        if(auto q=slots[slotIndex].timestamps;q && tsThisFrame){vkCmdResetQueryPool(cmd,q,0,2);vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,q,0);} // (ios-no-gpu-ts)
         ocqSlotBegin(); // occlusion package (out of line): the slot's occlusion pool reset, outside any pass
         { // v287: the pass profile of one frame in 600 (reset here, outside any pass, for every chunk of the frame)
             auto& s=slots[slotIndex];s.passProfiled=false;s.passCount=0;s.passInfo.clear();passProfileOpen=false;
+            if(resolveIdentityEnabled)s.resolveIdentity.reset({s.seFrame,word64(cmd),slotIndex,s.chunks-1});
             if(gpuPassProfile && !(++passProfileFrames%(v338PassDump?120u:600u))) { // (v339: one frame in 120 while dumping)
                 if(!s.passTimestamps && !s.passPoolFailed) {
                     VkQueryPoolCreateInfo qc{};qc.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;qc.queryType=VK_QUERY_TYPE_TIMESTAMP;qc.queryCount=2*MaxProfiledPasses;
@@ -4277,7 +4224,7 @@ public:
     }
     gpucost::Counters gcCounters() const noexcept {return gpucost::now(perf.barriers,perf.chunkSubmits,counters.resolves,v376Stats.resolves,
         v382Stats.dispatched,v74.texNew+v74.texChanged,counters.clears);} // gpu-cost (diag-gc-profile)
-    void endPass(int line=0){if(inPass){const auto endedKey=passKey;vkCmdEndRenderPass(cmd);inPass=false;passKey=0;afterWrite();lastEndedPassKey=endedKey;
+    void endPass(int line=0){if(inPass){const auto endedKey=passKey;vkCmdEndRenderPass(cmd);inPass=false;passAreaLimited=false;passKey=0;afterWrite();lastEndedPassKey=endedKey;
         if(passTargets[4]){auto& w=depthWroteLast[passViews];w=passDepthNone?(w||passDepthWrote):passDepthWrote;}passDepthNone=false; // v293
         seEndPass(); // submit-early (out of line, unconditional: this CFG unchanged)
         if(auto& s=slots[slotIndex];s.passProfiled && passProfileOpen) { // v287
@@ -4290,6 +4237,40 @@ public:
     // v287 (diagnostic) state: the switch, the frame counter, the open pass's counters at its begin.
     static constexpr unsigned MaxProfiledPasses=1024;
     bool v338PassDump=false; // v338 (diagnostic)
+    const iospassdiag::Policy passProfilingPolicy=iospassdiag::parse(std::getenv("RECOMP_IOS_PASS_PROFILING"));
+    const fan_indices_candidate::StartupPolicy smallFanPolicy=[] {
+        const auto* value=std::getenv("RECOMP_IOS_FAN_TRIANGLES");
+        // (Claude, 2026-10-20) default ON: the exact small-fan expansion (fan_indices.hpp; Codex's M4 MoltenVK equivalence test,
+        // 744 cases byte-identical) saves 6.9 ms of GPU per frame on matched driving positions (c272 vs c253): MoltenVK otherwise
+        // converts every fan on the GPU with an encoder break. RECOMP_IOS_FAN_TRIANGLES=0 restores the old path.
+        const auto p=fan_indices_candidate::parseStartupPolicy(value?value:"1");
+        if(p==fan_indices_candidate::StartupPolicy::Invalid)throw std::invalid_argument("RECOMP_IOS_FAN_TRIANGLES must be 0 or 1");
+        return p;
+    }();
+    std::uint64_t smallFanCandidates=0,smallFanExpanded=0,smallFanCapacityFallbacks=0;
+    std::vector<std::uint32_t> fanScratch; // (ios-fan-indexed)
+    const fan_large_candidate::Policy largeFanPolicy=[] {
+        const auto* value=std::getenv("RECOMP_IOS_LARGE_FAN_TRIANGLES");
+        const auto p=fan_large_candidate::parsePolicy(value?value:"1");
+        if(p==fan_large_candidate::Policy::Invalid)throw std::invalid_argument("RECOMP_IOS_LARGE_FAN_TRIANGLES must be 0 or 1");
+        return p;
+    }();
+    const std::uint32_t largeFanLimit=[] {
+        const char* largeMax=std::getenv("RECOMP_IOS_LARGE_FAN_MAX"); // (Claude 2026-10-20: default 192, the fan-list prewarm covers it; c275)
+        const auto limit=fan_large_candidate::parseLimit(largeMax?largeMax:"192");
+        if(!limit)throw std::invalid_argument("RECOMP_IOS_LARGE_FAN_MAX must be 96 or 192");
+        return limit;
+    }();
+    const convert_view_reuse::Policy convertViewPolicy=[] {
+        const auto p=convert_view_reuse::parsePolicy(std::getenv("RECOMP_IOS_CONVERT_VIEW_REUSE"));
+        if(p==convert_view_reuse::Policy::Invalid)throw std::invalid_argument("RECOMP_IOS_CONVERT_VIEW_REUSE must be 0 or 1");
+        return p;
+    }();
+    convert_view_reuse::Counters convertViewStats;
+    fan_large_candidate::Census fanCensus;
+    std::uint64_t largeFanExpanded=0,largeFanCapacityFallbacks=0;
+    const bool resolveIdentityEnabled=resolve_identity::parse(std::getenv("RECOMP_IOS_RESOLVE_IDENTITY"));
+    const bool waitTimingEnabled=renderwait::requested();renderwait::Reporter waitReporter;std::optional<renderwait::Identity> waitCompletedReadback;
     bool gpuPassProfile=false,passProfileOpen=false;std::uint64_t passProfileFrames=0,passBeginDraws=0,passBeginClears=0;
     bool colorLoadDontCare=false; // v289 (diagnostic measurement: diag-v289-load-dontcare)
     std::uint64_t lastEndedPassKey=0; // v288 (diagnostic): the framebuffer key of the last ended pass
@@ -4305,10 +4286,12 @@ public:
         endPass(__LINE__);
         if(targetedBarriers && (!writtenSince.empty() || !readSince.empty()))barrier(); // frames overlap on the GPU
         if(slots[slotIndex].timestamps)slots[slotIndex].timed=endChunkTimestamp(); // v78: the last chunk's end
-        if(vkEndCommandBuffer(cmd)!=VK_SUCCESS)return false;
+        const VkResult endResult=vkEndCommandBuffer(cmd);
+        if(endResult!=VK_SUCCESS){rendererfailure::notify("renderer-end-current",int(endResult),counters.presents);return false;}
         VkSubmitInfo s{};s.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;s.commandBufferCount=1;s.pCommandBuffers=&cmd;
         vkResetFences(d.device,1,&fence);
-        if(queueSubmit(s,fence)!=VK_SUCCESS)return false; // v111: through the submit proxy on the renderer thread
+        const VkResult submitResult=queueSubmit(s,fence); // wrapper returned; queue/lifecycle RAII released
+        if(submitResult!=VK_SUCCESS){rendererfailure::notify("renderer-submit-current",int(submitResult),counters.presents);return false;}
         seTraceSubmit(se::Final,slots[slotIndex].chunks-1); // submit-early (armed trace; out of line)
         auto& slot=slots[slotIndex];slot.pending=true;
         if(asyncPoolResetEnabled())queuePoolReset(slotIndex); // v204
@@ -4320,6 +4303,7 @@ public:
     // v78: the end timestamp of the current chunk (chunk 0: v71's query 1). True when the frame has timed chunks.
     bool endChunkTimestamp() {
         auto& slot=slots[slotIndex];const unsigned k=slot.chunks-1;
+        if(!tsThisFrame)return false; // ios-gpu-ts (sampled frames only)
         if(k==0)vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,slot.timestamps,1);
         else if(k<MaxTimedChunks && slot.chunkTimestamps)vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,slot.chunkTimestamps,2*(k-1)+1);
         else {++perf.untimedChunks;return slot.timedChunks>0;}
@@ -4329,13 +4313,7 @@ public:
     // the frame's fenced last buffer, so waitSlot's fence still covers it), then continues the frame in a new buffer
     // of the same slot: same ring, descriptor pool, frame sets and garbage (all released by that fence). Hazard lists
     // carry over (a barrier in a later buffer orders every earlier command in submission order); bound state does not.
-    // v560 (driving goal, 2026-10-21; MEASUREMENT ONLY, ported from v130's diag-generic-gpu-burden): files/private-trace/
-    // diag-gpu-burden holds N (empty = 2, at most 16): v561: N copies of an 8 MB scratch buffer (v560: clears) recorded
-    // after the chunk's last pass, before each chunk submission. The image is ours and never sampled: the picture is
-    // unchanged. Question: does the DRIVING frame follow GPU time (frame vs the measured gpu_ms rise)?
-    // v561: the burden is N copies of an 8 MB scratch buffer into a second one (the clears of v560 cost the Adreno almost
-    // nothing: gpu_ms +0.63 for 2 clears per chunk, gb1). Both buffers are ours and never read: the picture is unchanged.
-    Buffer gpuBurdenSrc,gpuBurdenDst;
+    Buffer gpuBurdenSrc,gpuBurdenDst; // ios-gpu-burden (measurement only)
     void gpuBurden() {
         const unsigned gpuBurdenCount=v560BurdenCount.load(std::memory_order_relaxed);
         if(!gpuBurdenCount || !recording)return;
@@ -4360,12 +4338,16 @@ public:
             slot.cmds.push_back(next);
         }
         endPass(__LINE__);
-        gpuBurden(); // v560 (measurement only): extra GPU work before this chunk is submitted
+        gpuBurden(); // ios-gpu-burden (measurement only): extra GPU work before this chunk is submitted
         if(slot.timestamps)endChunkTimestamp();
-        const bool ended=vkEndCommandBuffer(cmd)==VK_SUCCESS;
+        const VkResult endResult=vkEndCommandBuffer(cmd);const bool ended=endResult==VK_SUCCESS;
         VkSubmitInfo si{};si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;si.commandBufferCount=1;si.pCommandBuffers=&cmd;
         // (never observed) a failure loses the commands recorded since the last submission; chunking then stays off.
-        if(!ended || queueSubmit(si,VK_NULL_HANDLE)!=VK_SUCCESS){note("chunk-submit-failed",ended?"submit":"end");chunkSubmit=false;} // (v111: proxied)
+        const VkResult submitResult=ended?queueSubmit(si,VK_NULL_HANDLE):VK_SUCCESS; // no submit after end failure
+        if(!ended || submitResult!=VK_SUCCESS){
+            rendererfailure::notify(ended?"renderer-submit-chunk":"renderer-end-chunk",int(ended?submitResult:endResult),counters.presents);
+            note("chunk-submit-failed",ended?"submit":"end");chunkSubmit=false;
+        } // original failure continuation retained; capture never retries the operation
         seTraceSubmit(seReason,slot.chunks-1); // submit-early (armed trace; out of line)
         cmd=slot.cmds[++slot.cmdUsed];
         VkCommandBufferBeginInfo b{};b.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -4375,7 +4357,7 @@ public:
 #else
         recorded={};chunkWork=0;++slot.chunks;++perf.chunkSubmits;
 #endif
-        if(slot.timestamps && slot.chunks-1<MaxTimedChunks) {
+        if(slot.timestamps && tsThisFrame && slot.chunks-1<MaxTimedChunks) { // (ios-gpu-ts)
             if(!slot.chunkTimestamps && !slot.chunkTimestampsFailed) {
                 VkQueryPoolCreateInfo q{};q.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2*(MaxTimedChunks-1);
                 if(vkCreateQueryPool(d.device,&q,nullptr,&slot.chunkTimestamps)!=VK_SUCCESS){slot.chunkTimestamps=VK_NULL_HANDLE;slot.chunkTimestampsFailed=true;}
@@ -4395,7 +4377,6 @@ public:
     // heaviest pass of the frame first submits what is pending (>= se::MinPending items), so that work runs on the GPU while
     // the heaviest pass is recorded. Same commands and order; the new command buffer re-binds its state, as v337's chunks.
     [[gnu::noinline]] void seBeforePass(std::uint64_t views) {
-        if(census.active && censusSplitDue())censusSplit(); // census-split (v607): between passes (endPass done), census frames only
         seOpenViews=views;seOpenDraws=perf.draws;
 #if defined(RECOMP_SE_TEST_EVERY_PASS) // host harness stress: every pass begin is taken as the predicted one (the most split points)
         if(!(seMode&se::ModeBig))return;
@@ -4421,8 +4402,9 @@ public:
 #elif defined(RECOMP_SE_TEST_TOGGLE) // host harness: on for the windows ending at presents 120 and 180 (switched at 60 and 120)
         return counters.presents>=60 && counters.presents<180?unsigned(RECOMP_SE_TEST_TOGGLE):0u;
 #else
-        return (access(RECOMP_APP_PATH("/private-trace/diag-se-big"),F_OK)==0?se::ModeBig:0u)|
-               (access(RECOMP_APP_PATH("/private-trace/diag-se-idle"),F_OK)==0?se::ModeIdle:0u);
+        const unsigned fileBits=(access(RECOMP_APP_PATH("/private-trace/diag-se-big"),F_OK)==0?se::ModeBig:0u)|
+                                (access(RECOMP_APP_PATH("/private-trace/diag-se-idle"),F_OK)==0?se::ModeIdle:0u);
+        return iossebig::apply(seBigPolicy,fileBits,se::ModeBig);
 #endif
     }
     [[gnu::noinline]] void seTraceSubmit(unsigned reason,unsigned chunk) noexcept {
@@ -4585,7 +4567,7 @@ public:
         if(const vfi::ShaderRule* const rule=vfi::find(vs.hash)) {
             // v570: a cloth rule describes the override's three POSITION1 inputs (one binding each); without the override applied
             // (diag-generic-no-cloth-fix, or the entry did not match) the draw stays exactly as v569 made it
-            if(isClothKey(vs.hash) && !clothSolo.count(vs.hash)){clothRefused(*rule,vs,in,"no-solo",lo,count);return;} // (v617: logged)
+            if(isClothKey(vs.hash) && !clothSolo.count(vs.hash))return;
             if(!ptxFix && isPtxKey(vs.hash))return; // v598: without the override the particle draw stays v596's
             vfiApply(*rule,vs,in,data,lo,count);
         }
@@ -4594,37 +4576,11 @@ public:
         auto& R=vfiR;++R.seen;
         if(const std::size_t k=std::size_t(&rule-vfi::Rules);k<R.seenBy.size())++R.seenBy[k];
         if(!R.polled){R.polled=true;R.file=vfiSwitchFile();R.on=!R.file;}
-        if(!R.on){++R.off;if(isClothKey(vs.hash))clothRefused(rule,vs,in,"off",lo,count);return;}
+        if(!R.on){++R.off;return;}
         try {
-            if(const char* w=vfiPlan(rule,vs,in,data,lo,count)){R.refuse(w);if(isClothKey(vs.hash))clothRefused(rule,vs,in,w,lo,count);}
-        } catch(...) {R.refuse("exception");if(isClothKey(vs.hash))clothRefused(rule,vs,in,"exception",lo,count);}
+            if(const char* w=vfiPlan(rule,vs,in,data,lo,count))R.refuse(w);
+        } catch(...) {R.refuse("exception");}
     }
-    // v617 (thor-fixer2, G14 DIAGNOSTIC): a cloth draw the vfetch-index layout was NOT applied to (its cloth vertices then read POSITION1
-    // at their own index: v569's torn cloth). RENDER_CLOTH_REFUSED: the first 8 per 60-present window (vs, reason, lo, count); for the
-    // first refusal of each (vs, reason) also every rule vfetch's bound (effective) and container (identity) instruction words.
-    [[gnu::noinline]] void clothRefused(const vfi::ShaderRule& rule,const PackEntry& vs,const DrawInput& in,const char* why,unsigned lo,unsigned count) noexcept {
-        try {
-            ++clothW.refused;
-            const bool first=clothRefusedSeen.insert(vs.hash^std::hash<std::string>{}(why?why:"?")).second;
-            if(clothW.refusedLines<8 || first) {
-                ++clothW.refusedLines;
-                GLOG("RENDER_CLOTH_REFUSED p=%llu vs=%016llx why=%s lo=%u count=%u census=%u effective=%u",(unsigned long long)presentCount,
-                     (unsigned long long)vs.hash,why?why:"?",lo,count,unsigned(census.active),unsigned(in.vertexEffective!=nullptr));
-                if(census.active)clog("RENDER_CENSUS CWX i=%u vs=%016llx why=%s",census.seq?census.seq-1:0,(unsigned long long)vs.hash,why?why:"?");
-            }
-            if(!first)return;
-            const auto* eff=in.vertexEffective?in.vertexEffective:in.vertexIdentity;const auto* id=in.vertexIdentity;
-            std::string line;
-            for(unsigned j=0;j<rule.count;++j) {
-                const std::size_t at=std::size_t{rule.fetch[j].address}*12;char x[120];
-                const auto w=[&](const std::vector<std::uint8_t>* c,unsigned k)->unsigned{return c && at+12<=c->size()?unsigned(be32(c->data()+at+4*k)):0u;};
-                std::snprintf(x,sizeof x," @%u=%08x.%08x.%08x/%08x.%08x.%08x",unsigned(rule.fetch[j].address),w(eff,0),w(eff,1),w(eff,2),w(id,0),w(id,1),w(id,2));
-                line+=x;
-            }
-            GLOG("RENDER_CLOTH_REFUSED_FETCHES vs=%016llx why=%s bound/container:%s",(unsigned long long)vs.hash,why?why:"?",line.c_str());
-        } catch(...) {}
-    }
-    std::unordered_set<std::uint64_t> clothRefusedSeen; // v617 (G14 diagnostic)
     // nullptr: applied; else why not (nothing of the draw changed).
     const char* vfiPlan(const vfi::ShaderRule& rule,const PackEntry& vs,const DrawInput& in,const Reader& data,unsigned lo,unsigned count) {
         auto& R=vfiR;
@@ -4777,94 +4733,7 @@ public:
         }
         ++R.repaired;R.vertices+=count;R.streams+=replaced;R.split+=composedStreams;R.outside+=outside;
         if(in.vertexConstants && !vfi::literalsHold(rule,*in.vertexConstants))++R.literalDiffers;
-        if(isClothKey(vs.hash))clothWatchDraw(rule,vs,code,attrs,attrOf,groups.data(),groupCount,streams.data(),bytesAt,lo,count); // v606 (G14 diagnostic)
         return nullptr;
-    }
-    // v606 (G14 diagnostic, see ClothWatch): the cloth draw's simulated stream as read now, and its cloth vertices' records.
-    template<class Attrs,class Group,class Stream,class BytesAt>
-    [[gnu::noinline]] void clothWatchDraw(const vfi::ShaderRule& rule,const PackEntry& vs,const std::vector<std::uint8_t>& code,const Attrs& attrs,
-                                          const std::array<unsigned,12>& attrOf,const Group* groups,unsigned groupCount,const Stream* streams,
-                                          const BytesAt& bytesAt,unsigned lo,unsigned count) noexcept {
-        try {
-            auto& W=clothW;auto& R=vfiR;
-            unsigned pg=~0u;for(unsigned g=0;g<groupCount;++g)if(rule.fetch[groups[g].fetch].form==vfi::Form::Remap){pg=g;break;}
-            if(pg==~0u){++W.skipped;W.skipWhy="no-remap-group";return;}
-            const auto& G=groups[pg];const auto& st=streams[G.binding];
-            if(st.stride!=16 || !st.size || st.size>(64u<<10)){++W.skipped;W.skipWhy="stream-shape";return;}
-            const std::uint8_t* pos=nullptr;if(bytesAt(G.binding,{0,st.size},pos) || !pos){++W.skipped;W.skipWhy="stream-bytes";return;}
-            const auto& r0=rule.fetch[G.fetch];if(r0.via>=rule.count || attrOf[r0.via]==~0u){++W.skipped;W.skipWhy="via";return;}
-            const auto& va=attrs[attrOf[r0.via]];const auto& vst=streams[va.binding];
-            if(R.viaTaken.reach.first>lo || R.viaTaken.reach.end<lo+count){++W.skipped;W.skipWhy="via-reach";return;}
-            vfi::Via v;v.stream.data=R.viaTaken.bytes.data();v.stream.size=R.viaTaken.bytes.size();v.stream.stride=vst.stride;v.first=R.viaTaken.reach.first;
-            v.endian=vst.fetchEndian;v.offset=va.offset;v.fetch=va.fetch;v.fetch.feed=0x688;v.fetch.bgra=false;v.scale=1.0f;
-            const unsigned dsw=vfi::boundFetchOf(rule,code,r0.via).dstSwizzle;
-            const unsigned records=unsigned(st.size/16);
-            unsigned zeroRec=0,nan=0;float maxAbs=0;std::array<std::uint64_t,4> zbits{};
-            for(unsigned r=0;r<records;++r) {
-                const std::uint8_t* b=pos+std::size_t{r}*16;bool z=true;for(unsigned i=0;i<16;++i)z&=b[i]==0;
-                if(z){++zeroRec;if(r<256)zbits[r>>6]|=std::uint64_t{1}<<(r&63);continue;}
-                std::array<std::uint8_t,16> h{};swapCopy(h.data(),b,16,16,st.fetchEndian);
-                for(unsigned c=0;c<3;++c){float f;std::memcpy(&f,h.data()+4*c,4);if(!std::isfinite(f))++nan;else maxAbs=std::max(maxAbs,std::fabs(f));}
-            }
-            const auto comp=[&](std::uint32_t record,unsigned k){v.selector=swizzleSelector(dsw,k);return vfi::viaValue(v,record);};
-            unsigned cloth=0,outside=0,selZero=0,maxIndex=0;std::array<std::uint64_t,4> sel{};
-            for(unsigned j=0;j<count;++j) {
-                const std::uint32_t rec=lo+j;
-                const float flag=comp(rec,0)*vfi::bitsFloat(0x437f0080u);
-                if(!(flag>254.0f))continue;
-                ++cloth;
-                for(unsigned f=0;f<rule.count;++f) {
-                    const auto& rf=rule.fetch[f];if(rf.form!=vfi::Form::Remap)continue;
-                    const std::uint32_t idx=vfi::fetchIndex(comp(rec,rf.viaComponent)*vfi::bitsFloat(rf.kBits));
-                    if(idx==vfi::NoRecord || idx>=records){++outside;continue;}
-                    maxIndex=std::max(maxIndex,unsigned(idx));
-                    if(idx<256 && ((zbits[idx>>6]>>(idx&63))&1)){++selZero;sel[idx>>6]|=std::uint64_t{1}<<(idx&63);}
-                }
-            }
-            const bool bad=selZero || outside || nan;
-            ++W.draws;W.clothVertices+=cloth;W.badDraws+=bad;W.selZero+=selZero;W.outside+=outside;W.nanDraws+=nan!=0;
-            if((bad || W.draws<=2) && W.lines<16){++W.lines;
-                GLOG("RENDER_CLOTH_WATCH p=%llu vs=%016llx lo=%u count=%u addr=%08x records=%u zero_records=%u nan=%u maxabs=%.3g cloth=%u max_index=%u outside=%u sel_zero=%u census=%u",
-                     (unsigned long long)presentCount,(unsigned long long)vs.hash,lo,count,st.address,records,zeroRec,nan,double(maxAbs),cloth,maxIndex,outside,selZero,
-                     unsigned(census.active));}
-            // v610 (G14 DIAGNOSTIC, census frames only): the inputs of the cloth-path positions, for an offline rebuild with the
-            // census's vertex constants (VCA: clothParentMatrix c208-c210, gWorld, gWorldViewProj). CWR: the simulated records as
-            // floats (after the fetch's endian swap), four per line; CWV: each cloth vertex's three record indices (the rule's Remap
-            // fetches in address order) and its BLENDWEIGHT as the module receives it (bound swizzle applied), four vertices per line.
-            if(census.active) {
-                const unsigned ci=census.seq?census.seq-1:0;
-                clog("RENDER_CENSUS CW i=%u vs=%016llx lo=%u count=%u addr=%08x records=%u endian=%u cloth=%u",ci,(unsigned long long)vs.hash,lo,count,
-                     st.address,records,st.fetchEndian,cloth);
-                std::string line;unsigned n=0;
-                for(unsigned r=0;r<records;++r) {
-                    std::array<std::uint8_t,16> h{};swapCopy(h.data(),pos+std::size_t{r}*16,16,16,st.fetchEndian);float f[4];std::memcpy(f,h.data(),16);
-                    char x[96];std::snprintf(x,sizeof x," r%u=%.9g,%.9g,%.9g,%.9g",r,double(f[0]),double(f[1]),double(f[2]),double(f[3]));line+=x;
-                    if(!(++n%4)){clog("RENDER_CENSUS CWR i=%u%s",ci,line.c_str());line.clear();}
-                }
-                if(!line.empty())clog("RENDER_CENSUS CWR i=%u%s",ci,line.c_str());
-                // BLENDWEIGHT: the rule fetch whose location is 19, read from the same 44-byte records as BLENDINDICES
-                unsigned wf=~0u;for(unsigned f=0;f<rule.count;++f)if(rule.fetch[f].location==19){wf=f;break;}
-                vfi::Via w=v;bool haveW=false;unsigned wsw=0;
-                if(wf!=~0u && attrOf[wf]!=~0u && attrs[attrOf[wf]].binding==va.binding){const auto& wa=attrs[attrOf[wf]];w.offset=wa.offset;w.fetch=wa.fetch;w.fetch.feed=0x688;w.fetch.bgra=false;
-                    wsw=vfi::boundFetchOf(rule,code,wf).dstSwizzle;haveW=true;}
-                line.clear();n=0;
-                for(unsigned j=0;j<count;++j) {
-                    const std::uint32_t rec=lo+j;
-                    if(!(comp(rec,0)*vfi::bitsFloat(0x437f0080u)>254.0f))continue;
-                    char x[200];int at=std::snprintf(x,sizeof x," v%u=",rec);
-                    for(unsigned f=0;f<rule.count;++f){const auto& rf=rule.fetch[f];if(rf.form!=vfi::Form::Remap)continue;
-                        at+=std::snprintf(x+at,sizeof x-std::size_t(at),"%u,",unsigned(vfi::fetchIndex(comp(rec,rf.viaComponent)*vfi::bitsFloat(rf.kBits))));}
-                    for(unsigned k=0;k<4;++k){w.selector=haveW?swizzleSelector(wsw,k):4;const float q=haveW?vfi::viaValue(w,rec):0.0f;
-                        at+=std::snprintf(x+at,sizeof x-std::size_t(at),"%s%.9g",k?",":"w",double(q));}
-                    line+=x;if(!(++n%4)){clog("RENDER_CENSUS CWV i=%u%s",ci,line.c_str());line.clear();}
-                }
-                if(!line.empty())clog("RENDER_CENSUS CWV i=%u%s",ci,line.c_str());
-            }
-            if(W.n>=W.e.size()){++W.dropped;return;}
-            auto& x=W.e[W.n++];x.vs=vs.hash;x.present=presentCount;x.address=st.address;x.size=std::uint32_t(st.size);
-            x.bytes.assign(pos,pos+st.size);x.selZero=sel;x.selZeroCount=0;for(const auto w:sel)x.selZeroCount+=unsigned(__builtin_popcountll(w));x.cloth=cloth;
-            clothWatchPending.store(true,std::memory_order_relaxed);
-        } catch(...) {}
     }
     // At a slot's begin (its command buffer just began, no pass open): counts never taken from its last use are lost; with
     // the switch on (or an interval still open) its pool is created once and reset. Off: open intervals close.
@@ -4958,6 +4827,18 @@ public:
             ptxGatherOn=access(RECOMP_APP_PATH("/private-trace/diag-generic-no-ptx-gather"),F_OK)!=0; // v599
             GLOG("RENDER_GENERIC_PTX_FIX enabled=%u overrides=%zu applied=%u mismatched=%u why=%s gather=%u",unsigned(pl.enabled),std::size(PtxOverrides),pl.applied,pl.mismatched,pl.why,unsigned(ptxGatherOn));
         }
+        { // (iPad build 227) pack modules whose clamped RSQ becomes NaN under Metal fast math (the phone composite's pale band, the minimap
+          // composite): InverseSqrt(FMax(x, FLT_MIN)) (nan/make_nan_overrides.py; DISCOVERIES 2026-10-22 23:34). diag-generic-no-nan-fix keeps
+          // the pack's modules. Keys distinct from every other table (checked by apply: an override-taken refusal changes nothing).
+            std::uint64_t taken[std::size(DenormOverrides)+std::size(GradientOverrides)+std::size(RegLodOverrides)+std::size(ClothOverrides)+std::size(CoIssueOverrides)];std::size_t n=0;
+            for(const auto& o:DenormOverrides)taken[n++]=o.hash;
+            for(const auto& o:GradientOverrides)taken[n++]=o.hash;
+            for(const auto& o:RegLodOverrides)taken[n++]=o.hash;
+            for(const auto& o:ClothOverrides)taken[n++]=o.hash;
+            for(const auto& o:CoIssueOverrides)taken[n++]=o.hash;
+            const auto r=reglod::applyUnlessSwitch(pack,NanOverrides,std::size(NanOverrides),taken,n,RECOMP_APP_PATH("/private-trace/diag-generic-no-nan-fix"),0x3u);
+            GLOG("RENDER_GENERIC_NAN_FIX enabled=%u overrides=%zu applied=%u words=%u why=%s",unsigned(r.enabled),std::size(NanOverrides),r.applied,r.words,r.why);
+        }
         coIssueLoad(pack); // v593 (diag-generic-no-coissue-fix keeps the pack's modules): the co-issue hazard re-translations
         post::tonemapOneOnly.store(access(RECOMP_APP_PATH("/private-trace/diag-fg-tonemap-one"),F_OK)==0,std::memory_order_relaxed); // fixer2: v576's single tonemap shader
         GLOG("RENDER_GENERIC_TONEMAP_FAMILY variants=%zu one=%u",std::size(post::TonemapVariants),unsigned(post::tonemapOneOnly.load(std::memory_order_relaxed)));
@@ -5032,6 +4913,12 @@ public:
         GLOG("RENDER_GENERIC_GRADIENT_FIX enabled=%u overrides=%zu applied=%u",unsigned(gradientFix),std::size(GradientOverrides),gradientApplied);
         alignment=std::max<std::uint64_t>(256,d.properties.limits.minStorageBufferOffsetAlignment);
         uboBanks=uboBanksAvailable(); // v294 (the device was made with scalarBlockLayout for it)
+        { // ios-vs-trim: the state at start (before the prewarm starts) and whether this run may use it at all
+            vsTrim.on.store(access(RECOMP_APP_PATH("/private-trace/ios-vs-trim"),F_OK)==0,std::memory_order_relaxed);
+            const auto named=[](const char* e){const char* v=std::getenv(e);return v && std::strstr(v,"ios-vs-trim");};
+            vsTrim.wanted=vsTrim.on.load(std::memory_order_relaxed) || named("RECOMP_IOS_SWITCHES_ON") || named("RECOMP_IOS_SWITCHES_AB");
+            GLOG("RENDER_IOS_VS_TRIM start on=%u wanted=%u",unsigned(vsTrim.on.load(std::memory_order_relaxed)),unsigned(vsTrim.wanted));
+        }
         alignment=std::max<std::uint64_t>(alignment,d.properties.limits.minUniformBufferOffsetAlignment);
         GLOG("RENDER_DIAG_V294 ubo_banks=%u alignment=%llu",unsigned(uboBanks),(unsigned long long)alignment);
         for(unsigned s=0;s<6;++s) {
@@ -5056,6 +4943,12 @@ public:
         // pipelined presents, so a failure there (e.g. the second 128 MB ring) keeps v23's mode.
         if(!makeSlot(slots[0]))return false;
         slotCount=makeSlot(slots[1])?2:1;
+#if defined(__APPLE__)
+        // ios-frames-in-flight (Claude): two frames may wait on the GPU while the next is recorded, so the GPU never runs dry
+        // when the game spreads a frame's draws over its whole frame time (direct-present frames wait for the oldest slot).
+        if(const char* e=std::getenv("RECOMP_IOS_FRAMES_IN_FLIGHT");slotCount==2 && e && e[0]=='2' && !e[1] && makeSlot(slots[2]))slotCount=3;
+        GLOG("RENDER_IOS_FRAMES_IN_FLIGHT slots=%u",slotCount);
+#endif
         useSlot(0);lastSubmitted=slotCount-1; // the first begin() records into slot 0
         {   // v24: GPU time of every submitted command buffer (optional: no pools, no numbers)
             std::uint32_t families=0;vkGetPhysicalDeviceQueueFamilyProperties(d.physical,&families,nullptr);
@@ -5301,6 +5194,7 @@ public:
         }
         barrier();
         if(!submit())return false;
+        GLOG("RENDER_IOS_SAMPLER_ENUM set_bits=%u default=0 immutable_metadata=1",unsigned(samplerSetBits));
         GLOG("RENDER_GENERIC_INIT pack=%s shaders=%zu depth_format=%d alignment=%llu available=1",path,shaders.size(),
              int(depthFormat),(unsigned long long)alignment);
         GLOG("RENDER_GENERIC_V85_INIT independent_blend=%u alpha_words=%u,%u,%u,%u",unsigned(d.independentBlendEnabled),
@@ -5453,6 +5347,10 @@ public:
 #endif
         if(std::FILE* f=std::fopen(path,"rb")){n=std::fread(text,1,sizeof text,f);std::fclose(f);}
         rsSetting=rscale::parse(text,n);
+#if defined(__APPLE__)
+        rsSetting=recomp::apple::launcher::bridge::resolution(rsSetting);
+        if(const char* e=std::getenv("RECOMP_IOS_RENDER_SCALE"))rsSetting=rscale::parse(e,std::strlen(e)); // (Claude: test runs; percent, as the launcher's)
+#endif
 #if defined(RECOMP_RS_TEST_SIXTEENTHS) // host harness: the setting without a file
         rsSetting.k=RECOMP_RS_TEST_SIXTEENTHS;rsSetting.present=true;rsSetting.percent=RECOMP_RS_TEST_SIXTEENTHS*100/16;
 #endif
@@ -5465,6 +5363,9 @@ public:
 #endif
         rsFits=rscale::fits(rsSetting.k,l.maxImageDimension2D,std::min(l.maxViewportDimensions[0],l.maxViewportDimensions[1]),std::uint32_t(ScreenSpaceExtent));
         rsK=rsFits?rsSetting.k:rscale::One;rsPassK=rscale::One;
+#if defined(__APPLE__)
+        recomp_ios_render_sixteenths.store(rsK,std::memory_order_relaxed);
+#endif
         GLOG("RENDER_GENERIC_SCALE file=%u valid=%u percent=%d out_of_range=%u sixteenths=%d fits=%u applied=%d frame=%ux%u max_image=%u max_viewport=%u",
              unsigned(rsSetting.present),unsigned(rsSetting.valid),rsSetting.percent,unsigned(rsSetting.outOfRange),rsSetting.k,unsigned(rsFits),rsK,
              rscale::extent(rscale::FramePitch,rsK),rscale::extent(rscale::FrameHeight,rsK),l.maxImageDimension2D,l.maxViewportDimensions[0]);
@@ -5481,6 +5382,12 @@ public:
     [[gnu::noinline]] void rsbLoad() noexcept {
         const bool scaled=rsK!=rscale::One;
         bool stageA=scaled && access(RECOMP_APP_PATH("/private-trace/diag-rs-stage-a"),F_OK)==0;
+#if defined(__APPLE__)
+        // (Claude) the launcher's Frame Generation: stage A only where the generator cannot work at the render size (ios-fg-native,
+        // 2026-10-19: a size its 8-pixel block grid does not divide, e.g. 75 % = 960x540); at 50 % it works at 640x360
+        {const unsigned fw=rscale::extent(rscale::FramePitch,rsK),fh=rscale::extent(rscale::FrameHeight,rsK);
+         stageA=stageA || (scaled && recomp::apple::launcher::bridge::frameGeneration() && ((fw%8) || (fh%8)));}
+#endif
 #if defined(RECOMP_RS_TEST_FILE_ENV) // host harness: the switch by the environment variable RSB_STAGE_A
         stageA=scaled && std::getenv("RSB_STAGE_A")!=nullptr;
 #endif
@@ -5787,6 +5694,33 @@ public:
         GLOG("RENDER_GENERIC_SCALE_RECIPES files=%u recipes_total=%zu",files,list.size());
         return files;
     }
+    // recipe seed (Claude, 2026-10-20; c290: a first-ever pipeline compile froze the picture 1.2 s): the app bundle may carry
+    // recipe-seed/pipeline-recipes[-scaled]-NN.bin, recorded on a device that has played. They join the prewarm list after
+    // this device's own files (a recipe already read is skipped by its digest) and are never written: new recipes still go
+    // to private-trace. Without the folder nothing changes. RENDER_IOS_RECIPE_SEED logs what was read.
+    [[gnu::noinline]] unsigned seedRecipes(std::vector<recipes::Recipe>& list,const char* tag) noexcept {
+#if defined(__APPLE__)
+        unsigned files=0,added=0;
+        try {
+            char exe[1024];std::uint32_t size=sizeof exe;
+            if(_NSGetExecutablePath(exe,&size)!=0)return 0;
+            std::string dir(exe);const auto slash=dir.rfind('/');if(slash==std::string::npos)return 0;
+            dir.resize(slash);dir+="/recipe-seed/";
+            for(unsigned i=0;i<64;++i) {
+                char name[64];std::snprintf(name,sizeof name,"pipeline-recipes-%s%02u.bin",tag,i);
+                std::FILE* f=std::fopen((dir+name).c_str(),"rb");if(!f)break;
+                std::vector<std::uint32_t> w(16384);const auto n=std::fread(w.data(),4,w.size(),f);std::fclose(f);
+                ++files;
+                for(auto& r:recipes::decodeAll(w.data(),n))
+                    if(recipeDigests.insert(recipes::digest(recipes::encode(r))).second){list.push_back(std::move(r));++added;}
+            }
+        } catch(...) {}
+        GLOG("RENDER_IOS_RECIPE_SEED set=%s files=%u added=%u total=%zu",*tag?tag:"normal-",files,added,list.size());
+        return files;
+#else
+        (void)list;(void)tag;return 0;
+#endif
+    }
     // A diagnostic probe point (guest pixels) as a texel of the image.
     [[gnu::noinline]] static std::int32_t rsProbeX(const Image& i,unsigned x) noexcept {return std::int32_t(rscale::probe(x,i.k,rsHostW(i)));}
     [[gnu::noinline]] static std::int32_t rsProbeY(const Image& i,unsigned y) noexcept {return std::int32_t(rscale::probe(y,i.k,rsHostH(i)));}
@@ -5869,6 +5803,134 @@ public:
 #ifdef RECOMP_THOR_EDITION
     bool hud5NoPixels=false; // v647 (hud5-noskip): this draw runs with an empty scissor (the minimap box in "Bottom screen only")
 #endif
+    // ios-one-tri (Claude 2026-10-16, MEASUREMENT ONLY, wrong frames while on): every draw issues at most 3 indices /
+    // vertices (one primitive) with all its state kept, so MoltenVK still encodes each draw's state: with diag-v339-zero-
+    // scissor it splits the in-car draw cost into vertex work vs per-draw state. Applied at the 60-present boundaries.
+    bool iosOneTri=false;
+    // ios-one-tri-hdr (Claude 2026-10-20, MEASUREMENT ONLY, wrong frames while on): ios-one-tri for the draws into a pass whose
+    // first colour target is RGBA16F and that has depth (the HDR forward pass, ~25 us of GPU per draw at any render scale):
+    // in-run A/B splits that pass's cost into geometry (gone with the switch) vs per-draw state (kept).
+    bool iosOneTriHdr=false;
+    // ios-hdrquad-skip (Claude 2026-10-20, MEASUREMENT ONLY, wrong frames while on): draws of at most 6 indices/vertices into
+    // the HDR pass (RGBA16F + depth) issue no primitives (state kept): what those single quads cost the whole frame.
+    bool iosHdrQuadSkip=false;
+    // ios-tile-noconst (Claude 2026-10-20, MEASUREMENT ONLY, possibly wrong frames while on): a draw of at most 6 indices into
+    // the HDR pass whose vertex and pixel bank offsets equal the last binding keeps the last set-4 binding (the shared block
+    // of the previous draw): is the per-tile re-bind the sun-lighting tiles' fixed cost?
+    bool iosTileNoConst=false;
+    // ios-fan-indexed (Claude 2026-10-20; exact by construction): an INDEXED triangle fan of 3..64 indices is drawn as a triangle
+    // list with the same triangles, winding and provoking vertex (Vulkan fan triangle j = (j+1, j+2, 0), as fan_indices.hpp does
+    // for non-indexed fans), so MoltenVK never converts it. Such fans bypass the index cache (its key does not carry the form). A
+    // fan holding a restart marker is left as it is. Hypothesis: the sun-lighting tiles (a third of them are 4-index fans) carry
+    // a per-draw fixed cost from MoltenVK's fan handling. Counted in RENDER_DIAG_SMALL_FAN idx_expanded=.
+    bool iosFanIndexed=false;
+    // ios-fan-small (Claude 2026-10-20; exact: fan_indices.hpp's expansion, (j+1, j+2, 0)): the small non-indexed fan expansion
+    // (RECOMP_IOS_FAN_TRIANGLES=1) switchable at the 60-present poll, so it can be A/B-tested inside one run. MoltenVK otherwise
+    // rewrites each fan's indices on the GPU (lanes/glitch/IOS-RISKS.md R2), which the sun-lighting tiles pay per draw.
+    bool iosFanSmall=false;std::uint64_t idxFanExpanded=0,idxFanRestart=0;
+    // ios-drawlog (Claude 2026-10-16, diagnostic; output only): on profiled frames (diag-gc-profile), one line per draw into a
+    // pass whose first colour target is RGBA16F (the HDR scene): pass index, shader pair, count, blend/colour-control words.
+    bool iosDrawLog=false,iosDrawLogAll=false; // (ios-drawlog-all: every pass)
+    // ios-prebarrier (Claude 2026-10-16; exact: it only adds barriers). A draw that samples an image written since the last
+    // barrier ends its open pass for the barrier (the targeted-barrier conflict below): the pass's attachments are stored and
+    // loaded again, a full-size HDR + depth pass about once a frame in the car. The images of such a split are remembered
+    // under the pass's framebuffer key; with the switch on, a pass about to begin on that key first issues the barrier when
+    // one of them is written since the last barrier, so the draw finds no conflict and the pass is not split.
+    // ios-depthnone-dontcare (Claude 2026-10-16; MEASUREMENT until its output is verified): v293's store-none passes (the pass
+    // writes nothing to its depth/stencil attachment: any writing draw or clear splits it first) store with DONT_CARE instead of
+    // NONE. MoltenVK 1.4.2 encodes NONE as a Metal store, so on iOS every such pass writes its unchanged depth back.
+    bool iosDepthNoneDontCare=false;
+    // ios-no-gpu-ts (Claude 2026-10-17): no per-frame GPU timestamps (frame and chunk queries). In MoltenVK 1.4.2 a command buffer
+    // with a timestamp makes every encoder update a stage-counter fence and records each timestamp in a blit encoder that waits
+    // for all earlier fragment work (MVKCommandBuffer.mm 1049-1063, 1285-1296): a GPU drain at every chunk boundary. Profiled
+    // frames (diag-gc-profile) keep their pass timestamps. RENDER_GENERIC_TIMING gpu_ms is not measured while on.
+    bool iosNoGpuTs=false;
+    // Default (ADOPTED c133 sit display -1.7 ms, c134 drive display -4.8 ms): timestamps on one frame in 16 only, so gpu_ms stays
+    // measured (per timed frame); ios-gpu-ts-all: every frame (the old behaviour); ios-no-gpu-ts: none.
+    bool iosGpuTsAll=false,tsThisFrame=true;
+    // ios-inert-depth (Claude 2026-10-16; exact): a draw with colour output whose depth/stencil state cannot affect anything
+    // (stencil off, depth writes off, depth test off or ALWAYS) is bound without the depth attachment. A later draw that needs
+    // depth binds a different framebuffer, so its pass begins with the attachment as before. GTA V draws ~22 one-quad passes a
+    // frame with ZFUNC ALWAYS at sliding EDRAM depth bases: each loaded and stored a full 1280x768 depth+stencil image.
+    bool iosInertDepth=false;std::uint64_t inertDepthDraws=0;
+    struct {std::uint64_t draws=0,laterDraws=0,laterOtherFrame=0,laterDepth=0,resolves=0,skipped=0,fullClears=0,residue=0,redirected=0;} stripStats; // ios-strips (diagnostic)
+    bool iosSkipStripPass=false; // ios-skip-strip-pass (MEASUREMENT ONLY)
+    unsigned stripGeomLogs=0; // (strip-merge feasibility log)
+    // ios-probe-slice (Claude 2026-10-20; a PLAYER OPTION, off by default = the original): the reflection probe (a cube map the
+    // game renders face by face into one small EDRAM target, each face resolved into cube slice 0..5, c226: 2.75 ms per frame
+    // in the car at 50 %) is refreshed one face per frame (face = frame % 6): the other five faces' draws and their copies into
+    // the cube are skipped, so those faces keep their previous picture (reflections refresh at 5 Hz instead of 30 Hz). Every
+    // clear is kept. The probe target is learned from its cube-slice resolves (pitch <= 256, colour, slices 0-5).
+    bool iosProbeSlice=false;bool probeLearned=false;unsigned probeBase=0,probeFmt=0,probePitch=0,probeFaceNext=0;
+    struct {std::uint64_t draws=0,copies=0,keptCopies=0,frames=0;} probeStats;
+    // ios-shadow-skip-band3 (Claude 2026-10-20; a PLAYER OPTION, off by default = the original): the shadow map is one 640-pitch depth
+    // target of 2560 rows, four 640-row cascade bands; draws wholly inside rows 1920-2559 are skipped (that band stays at its clear
+    // value: no shadows from it). The per-band draw counts are logged with or without the switch (RENDER_IOS_SHADOW).
+    bool iosShadowSkip3=false;std::array<std::uint64_t,4> shadowBand{};std::uint64_t shadowSkipped=0;
+    // ios-hud-fit (Claude 2026-10-20, owner: "hud is zoomed in"): with the screen fill (ios_layer_geometry.h) the 1280x720 picture
+    // is scaled past the screen and its edges are cropped, the HUD with them. The Scaleform draws (HUD, menus, subtitles; the
+    // pixel shaders ui::scaleformPixelShader knows) of a full-frame pass (1280 wide, 720-768 rows) are drawn shrunk toward the picture's centre
+    // by the visible fraction: viewport and scissor scaled about (640,360). They then appear at the letterbox size and wholly
+    // inside the visible part, while the world still fills the screen. Fit (visible fraction 1) changes nothing. Scaleform
+    // draws into other targets (the phone's screen, in-world screens) are not touched. ios-hud-fit-off disables it (A/B).
+    bool iosHudFitOff=false;std::uint64_t hudFitDraws=0;
+    // (Claude 2026-10-22, build 207, the in-game phone in fill mode) pixel shader a67e462d509e7276: the one non-Scaleform,
+    // non-full-screen draw of the HUD pass besides the radar map's composite (RENDER_IOS_HUD_OTHERS, c526/c528/c532: in the windows
+    // where the phone is up). Hypothesis: the phone's composite, left at its full-size place beside its shrunk Scaleform frame
+    // (cut by the crop at the right edge). Shrunk with the HUD; files/private-trace/ios-hud-fit-phone-off keeps v206.
+    // RENDER_IOS_HUD_A67E logs its viewport/scissor extent (picture coordinates, before the shrink) per window to check where it is.
+    // (build 208) c533 falsified it: a67e's viewport and scissor are 0,0-1280,32 (a full-width strip at the top, 23 draws a frame),
+    // not the phone; its shrink is removed, the extent line kept. RENDER_IOS_HUD_NEW: non-Scaleform pixel shaders of the HUD pass
+    // first drawn after the first 1,800 frames (the phone comes up with Simeon's call at the street), to find the phone's draws.
+    // RENDER_IOS_RADAR: the radar target's draws (pass 560x512) and the radar composite's blend state, for the see-through minimap.
+    // ios-hud-fit-aniso: the pre-208 per-axis shrink (x by the visible fraction, y by its own); default: one uniform factor
+    // (min of the two) on both axes, the HUD's letterbox size and shape.
+    std::unordered_map<std::uint64_t,std::uint64_t> hudSeenPs;std::unordered_map<std::uint64_t,std::uint32_t> hudNewPs;bool iosHudFitAniso=false;
+    std::unordered_map<std::uint64_t,std::array<std::uint32_t,2>> radarPs;std::uint32_t radarCompBlend=0,radarCompCc=0,radarCompN=0;
+    // (build 210: c536 falsified it, the three shaders' shrink does not move the phone: removed, the extent line kept)
+    // (build 209) c534 RENDER_IOS_HUD_NEW: three non-Scaleform pixel shaders of the HUD pass first drawn when Simeon's call brings
+    // the phone up (frame ~2,400): 1a1a1450f4c4fa2b and b5862f8ab1abc15e (one draw a frame each), 8598fc008dd0f742 (10-60 a window).
+    // Hypothesis: the phone's 3D model and screen. They are shrunk with the HUD (ios-hud-fit-phone-off keeps 208b) and their
+    // extents logged (RENDER_IOS_HUD_PHONE). 1a1a reads FragCoord (screen position): if it samples the picture behind the phone, the
+    // shrink moves where it reads; the line shows it.
+    std::array<std::array<float,4>,3> hudPhoneVp{};std::array<std::uint32_t,3> hudPhoneN{};
+    std::uint32_t hudPhone3dN=0;std::array<float,4> hudPhone3dVp{}; // (build 213)
+    bool iosHudPhoneOff=false;std::uint32_t hudA67eN=0;std::array<float,4> hudA67eVp{1e9f,1e9f,-1e9f,-1e9f};std::array<std::int32_t,4> hudA67eSc{1<<30,1<<30,-(1<<30),-(1<<30)};
+    std::array<std::pair<std::uint32_t,std::uint32_t>,8> hudSizes{}; // (ios-hud-fit: Scaleform draws per pass size WxH, this window)
+    // (ios-hud-fit diagnosis) the other draws of the HUD-size passes: pixel shader hash -> {draws, full-pass draws, scaleform
+    // draws seen earlier in the same pass}; logged per window, the 12 most frequent
+    std::unordered_map<std::uint64_t,std::array<std::uint32_t,3>> hudOthers;std::uint64_t hudPassKey=0;bool hudPassSawUi=false;
+    unsigned hudResolveLogs=0;
+    unsigned phoneLogs=0; // (build 216) RENDER_IOS_PHONE_* lines so far
+    unsigned phoneSeen=0,phoneClearSeen=0;bool phoneExactSource=false; // (build 218) sampling counters; ios-phone-exact-source
+    bool phoneSkipRestore=false;std::uint64_t phoneRestoreSkips=0; // (build 221) ios-phone-skip-restore
+    bool phoneDepthKeep=false;std::uint64_t phoneDepthAlways=0; // (build 230) ios-phone-depth-keep: the screen quads keep GREATER when shrunk
+    unsigned hudPhoneCompN=0; // (build 217) phone composites in the window (RENDER_IOS_HUD_PHONE3D line)
+    static bool phoneRect(std::int32_t x0,std::int32_t y0,std::int32_t x1,std::int32_t y1){return x0>=860 && x0<=980 && y0>=360 && y0<=400 && x1>=1240 && y1>=700 && y1<=768;}
+    // (ios-notonemap diagnosis, Claude 2026-10-21) the pixel shader of the frame's last full-picture quad in a 1280-wide pass (not
+    // Scaleform), and per window how often a frame WITHOUT the known tonemap draw ended with which one (fg no-camera stand-downs, c381)
+    std::uint64_t iosLastFullPs=0;std::unordered_map<std::uint64_t,std::uint32_t> iosNoTonemapPs;std::unordered_map<std::uint64_t,std::uint32_t> hudCorner; // (diagnosis: psHash high 48 bits | pass height) // (ios-hud-fit diagnosis: partial-rectangle colour resolves of 1280-pitch targets, the first 60)
+    bool iosMeasStripOnePass=false;std::int32_t stripRowOff=0; // ios-meas-strip-onepass (MEASUREMENT ONLY)
+    static bool stripLive(const Target& t,std::int32_t y0,std::int32_t y1){return t.stripY1>t.stripY0 && y0<t.stripY1 && y1>t.stripY0;}
+    void stripClear(const Target& t,const std::array<std::int32_t,4>& r) { // a clear spanning the width removes the live strip rows it covers
+        auto& x=const_cast<Target&>(t);if(x.stripY1<=x.stripY0 || r[0]>0 || r[2]<std::int32_t(x.pitch))return;
+        if(r[1]<=x.stripY0 && r[3]>=x.stripY1){x.stripY0=x.stripY1=0;++stripStats.fullClears;}
+        else if(r[1]<=x.stripY0 && r[3]>x.stripY0)x.stripY0=r[3];else if(r[3]>=x.stripY1 && r[1]<x.stripY1)x.stripY1=r[1];
+    }
+    // ios-render-area (Claude 2026-10-17; exact; opt-in via files/private-trace/ios-render-area: no resolvable effect, c123c/c127; MoltenVK
+    // passes only offset+extent to Metal as the render-target size): a pass begun for a draw or clear gets that operation's rectangle as its render
+    // area (Vulkan load/store ops act only inside it; pixels outside keep their contents). Only on unscaled targets with no load-op
+    // clear and no pending clears to apply. Any later operation of the pass outside the area (or one without a rectangle) ends the
+    // pass first; it is re-begun with the full area. On a tile GPU a pass costs per tile of its area (c121: ~65 us per full pass).
+    bool iosRenderArea=false,passAreaLimited=false,areaHintValid=false;std::array<std::int32_t,4> areaHint{};VkRect2D passArea{};
+    struct {std::uint64_t limited=0,splits=0,full=0;std::uint64_t areaPx=0,fullPx=0;} areaStats;
+    void setAreaHint(std::int32_t x0,std::int32_t y0,std::int32_t x1,std::int32_t y1){areaHint={x0,y0,x1,y1};areaHintValid=true;}
+    bool iosPreBarrier=false;std::unordered_map<std::uint64_t,std::vector<VkImage>> preBarrierImages;
+    struct {std::uint64_t splits=0,pre=0,preUseful=0;} preStats;
+    std::uint32_t oneTri(std::uint32_t n) const noexcept {
+        const bool hdr=iosOneTriHdr && passTargets[0] && passTargets[4] && passTargets[0]->image.format==VK_FORMAT_R16G16B16A16_SFLOAT;
+        if(iosHdrQuadSkip && n<=6 && passTargets[0] && passTargets[4] && passTargets[0]->image.format==VK_FORMAT_R16G16B16A16_SFLOAT)return 0u;
+        return (iosOneTri || hdr) && n>3?3u:n;}
     bool v345Small=false; // v345 (A/B): chunks of 48 items instead of 192 (diag-v345-chunk48)
     // v343: (exact) the clear rectangles of one vkCmdClearAttachments call (one value) are coalesced into fewer rectangles with
     // the same union (diag-v343-baseline = as issued); diag-v343-skip-pending (MEASUREMENT ONLY, with zero-draws) drops the
@@ -6105,12 +6167,9 @@ public:
             // v310: a colour surface a tiled pass drew (rows short of its image), bound now with more rows: its rows past the tiled
             // ones are, in EDRAM, the next surfaces' last tiles (edram_residue.h), copied in before its next pass or read.
             if(i<4 && !x.depth) {
-                if(rows && rows<x.image.height) {
-                    if(ffOn){if(x.residuePending)ffRes("D%u",x.base);if(x.tiledRows!=rows)ffRes("T%u/%u",x.base,rows);} // (v581)
-                    x.tiledRows=rows;x.residuePending=false;
-                }
+                if(rows && rows<x.image.height){x.tiledRows=rows;x.residuePending=false;}
                 else if(x.tiledRows) {
-                    if(!v310Baseline){x.residueRows=x.tiledRows;x.residueNewRows=rows;x.residuePending=true;++v310.marked;if(ffOn)ffRes("M%u/%u",x.base,rows);}
+                    if(!v310Baseline){x.residueRows=x.tiledRows;x.residueNewRows=rows;x.residuePending=true;++v310.marked;}
                     x.tiledRows=0;
                 }
             }
@@ -6126,6 +6185,7 @@ public:
         const bool dontCare=colorLoadDontCare;
         if(dontCare)key^=0xD0C0D0C0D0C0D0C0ull;
         if(depthNone)key^=0x0293029302930293ull; // v293: the depth store-none variant (compatible: only store ops differ)
+        if(depthNone && iosDepthNoneDontCare)key^=0x1D0C1D0C1D0C1D0Cull; // ios-depthnone-dontcare
         if(clearMask)key=fnvOf(std::uint64_t(clearMask)|0x3010000000000000ull,key); // v301: colour LOAD_OP_CLEAR variants (compatible)
         const unsigned measure=v369MeasureBits(); // v369 (MEASUREMENT ONLY): DONT_CARE store / depth-load variants (compatible)
         if(measure)key=fnvOf(std::uint64_t(measure)|0x3690000000000000ull,key);
@@ -6139,7 +6199,7 @@ public:
             VkAttachmentDescription a{};a.format=b.t[i]->image.format;a.samples=VK_SAMPLE_COUNT_1_BIT;
             a.loadOp=a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_LOAD;a.storeOp=a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_STORE;
             if(dontCare && i<4)a.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE; // v289 (diagnostic)
-            if(depthNone && i==4)a.storeOp=a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_NONE_EXT; // v293
+            if(depthNone && i==4)a.storeOp=a.stencilStoreOp=iosDepthNoneDontCare?VK_ATTACHMENT_STORE_OP_DONT_CARE:VK_ATTACHMENT_STORE_OP_NONE_EXT; // v293 (ios-depthnone-dontcare)
             if(i<4 && (clearMask&(1u<<i)))a.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; // v301
             if((measure&1) && i<4)a.storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE; // v369 (measurement only)
             if((measure&2) && i==4)a.storeOp=a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -6194,11 +6254,20 @@ public:
             for(unsigned i=0;i<5;++i)w[1+i]=b.t[i]?word64(b.t[i]->image.view):0;
             views=wordsKey(w.data(),w.size(),0x5A);
         } else {views=formats;for(const auto* t:b.t)views=fnvOf(t?t->image.view:VK_NULL_HANDLE,views);views=fnvOf(b.height,views);}
-        if(inPass && passKey==views)return true;
-        if(msaa4xSeen && !v591Off)for(const auto* t:b.t)if(t)msaaAlias(*const_cast<Target*>(t)); // v591 (a new pass: S's write began another one)
+        const bool hintValid=areaHintValid;areaHintValid=false;bool forceFull=false; // ios-render-area (the hint clamped to the target)
+        std::array<std::int32_t,4> hint=areaHint;hint[0]=std::clamp<std::int32_t>(hint[0],0,std::int32_t(b.width));hint[1]=std::clamp<std::int32_t>(hint[1],0,std::int32_t(b.height));
+        hint[2]=std::clamp<std::int32_t>(hint[2],hint[0],std::int32_t(b.width));hint[3]=std::clamp<std::int32_t>(hint[3],hint[1],std::int32_t(b.height));
+        if(inPass && passKey==views) {
+            if(!passAreaLimited || (hintValid && hint[0]>=passArea.offset.x && hint[1]>=passArea.offset.y &&
+               hint[2]<=passArea.offset.x+std::int32_t(passArea.extent.width) && hint[3]<=passArea.offset.y+std::int32_t(passArea.extent.height)))return true;
+            ++areaStats.splits;forceFull=true; // (the operation reaches outside the limited area: re-begin with the full area)
+        }
+        if(msaa4xSeen && !v591Off)for(const auto* t:b.t)if(t)msaaAlias(*const_cast<Target*>(t)); // v591 (iPad: after the render-area check; a new pass: S's write began another one)
         endPass(__LINE__);
         if(v337Chunks && chunkWork>=(v345Small?48u:V337ChunkItems))submitChunk(); // v337 (between passes: no pass is split; v345: 48 items with diag-v345-chunk48)
         seBeforePass(views); // submit-early: diag-se-big (between passes, as v337; out of line, unconditional)
+        if(iosPreBarrier && targetedBarriers)if(const auto it=preBarrierImages.find(views);it!=preBarrierImages.end()) // ios-prebarrier
+            for(const auto im:it->second)if(listed(writtenSince,im)){barrier();++preStats.pre;break;}
         std::uint64_t predictKey=0; // v293
         if(b.t[4]) {
             if(passContinuing)predictKey=passViews;
@@ -6272,6 +6341,16 @@ public:
         }
         VkRenderPassBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;bi.renderPass=rp;bi.framebuffer=fb;
         bi.renderArea={{0,0},{rsExtent(b.width,b.k),rsExtent(b.height,b.k)}}; // (fsr-modes: host pixels; the same numbers at 16)
+        bool areaLimited=false;VkRect2D area=bi.renderArea;
+        if(iosRenderArea && hintValid && !forceFull && b.k==16 && !clearMask && !census.active && [&]{for(const auto* t:b.t)if(t && !t->pendingClears.empty())return false;return true;}()) {
+            const std::int32_t x0=std::clamp<std::int32_t>(hint[0],0,std::int32_t(b.width)),y0=std::clamp<std::int32_t>(hint[1],0,std::int32_t(b.height));
+            const std::int32_t x1=std::clamp<std::int32_t>(hint[2],x0,std::int32_t(b.width)),y1=std::clamp<std::int32_t>(hint[3],y0,std::int32_t(b.height));
+            if(x1>x0 && y1>y0 && (x0>0 || y0>0 || x1<std::int32_t(b.width) || y1<std::int32_t(b.height))) {
+                area={{x0,y0},{std::uint32_t(x1-x0),std::uint32_t(y1-y0)}};bi.renderArea=area;areaLimited=true;++areaStats.limited;
+                areaStats.areaPx+=std::uint64_t(x1-x0)*std::uint64_t(y1-y0);areaStats.fullPx+=std::uint64_t(b.width)*b.height;
+            }
+        }
+        if(!areaLimited)++areaStats.full;
         if(clearMask){bi.clearValueCount=clearCount;bi.pClearValues=clearValues.data();} // v301
         for(const auto* t:b.t)if(t)hazards({},{t->image.image}); // load + store of every attachment
         if(auto& s=slots[slotIndex];s.passProfiled && s.passCount<MaxProfiledPasses) { // v287
@@ -6279,11 +6358,13 @@ public:
             vkCmdWriteTimestamp(cmd,gcBeginStage(),s.passTimestamps,2*s.passCount); // (gpu-cost: BOTTOM_OF_PIPE with diag-gc-profile)
             FrameSlot::PassInfo pi;pi.w=b.width;pi.h=b.height;for(unsigned i=0;i<5;++i)pi.formats[i]=b.t[i]?std::int32_t(b.t[i]->image.format):-1;
             pi.sameAsPrevious=views==lastEndedPassKey; // v288
+            for(unsigned i=0;i<5;++i)if(b.t[i]){pi.bases[i]=b.t[i]->base;pi.views[i]=std::uint32_t(reinterpret_cast<std::uintptr_t>(b.t[i]->image.view));}
             pi.depth=b.t[4]!=nullptr;pi.depthWritten=b.t[4] && !b.t[4]->pendingClears.empty(); // v292 (pending alias clears run below)
             s.passInfo.push_back(pi);passProfileOpen=true;passBeginDraws=perf.draws;passBeginClears=counters.clears;
         }
-        vkCmdBeginRenderPass(cmd,&bi,VK_SUBPASS_CONTENTS_INLINE);++perf.passes;if(ffOn)ffPassNote(b); // (v581)
+        vkCmdBeginRenderPass(cmd,&bi,VK_SUBPASS_CONTENTS_INLINE);++perf.passes;
         inPass=true;passKey=views;pass=rp;passWidth=b.width;passHeight=b.height;passTargets=b.t;rsPassBegin(b.k); // (fsr-modes: the scale of the pass)
+        passAreaLimited=areaLimited;passArea=area; // ios-render-area
         passDepthNone=depthNone;passDepthWrote=false;passViews=predictKey;passContinuing=false;if(b.t[4])++(depthNone?v293.nonePasses:v293.storePasses); // v293
         // v58: deferred alias clears first, inside this pass (the part outside its area stays pending).
         for(unsigned i=0;i<4;++i)if(b.t[i] && !b.t[i]->pendingClears.empty()) {
@@ -6310,8 +6391,8 @@ public:
                 u.calls+=v301.pendingCalls-callsBefore;u.rects+=v301.pendingRects-rectsBefore;u.passW=b.width;u.passH=b.height;u.attachments=b.count;
             }
         }
-        ++writeClock;for(const auto* t:b.t)if(t){auto* w=const_cast<Target*>(t);w->serial=frame;w->written=writeClock;w->passClock=writeClock; // (v310)
-            w->writes[w->writesN%v310::WriteRing]={writeClock,w->edramRows,0,0,0,0};++w->writesN;} // v583: a pass of no writes yet (noteWrite adds them)
+        ++writeClock;for(const auto* t:b.t)if(t){auto* w=const_cast<Target*>(t);w->serial=frame;w->written=writeClock;w->passClock=writeClock;w->stampPrev=w->stampSite;w->stampSite=1; // (v310)
+            w->writes[w->writesN%v310::WriteRing]={writeClock,w->edramRows,0,0,0,0};++w->writesN;}noteCache.clock=~0ull; // (build 201: a new write slot) // v583: a pass of no writes yet (noteWrite adds them)
         return true;
     }
     // v310: the tiled-pass residue of `t` (edram_residue.h): each band of its image rows past its tiled rows that lies, in EDRAM,
@@ -6380,7 +6461,7 @@ public:
         VkBufferImageCopy out{};out.bufferOffset=c.out;out.imageSubresource={aspect,0,0,1};out.imageExtent={c.width,c.height,1};
         vkCmdCopyBufferToImage(cmd,c.buffer.buffer,x.image.image,VK_IMAGE_LAYOUT_GENERAL,1,&out);
         hazards({},{x.image.image});afterWrite();
-        x.written=++writeClock;x.serial=frame;
+        x.written=++writeClock;x.serial=frame;x.stampPrev=x.stampSite;x.stampSite=2;
         ++v591Stats.copies;v591Stats.ns+=std::uint64_t(nsSince(t0));
         if(v591Logged<16){++v591Logged;
             GLOG("RENDER_GENERIC_V591_ALIAS to=%s from=%s %ux%u from=%ux%u words=%u depth=%u frame=%llu",targetName(&x).c_str(),targetName(&s).c_str(),
@@ -6390,7 +6471,7 @@ public:
     void applyResidue(Target& t) {
         t.residuePending=false;
         if(v310Baseline)return;
-        if(!t.image.image || t.samples || sixtyFourBit(t.xenosFormat)){++v310.unsupported;if(ffOn)ffRes("U%u",t.base);return;}
+        if(!t.image.image || t.samples || sixtyFourBit(t.xenosFormat)){++v310.unsupported;return;}
         std::vector<v310::Surface> s;std::vector<Target*> ptr;std::size_t self=0;
         s.reserve(targets.size());ptr.reserve(targets.size());
         for(auto& [key,u]:targets) {
@@ -6398,24 +6479,12 @@ public:
             if(&u==&t)self=s.size();
             v310::Surface x;x.base=u.base;x.pitch=u.pitch;x.height=u.image.height;x.format=u.xenosFormat;x.samples=u.samples;x.depth=u.depth;
             x.edramRows=u.edramRows;x.tiledRows=u.tiledRows;x.passClock=u.passClock;
-            x.writes=u.writes;x.writesN=u.writesN;x.writesKnown=!u.samples && !sixtyFourBit(u.xenosFormat); // v583
+            x.writes=u.writes;x.writesN=u.writesN;x.writesKnown=!u.samples && !sixtyFourBit(u.xenosFormat); // v583 (Thor fixer3, G7)
             s.push_back(x);ptr.push_back(&u);
         }
         const auto p=v310::plan(s,self,t.residueRows,t.residueNewRows);
-        if(p.unsupported){++v310.unsupported;if(ffOn)ffRes("U%u",t.base);return;}
+        if(p.unsupported){++v310.unsupported;return;}
         v310.missing+=p.missing;v310.stale+=p.stale;v310.spared+=p.spared; // (v583: spared)
-        if(ffOn && p.sparedBy<ptr.size()){const Target& c=*ptr[p.sparedBy];ffRes("K%u<%u:%u:%u/%u",t.base,c.base,c.xenosFormat,c.pitch,c.edramRows);} // v583: a pass attached over the band that wrote none of it
-        if(ffOn) { // v581 (G7, DIAGNOSTIC): the first band left out, with its culprit or reason
-            if(p.staleBy<ptr.size()) {
-                const Target& c=*ptr[p.staleBy];const Target* k=p.missingNear<ptr.size()?ptr[p.missingNear]:nullptr;
-                ffRes("S%u@%u<%u:%u%s:%u/%uc%llu",t.base,p.firstBadBase,c.base,c.xenosFormat,c.depth?"d":"",c.pitch,c.edramRows,
-                      (unsigned long long)(k?c.passClock-k->passClock:0));
-            }
-            if(p.missingWhy) {
-                const Target* n=p.missingNear<ptr.size()?ptr[p.missingNear]:nullptr;
-                ffRes("X%u@%u:%c%d/%u",t.base,p.firstBadBase,p.missingWhy,n?int(n->base):-1,n?n->tiledRows:0u);
-            }
-        }
         std::vector<std::pair<std::int32_t,std::int32_t>> copied;
         for(const auto& c:p.copies) {
 #if defined(RECOMP_V310_MUTANT_SELF) // test mutant: the band from t's own image (its last tile) instead of the surface over it
@@ -6423,9 +6492,7 @@ public:
 #else
             Target& from=*ptr[c.source];
 #endif
-            if(from.image.format!=t.image.format || (!from.pendingClears.empty() && !flushPending(from))) {
-                ++v310.missing;if(ffOn)ffRes("X%u@%u:%c",t.base,from.base,from.image.format!=t.image.format?'F':'C');continue; // (v581)
-            }
+            if(from.image.format!=t.image.format || (!from.pendingClears.empty() && !flushPending(from))){++v310.missing;continue;}
             endPass(__LINE__);
             VkImageCopy r{};r.srcSubresource=r.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
             r.srcOffset={0,c.srcY,0};r.dstOffset={0,c.dstY,0};r.extent={std::min(from.image.width,t.image.width),std::uint32_t(c.rows),1};
@@ -6433,12 +6500,12 @@ public:
             rsCopyImage(from.image,t.image,r); // fsr-modes: v458's vkCmdCopyImage; host rows on scaled surfaces
             afterWrite();
             ++v310.bands;copied.push_back({c.dstY,c.dstY+c.rows});
+            if(stripLive(from,c.srcY,c.srcY+c.rows))++stripStats.residue; // ios-strips: live strip rows carried by a residue copy
             if(census.active)clog("RENDER_CENSUS RR i=%u to=%s from=%s src_rows=%d-%d dst_rows=%d-%d tiled_rows=%u new_rows=%u",census.seq,
                 targetName(&t).c_str(),targetName(ptr[c.source]).c_str(),c.srcY,c.srcY+c.rows,c.dstY,c.dstY+c.rows,t.residueRows,t.residueNewRows);
         }
-        if(ffOn)ffRes("A%u:%zu",t.base,copied.size()); // (v581)
         if(copied.empty())return;
-        ++v310.fills;t.written=++writeClock;
+        ++v310.fills;t.written=++writeClock;t.stampPrev=t.stampSite;t.stampSite=3;
         for(auto& e:t.pendingClears) {
             std::vector<edram::Rect> kept;
             for(const auto& r:e.rects) {
@@ -6503,11 +6570,7 @@ public:
             if(d.samplerAnisotropyEnabled && filterable && aniso>=2 && aniso<=5) {
                 c.anisotropyEnable=VK_TRUE;c.maxAnisotropy=std::min(float(1u<<(aniso-1)),d.properties.limits.maxSamplerAnisotropy);
             }
-            // v545: a failed create is not cached (before: the default sampler was stored under this key, so the key kept
-            // the default's linear/clamp/LOD-0 state for the rest of the run); the default serves this draw only.
-            VkSampler created=VK_NULL_HANDLE;
-            if(vkCreateSampler(d.device,&c,nullptr,&created)!=VK_SUCCESS){samplers.erase(key);return defaultSampler;}
-            s=created;
+            if(vkCreateSampler(d.device,&c,nullptr,&s)!=VK_SUCCESS)s=defaultSampler;
         }
         if(s!=defaultSampler)front={tuple,s}; // v254 (a failed create returns the default sampler without storing it)
         return s;
@@ -6646,8 +6709,7 @@ public:
         if(f.dimension!=XenosTextureDescription::Dimension::TwoDOrStacked || f.stacked)return nullptr;
         const unsigned flb=memoryLog2Bytes(f.format);
         const auto resolveLayout=rlr::resolveMemoryLayout(r.memory.layout.pitch,r.memory.layout.height,r.memory.layout.log2Bytes);
-        // v587: a fetch format without a known texel size compares tiling and pitch only (v586 counted it as another layout)
-        const auto fetch=rlr::fetchLayout(f.tiled,f.pitchTexels,f.height,flb==0xFF?resolveLayout.log2Bytes:flb);
+        const auto fetch=rlr::fetchLayout(f.tiled,f.pitchTexels,f.height,flb==0xFF?resolveLayout.log2Bytes:flb); // (v587: unknown texel size compares tiling and pitch only)
         if(rlr::sameTexels(resolveLayout,fetch)){++v586Stats.sameLayout;return nullptr;}
         const auto refuse=[&](const char* w){++v586Stats.refused;note("layout-remap-refused",w);return nullptr;};
         if(flb==0xFF)return refuse("fetch-format");
@@ -6750,8 +6812,8 @@ public:
         const auto it=resolved.find(at);if(it==resolved.end() || &it->second!=&r)return &r;
         ++cpuReconcileDrops;
         if(cpuReconcileDrops<=8 || !(cpuReconcileDrops%64))
-            GLOG("RENDER_GENERIC_V668_CPU_WRITE addr=%08x bytes=%u frame=%llu drops=%llu revealed=%u",at,r.cpuView.hi-r.cpuView.lo,
-                 (unsigned long long)frame,(unsigned long long)cpuReconcileDrops,fowRevealed(bytes->data(),bytes->size())); // v840: + revealed
+            GLOG("RENDER_GENERIC_V668_CPU_WRITE addr=%08x bytes=%u frame=%llu drops=%llu",at,r.cpuView.hi-r.cpuView.lo,
+                 (unsigned long long)frame,(unsigned long long)cpuReconcileDrops);
         dropResolved(it);return nullptr;
     }
     // v363: `memo` (the calling binding's V363TexMemo, only while diag-v363-flat-maps is on) replaces the resolved, planCache and
@@ -7344,6 +7406,8 @@ public:
             if(!blendGuard)key=fnvOf(0xB1E9Du,key);
         }
         key^=gcKeySalt(); // gpu-cost (diag-gc-index-fold): 0 while off
+        if(vsTrim.on.load(std::memory_order_relaxed))key^=0x7A51D3E4C0FFEE01ull; // ios-vs-trim: the trimmed set's own pipelines
+        if(vsTrim.noClip.load(std::memory_order_relaxed))key^=0x5EC11F0000000001ull; // ios-vs-noclip (measurement)
         Pipeline* entryAt=nullptr;
         if(v363FlatMaps) { // v363
             auto& f=v363PipeFront[v363Index(key,V363PipeBits)];
@@ -7365,7 +7429,7 @@ public:
 #if defined(RECOMP_GC_MUTANT_PS_ONLY) // host-test mutant: the vertex stage keeps its unfolded module
         const auto vmUsed=vm,pmUsed=gcModuleFor(d.device,pm);
 #else
-        const auto vmUsed=gcModuleFor(d.device,vm),pmUsed=gcModuleFor(d.device,pm); // gpu-cost (diag-gc-index-fold)
+        const auto vmUsed=gcModuleFor(d.device,vtFor(vm,pm)),pmUsed=gcModuleFor(d.device,pm); // gpu-cost (diag-gc-index-fold); ios-vs-trim
 #endif
 #if defined(RECOMP_GC_TEST_STAGECHECK) // host test: each stage's module against what the fold makes of it
         gcCheckStage(vm,vmUsed);gcCheckStage(pm,pmUsed);
@@ -7411,24 +7475,9 @@ public:
                 a.blendEnable=VK_FALSE;++v85.blendGuarded;
                 char x[48];std::snprintf(x,sizeof x,"vkformat=%d bc=%08x",int(b.t[i]->image.format),bc);note("blend-disabled-format",x);
             }
+            if(!d.independentBlendEnabled && i){const auto m=a.colorWriteMask;a=att[0];a.colorWriteMask=m;}
         }
-        // v545: without independentBlend Vulkan requires every attachment state to be identical, write mask included
-        // (VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605). Before, each target kept its own mask (an
-        // invalid pipeline when they differ), and copying target 0 re-enabled blending on a target the format guard
-        // had just disabled. Now: blending is off for all if any bound target cannot blend, and every target takes
-        // target 0's state and mask (what such a device applies anyway); both cases are noted.
-        if(!d.independentBlendEnabled && colorCount>1) {
-            if(blendGuard && att[0].blendEnable)for(unsigned i=1;i<colorCount;++i)if(b.t[i] && !hostBlends(b.t[i]->image.format)) {
-                att[0].blendEnable=VK_FALSE;++v85.blendGuarded;
-                char x[48];std::snprintf(x,sizeof x,"rt=%u vkformat=%d (all targets)",i,int(b.t[i]->image.format));note("blend-disabled-format",x);break;
-            }
-            for(unsigned i=1;i<colorCount;++i) {
-                if(att[i].colorWriteMask!=att[0].colorWriteMask && b.t[i]) {
-                    char x[40];std::snprintf(x,sizeof x,"rt=%u mask=%x/%x",i,unsigned(att[0].colorWriteMask),unsigned(att[i].colorWriteMask));note("blend-mask-collapsed",x);
-                }
-                att[i]=att[0];
-            }
-        }
+        if(!d.independentBlendEnabled)for(unsigned i=1;i<colorCount;++i){const auto m=att[i].colorWriteMask;att[i]=att[0];att[i].colorWriteMask=m;}
         // v85: without independentBlend every target blends with RB_BLENDCONTROL0 (seen when the words differ).
         if(!d.independentBlendEnabled)for(unsigned i=1;i<colorCount;++i)if(s.blend[i]!=s.blend[0] && ((s.colorMask>>(4*i))&15)){
             char x[40];std::snprintf(x,sizeof x,"rt=%u bc=%08x/%08x",i,s.blend[0],s.blend[i]);note("blend-per-target-collapsed",x);break;}
@@ -7445,14 +7494,21 @@ public:
             std::lock_guard lock(d.pipelineCacheMutex);
             if(vkCreateGraphicsPipelines(d.device,d.pipelineCache,1,&g,nullptr,&p)!=VK_SUCCESS)p=VK_NULL_HANDLE;
         }
-        perf.pipelineNs+=nsSince(created);++perf.pipelinesCreated;
+        const auto createdNs=nsSince(created);
+        perf.pipelineNs+=createdNs;++perf.pipelinesCreated;
         if(p)++counters.pipelines;
+        lastRecipeDigest=0;lastRecipeKnown=false;
         if(p && recipesOn)recordRecipe(s,vs,ps,b,vb,va,ia,rs,ds,colorCount,att); // v139
+        if(createdNs>=20'000'000ull && prewarmDone.load(std::memory_order_relaxed)) // ios-pw-diag (Claude): which slow pipeline, and was it prewarmed
+            GLOG("RENDER_IOS_PW_SLOW ms=%.1f recipe=%016llx known=%u vs=%016llx ps=%016llx variant=%016llx ps_variant=%u spec=%u topo=%u restart=%u attrs=%zu bindings=%zu",
+                 double(createdNs)/1e6,(unsigned long long)lastRecipeDigest,unsigned(lastRecipeKnown),(unsigned long long)s.vs,(unsigned long long)s.ps,
+                 (unsigned long long)s.variant,unsigned(s.psVariant),unsigned(s.spec),unsigned(s.topology),unsigned(s.restart),va.size(),vb.size());
         return p;
     }
     // v139: the recipe of a pipeline just created (the exact fixed-function state passed to Vulkan and the pack
     // identities of its modules), appended once to files/private-trace/pipeline-recipes-NN.bin (each file < 60 KB:
     // game runs cap files at 64 KiB). Vertex variants (v77) and unidentifiable entries are not recorded.
+    std::uint64_t lastRecipeDigest=0;bool lastRecipeKnown=false; // ios-pw-diag (Claude): the last recorded pipeline's recipe digest
     void recordRecipe(const PipelineState& s,const PackEntry& vs,const PackEntry& ps,const Bound& b,
                       const std::vector<VkVertexInputBindingDescription>& vb,const std::vector<VkVertexInputAttributeDescription>& va,
                       const VkPipelineInputAssemblyStateCreateInfo& ia,const VkPipelineRasterizationStateCreateInfo& rs,
@@ -7482,6 +7538,7 @@ public:
         for(unsigned i=0;i<5;++i)r.formats[i]=b.t[i]?std::int32_t(b.t[i]->image.format):-1;
         r.bindings=vb;r.attributes=va;
         const auto words=recipes::encode(r);
+        lastRecipeDigest=recipes::digest(words);lastRecipeKnown=recipeDigests.count(lastRecipeDigest)!=0; // (ios-pw-diag)
         if(!recipeDigests.insert(recipes::digest(words)).second){++recipesDuplicate;return;}
         const std::size_t bytes=words.size()*4;
         rsRecipeSelect(r.psVariant); // fsr-modes: a recipe with PsScaled (never at 16) goes to its own files; recipeFile / recipeFileBytes then hold that set
@@ -7582,6 +7639,8 @@ public:
             for(auto& r:recipes::decodeAll(w.data(),n)){recipeDigests.insert(recipes::digest(recipes::encode(r)));list->push_back(std::move(r));}
         }
         files+=rsLoadRecipes(*list); // fsr-modes: + the scaled modes' own recipe files (nothing, 0, at 16)
+        seedRecipes(*list,""); // recipe seed: the bundle's recorded recipes after this device's own
+        if(rsK!=rscale::One)seedRecipes(*list,"scaled-");
         const bool prewarm=!list->empty() && !switchFile("diag-generic-no-prewarm");
         gcStartup(); // gpu-cost: diag-gc-prewarm / -index-fold / -all at startup (the prewarm also compiles the folded variants)
 #if defined(RECOMP_PW_TEST_GC_PREWARM) // host test: the folded prewarm on (gcFile answers no files in the fold test builds)
@@ -7592,8 +7651,12 @@ public:
         GLOG("RENDER_GENERIC_RECIPES on=1 files=%u recipes=%zu prewarm=%u",files,list->size(),unsigned(prewarm));
         if(!prewarm){prewarmDone=true;recomp::pcache::warmupFinished(0);return;} // (boot-stall: no warm-up in this run)
         std::thread([this,list,pwFix]{
+#if defined(__APPLE__)
+            (void)recomp::apple::backgroundCompilationThread();
+#else
             cpu_set_t little;CPU_ZERO(&little);RECOMP_TOPOLOGY_ADD_CPUS(little,recomp_topology::roles().little); // topology lane: the little role (Thor: cpu0-2)
             (void)sched_setaffinity(0,sizeof little,&little);(void)setpriority(PRIO_PROCESS,int(gettid()),10);
+#endif
             const auto t0=Clock::now();
             std::unordered_map<std::uint64_t,VkShaderModule> modules;std::map<std::array<std::int32_t,5>,VkRenderPass> passes;
             VkShaderModule nullRound=VK_NULL_HANDLE; // depth-float (diag-df-round)
@@ -7636,11 +7699,24 @@ public:
                 if(!vm || ((ps!=&nullPixel || (r.psVariant&PsRound)) && !pm) || !rp){++prewarmFailed;continue;}
                 if(compileRecipe(r,vm,pm,rp))++prewarmCompiled;else ++prewarmFailed;
                 gcPrewarmFolded(d.device,vm,pm,[&](VkShaderModule fv,VkShaderModule fp){return compileRecipe(r,fv,fp,rp);}); // gpu-cost
+                // fan-list prewarm (Claude, 2026-10-20): a fan recipe also prewarms its TRIANGLE_LIST form, the pipeline the draw path
+                // makes once the renderer expands the fan (RECOMP_IOS_FAN_TRIANGLES, default 1 since c1-fandef-112; large fans): without
+                // it the first expanded draw of each such pipeline compiled on the draw path (c274: 634.6 ms, RENDER_IOS_PW_SLOW known=0).
+                if(r.topology==std::uint32_t(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)) {
+                    auto rl=r;rl.topology=std::uint32_t(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);rl.restart=false;
+                    if(compileRecipe(rl,vm,pm,rp))++prewarmCompiled;else ++prewarmFailed;
+                    ++fanListPrewarmed;
+                }
+                if(const auto tv=vtFor(vm,pm,true);tv!=vm) { // ios-vs-trim: the trimmed pipeline too (and its folded form), as pipeline() makes it
+                    (void)compileRecipe(r,tv,pm,rp);
+                    gcPrewarmFolded(d.device,tv,pm,[&](VkShaderModule fv,VkShaderModule fp){return compileRecipe(r,fv,fp,rp);});
+                }
             }
-            for(auto& [k,m]:modules)if(m){gcForgetModule(m);vkDestroyShaderModule(d.device,m,nullptr);} // (gpu-cost: forget the words first)
+            for(auto& [k,m]:modules)if(m){gcForgetModule(m);vtForget(m);vkDestroyShaderModule(d.device,m,nullptr);} // (gpu-cost: forget the words first)
             if(nullRound)vkDestroyShaderModule(d.device,nullRound,nullptr);
             for(auto& [k,rp]:passes)if(rp)vkDestroyRenderPass(d.device,rp,nullptr);
             prewarmNs=std::uint64_t(nsSince(t0));prewarmDone=true;recomp::pcache::warmupFinished(prewarmCompiled.load()); // boot-stall: the saver thread may now write the cache (it polls; nothing waits here)
+            GLOG("RENDER_IOS_FAN_LIST_PREWARM fan_recipes=%u",fanListPrewarmed); // (fan-list prewarm)
             GLOG("RENDER_GENERIC_PREWARM done=1 recipes=%zu compiled=%u failed=%u skipped=%u ms=%.0f",list->size(),prewarmCompiled.load(),
                  prewarmFailed.load(),prewarmSkipped.load(),double(prewarmNs.load())*1e-6);
             GLOG("RENDER_DIAG_PW_PREWARM fix=%u variant_recipes=%u variant_modules=%u",unsigned(pwFix),variantRecipes,variantModules); // prewarm-fix
@@ -7684,7 +7760,7 @@ public:
         struct Account {Perf& p;Clock::time_point t;bool on;std::uint64_t k;~Account(){if(on)p.drawNs+=k*nsSince(t);}} account{perf,t0,drawTimed,drawScale};
         if(unlockQueue.pending.load(std::memory_order_acquire))drainUnlocks(); // v86
         const unsigned cseq=census.active?census.seq++:0;
-        const auto refuse=[&](const char* w){if(why)*why=w;++counters.drawRefused;note("draw-refused",w);++v74.refused;++v74.refusals[w];if(ffOn)ffRefused(w,false); // (v579)
+        const auto refuse=[&](const char* w){if(why)*why=w;++counters.drawRefused;note("draw-refused",w);++v74.refused;++v74.refusals[w];
             if(census.active)clog("RENDER_CENSUS X i=%u draw why=%s prim=%u n=%zu/%u",cseq,w,in.primitive,in.indices.size(),in.vertexCount);return false;};
         // v41: no pixel code (a null pixel shader) is allowed: such a draw can only write depth/stencil.
         if((!in.stateBytes && (!in.state || in.state->size()<13860)) || !in.vertexIdentity || !in.vertexConstants || !in.pixelConstants)return refuse("input");
@@ -7694,6 +7770,34 @@ public:
         if(cachesEnabled && !baseResources && volumeBindings.size()>V363BindingCacheLimit)(volumeBindings.clear(),++bindingsGen); // v96 (v71 never trimmed it)
         const auto identityKey=codeKey(*in.vertexIdentity,in.vertexIdentityVersion);
         auto vsHash=identityKey.hash;const auto psHash=in.pixelCode?codeKey(*in.pixelCode,in.pixelVersion).hash:0;
+#if defined(__APPLE__)
+        // (build 221, diagnostic A/B: files/private-trace/ios-phone-skip-restore) the phone chain's restore draw (c537b pass 109,
+        // vs adb76296b385c149 / ps 32f1e56beccdb575: writes the saved scene rectangle back) is not recorded: is the pale band its output?
+        if(phoneSkipRestore && psHash==0x32f1e56beccdb575ull) [[unlikely]] {++phoneRestoreSkips;if(why)*why="phone-restore-skipped";return true;}
+        // (build 222, diagnostic) the phone composite adds ~(0.5,0.5,0.5,0.5) where its texture is zero (c564 census p2: 0.447 -> 0.726,
+        // alpha 0 -> 0.55), like the see-through minimap composite (the Thor: GeneralParams0 c230 = 0.5): their non-zero pixel constants
+        if((psHash==0xe2649e6bc8ee4db8ull || psHash==0xf0ff7fe255dbc811ull) && in.pixelConstants) [[unlikely]] {
+            static unsigned seenPhone=0,seenRadar=0,linesPhone=0,linesRadar=0;
+            const bool ph=psHash==0xe2649e6bc8ee4db8ull;unsigned& seen=ph?seenPhone:seenRadar;unsigned& lines=ph?linesPhone:linesRadar;
+            if((seen++%60)==0 && lines<24) {++lines;
+                std::string o;char b[96];const auto& pc=*in.pixelConstants;const std::size_t regs=std::min<std::size_t>(pc.size()/4,256);
+                for(std::size_t r=192;r<regs;++r) { // (build 223: c192-c255 only; 222's lines stopped at ~c131)
+                    std::uint32_t w[4];bool nz=false;for(unsigned k=0;k<4;++k){w[k]=pc[r*4+k];nz|=w[k]!=0;}
+                    if(!nz)continue;float f[4];std::memcpy(f,w,16);
+                    std::snprintf(b,sizeof b," c%zu=%g,%g,%g,%g",r,double(f[0]),double(f[1]),double(f[2]),double(f[3]));o+=b;if(o.size()>1700)break;
+                }
+                GLOG("RENDER_IOS_COMPOSITE_CONSTS %s n=%u%s",ph?"phone":"radar",seen,o.c_str());
+            }
+        }
+#endif
+        if(psHash==0xab2d822723ef610cull) [[unlikely]] { // ios-h2-loop (Claude 2026-10-20; measurement only): the reflection mip blur's
+            // nested loop runs trunc(c229.y)^2 samples (DISCOVERIES "H2 refined"); a non-finite or huge c229.y never ends on the GPU
+            static std::uint64_t binds=0,bad=0;static float maxY=0;
+            std::uint32_t w=(*in.pixelConstants)[229*4+1];float y;std::memcpy(&y,&w,4);
+            ++binds;if(std::isfinite(y) && y>maxY)maxY=y;
+            if(!std::isfinite(y) || y>64.f){if(!(bad++%32))GLOG("RENDER_IOS_H2_LOOP_CONST y=%g bits=%08x binds=%llu bad=%llu",double(y),w,(unsigned long long)binds,(unsigned long long)bad);}
+            if(binds==1 || !(binds%4096))GLOG("RENDER_IOS_H2_LOOP binds=%llu bad=%llu max_y=%g",(unsigned long long)binds,(unsigned long long)bad,double(maxY));
+        }
         CodeKey effectiveKey;
         // (v363: the lookups as pointers, nullptr = not in the pack (a shaders value is never null); the v363 front when on)
         const auto findShader=[&](std::uint64_t h)->const PackEntry*{
@@ -7777,7 +7881,7 @@ public:
         const IndexCache::Entry* cachedIndices=nullptr; // v266: the arena copy this draw's indices come from (none: the ring)
         IndexCache::Entry cachedIndexCopy; // v271: entries move in the flat map (an arena eviction below may shift them)
         unsigned vertexCount=in.vertexCount;
-        bool rectList=false;
+        bool rectList=false,fanExpanded=false;
         switch(in.primitive) {
         case 1: s.topology=VK_PRIMITIVE_TOPOLOGY_POINT_LIST;break;
         case 2: s.topology=VK_PRIMITIVE_TOPOLOGY_LINE_LIST;break;
@@ -7808,7 +7912,8 @@ public:
             std::uint32_t l=0,h=0;
             if(in.rawIndices) { // v266
                 const IndexCache::Key key{in.rawIndices,in.rawIndexCount,in.rawIndex32,p};
-                cachedIndices=indexVertexOffset?indexCacheLookup(key):nullptr; // (hits bind with vertexOffset=-lo)
+                const bool fanX=iosFanIndexed && s.topology==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && in.rawIndexCount>=3 && in.rawIndexCount<=64; // (ios-fan-indexed)
+                cachedIndices=indexVertexOffset && !fanX?indexCacheLookup(key):nullptr; // (hits bind with vertexOffset=-lo)
                 if(cachedIndices){cachedIndexCopy=*cachedIndices;cachedIndices=&cachedIndexCopy;} // v271
                 if(cachedIndices){l=cachedIndices->lo;h=cachedIndices->hi;}
                 else {
@@ -7816,7 +7921,7 @@ public:
                     recomp::gpu::hot::bigEndianIndices(in.rawIndices,in.rawIndexCount,in.rawIndex32,rawIndexScratch.data());
                     indices.resize(rawIndexScratch.size());
                     if(!transformIndices(rawIndexScratch.data(),rawIndexScratch.size(),p,indices.data(),l,h))return refuse("empty-indices");
-                    if(indexVertexOffset && l<=0x7FFFFFFFu)cachedIndices=indexCacheStore(key,indices,l,h); // (the ring's vertexOffset form)
+                    if(indexVertexOffset && l<=0x7FFFFFFFu && !fanX)cachedIndices=indexCacheStore(key,indices,l,h); // (the ring's vertexOffset form)
                     if(cachedIndices){cachedIndexCopy=*cachedIndices;cachedIndices=&cachedIndexCopy;} // v271
                 }
             } else {
@@ -7824,6 +7929,16 @@ public:
                 if(!transformIndices(in.indices.data(),in.indices.size(),p,indices.data(),l,h))return refuse("empty-indices");
             }
             lo=l;hi=h;
+            if(iosFanIndexed && s.topology==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !cachedIndices && indices.size()>=3 && indices.size()<=64) { // ios-fan-indexed
+                bool marker=false;for(const auto i:indices)if(i==0xFFFFFFFFu || i==restartIndex){marker=s.restart;if(marker)break;}
+                if(marker)++idxFanRestart;
+                else {
+                    fanScratch.assign(indices.begin(),indices.end());const std::size_t n=fanScratch.size();
+                    indices.resize((n-2)*3);
+                    for(std::size_t j=0;j+2<n;++j){indices[3*j]=fanScratch[j+1];indices[3*j+1]=fanScratch[j+2];indices[3*j+2]=fanScratch[0];}
+                    s.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;s.restart=false;++idxFanExpanded;
+                }
+            }
         } else {
             s.restart=false;indices.clear();
             if(!vertexCount)return refuse("empty-draw");
@@ -8043,7 +8158,7 @@ public:
                 const int endian=r?rvf::endianComposition(r->memory.endian,fetchEndian):0;
                 const char* why=in.inlineVertices || !st.address?"inline":!source.valid || source.reg!=rule->indexRegister || source.component!=rule->indexComponent?"index-register":
                     position==~0u?"no-position":(st.pairSwap && !pairGather) || f.format!=32 || f.feed!=0x688 || f.expAdjust || !st.stride?"fetch-format":
-                    !r?"not-resolved":!r->memory.exact?"inexact":!rvf::float16x4Memory(r->memory.format) || r->memory.layout.log2Bytes!=3 || // (v589: + format 29)
+                    !r?"not-resolved":!r->memory.exact?"inexact":!rvf::float16x4Memory(r->memory.format) || r->memory.layout.log2Bytes!=3 || // (v589: + format 29; iPad 2026-10-22 with v592's MSAA alias)
                     r->image.format!=VK_FORMAT_R16G16B16A16_SFLOAT?"memory-format":endian<0?"endian":nullptr;
                 if(why){++perf.gatherRefused;char b[80];std::snprintf(b,sizeof b,"%s vs=%016llx",why,(unsigned long long)vs.hash);note("vertex-gather-refused",b);continue;}
                 gather.attribute=a;gather.position=position;gather.rule=rule;gather.source=r;gather.key=key;gather.address=st.address;
@@ -8329,15 +8444,16 @@ public:
         // v23: PA_SC_WINDOW_OFFSET (tiled passes). The hardware adds it to vertex window coordinates
         // when PA_SU_SC_MODE_CNTL.vtx_window_offset_enable (bit 16) is set, and to the window scissor
         // unless PA_SC_WINDOW_SCISSOR_TL.window_offset_disable (bit 31) is set.
-        std::int32_t wox=0,woy=0;
+        std::int32_t wox=0,woy=0;bool scissorWindowOffset=false; // (ios-hud-fit: whether the window offset moved the scissor)
         if(in.scissor) {
             const auto& r=*in.scissor;
             wox=static_cast<std::int32_t>(r[0]<<17)>>17;woy=static_cast<std::int32_t>((r[0]>>16)<<17)>>17;
             sx0=r[1]&0x7FFF;sy0=(r[1]>>16)&0x7FFF;sx1=r[2]&0x7FFF;sy1=(r[2]>>16)&0x7FFF;
-            if(!(r[1]>>31)){sx0+=wox;sy0+=woy;sx1+=wox;sy1+=woy;}
+            if(!(r[1]>>31)){sx0+=wox;sy0+=woy;sx1+=wox;sy1+=woy;scissorWindowOffset=true;}
             if(wox || woy){char b[48];std::snprintf(b,sizeof b,"%d,%d",wox,woy);note("window-offset",b);}
         }
         const bool vertexWindowOffset=(reg(state,0x2205)>>16)&1;
+        const std::array<std::int32_t,4> windowScissor{sx0,sy0,sx1,sy1}; // (ios-hud-fit: before the screen scissor, i.e. the tile's bounds)
         const auto screenTl=reg(state,0x200E),screenBr=reg(state,0x200F);
         sx0=std::max<std::int32_t>(sx0,screenTl&0x7FFF);sy0=std::max<std::int32_t>(sy0,(screenTl>>16)&0x7FFF);
         sx1=std::min<std::int32_t>(sx1,screenBr&0x7FFF);sy1=std::min<std::int32_t>(sy1,(screenBr>>16)&0x7FFF);
@@ -8396,11 +8512,17 @@ public:
         if(scaleform){++uiStats.uiDraws;if(psHash==0x545eb7f306ebe941ull)++uiStats.textDraws;}
         // v40 census: slot:format:size:source(r resolved, d decoded, k swizzled fallback, - grey dummy):sign:exp:swizzle:address
         std::string censusTextures;
-        std::array<std::uint32_t,4> wtex{};unsigned wtexN=0; // v587 resolve watch: the texture bases this draw samples (first 4)
         for(const auto* stage:{&vs,&ps}) {
             const bool vertexStage=stage==&vs;
             const bool volumes=usesVolumeHeap(*stage); // v41: its tfetch3D reads 3D textures from set 5
-            for(unsigned r=0;r<HeapSlots;++r)if((stage->samplers>>r)&1) {
+            static_assert(HeapSlots==16);
+            // Shader pack sampler metadata is immutable during a draw. Both arms retain
+            // stage/slot order and the identical body; clear before any body continue.
+            if(samplerSetBits) {
+                for(std::uint32_t pending=stage->samplers & 0xffffu;pending;) {
+                    const unsigned r=std::countr_zero(pending);
+                    pending &= pending-1;
+
                 const unsigned slot=vertexStage?16+r:r;
                 std::optional<std::array<std::uint32_t,6>> fetch=in.fetch?in.fetch(slot):std::nullopt;
                 if(!fetch){std::array<std::uint32_t,6> w{};for(unsigned k=0;k<6;++k)w[k]=field(state,1152+24*slot+4*k);fetch=w;}
@@ -8425,7 +8547,77 @@ public:
                         out+=b;
                     }
                 } censusTexture{*this,*fetch,slot,images[r],censusTextures};
-                if(watchOn && wtexN<4 && ((*fetch)[0]&3)==2)wtex[wtexN++]=physicalAddress((*fetch)[1]&0xfffff000u)|(((*fetch)[0]>>31)?1u:0u); // v587 (bit 0: tiled)
+                if(in.pixelSamples && !vertexStage) { // v56: what this draw's pixel shader samples (diagnostic)
+                    const auto d=((*fetch)[0]&3)==2?XenosTextureDescription::decode(*fetch):std::nullopt;
+                    in.pixelSamples->push_back(d?physicalAddress(d->baseAddress):0u);
+                }
+                if(((*fetch)[0]&3)!=2){note("texture-fetch-not-texture");continue;}
+                if(census.active && census.afTextures.match(vsHash,psHash))afDumpTexture(cseq,slot,*fetch,data); // artifacts-1 (census only)
+                // v74: the heap the fetch's dimension reads (a shader's tfetch2D/Cube/3D follows it) against the image
+                // bound: a mismatch samples the grey/zero dummy of that heap (counted per draw and slot).
+                const auto heapCheck=[&](const Image* im) {
+                    const unsigned dim=((*fetch)[5]>>9)&3u;const bool stacked=((*fetch)[1]&1024u)!=0;
+                    if(!im)return;
+                    if(dim==3){if(!im->cube)++v74.heapCube;}
+                    else if(dim==2){if(!im->volume && !im->array)++v74.heapVolume;}
+                    else if(dim==1 && stacked){if(!im->array && im->layers<2)++v74.heapArray;}
+                    else if(dim==1 && (im->cube || im->volume))++v74.heap2D;
+                };
+                if(cachesEnabled) {
+                    // v24: one verification per fetch per frame. A hit needs the same frame (a
+                    // mid-frame flush starts a new one), no change to the resolved set since, and a
+                    // live view (a failed re-upload leaves the entry empty).
+                    auto& cached=bindingFor(volumes,FetchKey{*fetch}); // v254 (the same entry as the map's operator[])
+                    // v86: also invalid after an unlock over a cached texture (uploadEpoch), and for a Scaleform draw
+                    // when a non-UI draw verified it (sampled words only) this frame.
+                    if(cached.frame==frame && cached.epoch==resolveEpoch && cached.upload==uploadEpoch && (!uiCheck || cached.full) &&
+                       (cached.refused || (cached.image && cached.image->view))) {
+                        images[r]=cached.image;samps[r]=cached.sampler;++perf.bindingHits;heapCheck(images[r]);continue;
+                    }
+                    ++perf.bindingMisses;vkw2BindingMiss(cached,uiCheck); // (vk-worker-2 diagnostic: the miss's reason)
+                    // v363: the binding's memo of texture()'s probes survives its re-verification (v349 resets the whole binding)
+                    V363TexMemo memo=v363FlatMaps?cached.v363:V363TexMemo{};
+                    cached={};
+                    if(const auto* image=textureOrFallback(*fetch,data,volumes,uiCheck,v363FlatMaps?&memo:nullptr)) {
+                        images[r]=image;
+                        if(const auto desc=XenosTextureDescription::decode(*fetch))samps[r]=sampler(*desc,image);
+                        cached={image,samps[r],frame,resolveEpoch,false,uploadEpoch,uiCheck};
+                    } else cached={nullptr,VK_NULL_HANDLE,frame,resolveEpoch,true,uploadEpoch,uiCheck}; // v41: a refusal holds for the frame too
+                    if(v363FlatMaps)cached.v363=memo;
+                    heapCheck(images[r]);
+                    continue;
+                }
+                if(const auto* image=textureOrFallback(*fetch,data,volumes,uiCheck)) {
+                    images[r]=image;
+                    if(const auto desc=XenosTextureDescription::decode(*fetch))samps[r]=sampler(*desc,image);
+                }
+                heapCheck(images[r]);
+                }
+            } else {
+            for(unsigned r=0;r<HeapSlots;++r)if((stage->samplers>>r)&1) {
+                const unsigned slot=vertexStage?16+r:r;
+                std::optional<std::array<std::uint32_t,6>> fetch=in.fetch?in.fetch(slot):std::nullopt;
+                if(!fetch){std::array<std::uint32_t,6> w{};for(unsigned k=0;k<6;++k)w[k]=field(state,1152+24*slot+4*k);fetch=w;}
+                const struct CensusTexture {
+                    Renderer& self;const std::array<std::uint32_t,6>& fetch;unsigned slot;const Image* const& image;std::string& out;
+                    ~CensusTexture() {
+                        if(!self.census.active)return;
+                        const auto d=XenosTextureDescription::decode(fetch);char b[176];
+                        if(!d){std::snprintf(b,sizeof b," s%u:type%u",slot,fetch[0]&3);out+=b;return;}
+                        const bool res=self.resolved.count(physicalAddress(d->baseAddress))!=0;
+                        // v76: + the fetch's mag/min/mip filters (0 point, 1 linear, 2 basemap/keep), clamp modes, and for
+                        // resolved images whether a shadow caster drew the source (sh) and the presents since that resolve.
+                        char extra[48]="";
+                        if(res && image && image->resolvedImage)std::snprintf(extra,sizeof extra,":%sage%llu",image->shadowMap?"sh:":"",
+                            (unsigned long long)(self.counters.presents-image->resolvedAt));
+                        std::snprintf(b,sizeof b," s%u:f%u:%ux%u%s:%c:sg%u%u%u%u:ex%d:sw%u%u%u%u:%08x:mip%u-%u:fl%u%u%u:cl%u%u%u%s",slot,d->format,d->width,d->height,
+                            d->dimension==XenosTextureDescription::Dimension::Cube?"c":d->dimension==XenosTextureDescription::Dimension::ThreeD?"v":"",
+                            res?(image && image->depthWord?'w':'r'):image?(self.isFallback(image)?'k':'d'):'-',d->sign[0],d->sign[1],d->sign[2],d->sign[3],d->exponentBias,
+                            d->swizzle[0],d->swizzle[1],d->swizzle[2],d->swizzle[3],d->baseAddress,d->mipMin,d->mipMax,
+                            (fetch[3]>>19)&3,(fetch[3]>>21)&3,(fetch[3]>>23)&3,d->clamp[0],d->clamp[1],d->clamp[2],extra);
+                        out+=b;
+                    }
+                } censusTexture{*this,*fetch,slot,images[r],censusTextures};
                 if(in.pixelSamples && !vertexStage) { // v56: what this draw's pixel shader samples (diagnostic)
                     const auto d=((*fetch)[0]&3)==2?XenosTextureDescription::decode(*fetch):std::nullopt;
                     in.pixelSamples->push_back(d?physicalAddress(d->baseAddress):0u);
@@ -8472,16 +8664,45 @@ public:
                 }
                 heapCheck(images[r]);
             }
+            }
         }
         const auto tTextures=phaseNow();phaseAdd(perf.textureNs,tVertices,tTextures);
-        if(ffOn)ffDraw(psHash,images); // (v579: the sun pass probe; one branch while off)
         // ---- constants
         const auto constantBytes=4096+4096+512+2*alignment;
         auto base=allocate(constantBytes);
-        const auto vsVertexBytes=[&]{std::size_t n=0;for(unsigned b=0;b<streamCount;++b)if(!sources[b].arena)n+=sources[b].n+alignment;
+        auto vsVertexBytes=[&]{std::size_t n=0;for(unsigned b=0;b<streamCount;++b)if(!sources[b].arena)n+=sources[b].n+alignment;
             if(gathering)n+=vkwGc->size()*4+alignment; // v73
             if(ptxG.active)n+=ptxGatherCoordBytes()+std::size_t{ptxG.count}*32+2*alignment; // v599
             return n+(cachedIndices?0:indices.size()*4)+alignment;}();
+        // Preserve the original ring/flush behavior: expand only when the extra
+        // indices fit this slot after the original draw's complete reservation.
+        const bool originalFanIndexed=indexed;
+        fanCensus.observe(in.primitive,originalFanIndexed,vertexCount);
+        if(fan_indices_candidate::eligible(fan_indices_candidate::StartupPolicy::Enabled,in.primitive,indexed,vertexCount)) {
+            ++smallFanCandidates;
+            if(smallFanPolicy==fan_indices_candidate::StartupPolicy::Enabled || iosFanSmall) { // (ios-fan-small: the same expansion at runtime)
+                const std::size_t count=std::size_t(vertexCount-2)*3,extra=count*sizeof(std::uint32_t);
+                if(base && fan_indices_candidate::fitsRemaining(vsVertexBytes,extra,ring.size,ringOffset)) {
+                    indices.resize(count);
+                    const auto result=fan_indices_candidate::write(fan_indices_candidate::StartupPolicy::Enabled,in.primitive,indexed,vertexCount,indices.data(),indices.size());
+                    if(result.expanded) {
+                        indexed=true;fanExpanded=true;s.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                        vsVertexBytes+=extra;++smallFanExpanded;
+                    } else indices.clear();
+                } else ++smallFanCapacityFallbacks;
+            }
+        }
+        if(fan_large_candidate::eligible(largeFanPolicy,in.primitive,indexed,vertexCount,largeFanLimit)) {
+            const std::size_t count=std::size_t(vertexCount-2)*3,extra=count*sizeof(std::uint32_t);
+            if(base && fan_indices_candidate::fitsRemaining(vsVertexBytes,extra,ring.size,ringOffset)) {
+                indices.resize(count);
+                const auto result=fan_large_candidate::write(largeFanPolicy,in.primitive,indexed,vertexCount,indices.data(),indices.size(),largeFanLimit);
+                if(result.expanded) {
+                    indexed=true;fanExpanded=true;s.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                    vsVertexBytes+=extra;++largeFanExpanded;
+                } else indices.clear();
+            } else ++largeFanCapacityFallbacks;
+        }
         // v96: a frame about to exhaust its descriptor pool flushes like a full ring (v71: the draw was refused).
         const bool poolFull=poolGuard && !baseResources && res.setsUsed+5>5u*MaxSetsPerFrame;
         if(poolFull){++res.poolFlushes;note("descriptor-pool-flush","frame");}
@@ -8626,10 +8847,42 @@ public:
             indexOffset=*at;perf.indices+=indices.size();
         }
         // ---- pass, pipeline, record
-        auto b=bound(state,needHeight,colorMask,wantDepth);
+        const bool depthInert=iosInertDepth && colorMask && !(depthControl&1) && !(depthControl&4) && (!(depthControl&2) || ((depthControl>>4)&7)==7); // ios-inert-depth
+        if(depthInert && wantDepth)++inertDepthDraws;
+        auto b=bound(state,needHeight,colorMask,wantDepth && !depthInert);
+        { // ios-strips (Claude 2026-10-17, diagnostic counters only): does anything consume the depth-restore strips (im#78p)?
+            if(b.t[4] && !b.t[0] && b.t[4]->pitch==640 && b.t[4]->image.height>=2560 && sy1>sy0) { // ios-shadow-skip-band3 (player option)
+                const unsigned band=std::min<unsigned>(3,unsigned(sy0)/640);++shadowBand[band];
+                if(iosShadowSkip3 && sy0>=1920 && sy1<=2560){++shadowSkipped;if(why)*why="ios-shadow-skip-band3";return true;}
+            }
+            if(iosProbeSlice && probeLearned && probeFaceNext<6 && probeFaceNext!=unsigned(frame%6) && b.t[0] && b.t[0]->base==probeBase &&
+               b.t[0]->pitch==probePitch && b.t[0]->xenosFormat==probeFmt){++probeStats.draws;if(why)*why="ios-probe-slice";return true;} // ios-probe-slice (player option)
+            // (Claude 2026-10-21, c398 SIGSEGV) these three skips returned with *why unset; the sync wrappers then handed back null and
+            // captureInline's std::strcmp(why,"inline-indices") (renderer_boundary_trace.cpp, inline draws 0x823BD360) faulted.
+            const bool strip=psHash==0xa67e462d509e7276ull;if(strip)++stripStats.draws;
+            // (Claude 2026-10-18, diagnostic: can the strips share one pass?) the first 50 strip draws: target, rows, viewport, vPos
+            if(strip && stripGeomLogs<50) {++stripGeomLogs;
+                GLOG("RENDER_IOS_STRIP_GEOM n=%u frame=%llu base=%x pitch=%u fmt=%u depth_base=%x scissor=%d,%d-%d,%d wo=%d,%d vtx_wo=%u vp=%.1f,%.1f,%.1f,%.1f screen_space=%u frag_coord=%u",
+                     stripGeomLogs,(unsigned long long)frame,b.t[0]?b.t[0]->base:0xFFFFu,b.t[0]?b.t[0]->pitch:0u,b.t[0]?b.t[0]->xenosFormat:0u,
+                     b.t[4]?b.t[4]->base:0xFFFFu,sx0,sy0,sx1,sy1,wox,woy,unsigned(vertexWindowOffset),xs,xo,ys,yo,unsigned(screenSpace),
+                     unsigned(psInfo && psInfo->fragCoord));}
+            if(strip && iosSkipStripPass){++stripStats.skipped;if(why)*why="ios-skip-strip-pass";return true;} // ios-skip-strip-pass (MEASUREMENT ONLY: no pass, no draw)
+            for(unsigned i=0;i<4;++i)if(b.t[i]){auto* t=const_cast<Target*>(b.t[i]);
+                if(strip){if(t->stripY1<=t->stripY0){t->stripY0=sy0;t->stripY1=sy1;}else{t->stripY0=std::min(t->stripY0,sy0);t->stripY1=std::max(t->stripY1,sy1);}}
+                else if(stripLive(*t,sy0,sy1))++stripStats.laterDraws;}
+            // ios-meas-strip-onepass (Claude 2026-10-18, MEASUREMENT ONLY - wrong picture: the strips' own images are not written):
+            // every strip draws its rows 0-31 (c216 RENDER_IOS_STRIP_GEOM) into ONE scratch target at rows 32k..32k+31 (k = base /
+            // 0x20), depth dropped (ZFUNC ALWAYS, no write): consecutive strips share one pass. Bounds what merging could save.
+            if(strip && iosMeasStripOnePass && b.t[0] && b.t[0]->pitch==1280 && b.t[0]->base<0x300 && !(b.t[0]->base&0x1F)) {
+                const unsigned k=b.t[0]->base/0x20,fmt=b.t[0]->xenosFormat;
+                if(const Target* scratch=target(0xFFF0u,fmt,1280,false,768)) {
+                    b.t[0]=scratch;b.t[4]=nullptr;stripRowOff=std::int32_t(32*k);sy0+=stripRowOff;sy1+=stripRowOff;++stripStats.redirected;
+                    b.height=std::max<unsigned>(b.height,unsigned(sy1));
+                }
+            }
+        }
         s.psVariant|=rsPsVariant(b.k,psInfo); // fsr-modes (0 unless the target is scaled and the shader reads vPos)
         if(!b.count)return refuse("no-render-target");
-        if(ffOn)ffKey(vsHash,psHash,b,std::uint32_t(in.vertexCount)); // v582 (G10): the frame's draw keys (one branch while off)
         if(v338Merge && inPass && !census.active) { // v338
             [[maybe_unused]] const unsigned merged=mergeMaskedSlots(b,state,colorMask,images);
 #if defined(RECOMP_V338_MUTANT_WRITE) // harness mutant: the merged slots written (must differ)
@@ -8662,6 +8915,20 @@ public:
         if(alpha.mode==state::AlphaMode::Threshold && !legacyAlpha && (alpha.func==1 || alpha.func==2 || alpha.func==3 || alpha.func==5)) {
             ++v85.unpatched;char x[32];std::snprintf(x,sizeof x,"func=%u",alpha.func);note("alpha-function-unpatched",x);
         }
+#if defined(__APPLE__)
+        // (Claude 2026-10-23, build 230) phone screen seam: the two screen quads (pass 111) test GREATER against the phone body's
+        // depth, which the body pass wrote UNSHRUNK into the same depth surface (0:17); ios-hud-fit moves the quads (below), so at
+        // guest x ~1033 they meet the body's raised left rim (c588 census: depth 0.000066 vs 0.000065 beside it) and leave a 2-3 px
+        // column of the world showing through the screen. Shrunk, they take ALWAYS (writes kept): in the original layout they lie
+        // over the body's screen glass and pass there. files/private-trace/ios-phone-depth-keep restores the game's test.
+        if(((psHash==0x196a64a9be25a4bfull && vsHash==0xd7dc395a63244641ull) || (psHash==0x325cb5da85796d1bull && vsHash==0x378e2de385dd7e99ull)) &&
+           !phoneDepthKeep && !iosHudPhoneOff && !iosHudFitOff && b.width==1280 && b.height>=720 && b.height<=768 &&
+           (s.depthControl&2) && ((s.depthControl>>4)&7)!=7) [[unlikely]] {
+            const float vx=recomp_ios_visible_x.load(std::memory_order_relaxed),vy=recomp_ios_visible_y.load(std::memory_order_relaxed);
+            const float hx=iosHudFitAniso?vx:std::min(vx,vy),hy=iosHudFitAniso?vy:std::min(vx,vy);
+            if((hx<1.0f || hy<1.0f) && hx>0.25f && hy>0.25f){s.depthControl|=0x70u;++phoneDepthAlways;}
+        }
+#endif
         const auto sets=descriptorSetsV341(images,samps); // (v341b)
         if(!sets[0])return refuse("descriptor-sets");
         const auto p=pipeline(s,vs,ps,b);
@@ -8670,7 +8937,13 @@ public:
             // Sampled images written since the last barrier (a resolve, an upload): the barrier cannot
             // go inside a render pass, so an open pass ends first (never observed: those writes end it).
             bool conflict=false;for(const auto* im:images)conflict=conflict || (im && listed(writtenSince,im->image));
-            if(conflict){endPass(__LINE__);barrier();}
+            if(conflict) {
+                if(inPass && preBarrierImages.size()<512) { // ios-prebarrier: remember what split this pass
+                    auto& v=preBarrierImages[passKey];++preStats.splits;
+                    for(const auto* im:images)if(im && listed(writtenSince,im->image) && v.size()<8 && std::find(v.begin(),v.end(),im->image)==v.end())v.push_back(im->image);
+                }
+                endPass(__LINE__);barrier();
+            }
             for(const auto* im:images)if(im && !listed(readSince,im->image))readSince.insert(im->image);
         }
         if(gathering && v382Reuse && !(v382Prev.valid && v382Prev.image==gather.source->image.image
@@ -8693,6 +8966,7 @@ public:
             if(v382GatherHoist)v382Keep(gather.source->image.image,gatherOut,vertexCount,gather.flags); // v382: the output other draws may bind
         } else if(gathering){++v382Stats.reused;++perf.gatherDraws;perf.gatherVertices+=vertexCount;} // v382: no dispatch, no barrier
         if(ptxG.active && !ptxGatherRecord())return refuse("ptx-gather"); // v599 (before the pass: the dispatches end it)
+        setAreaHint(sx0,sy0,sx1,sy1); // ios-render-area: the draw's scissor (its fragments stay inside)
         if(!ensurePass(b))return refuse("render-pass");
         if(v382Open && perf.passes==v382Passes)++v382Stats.breaksAvoided; // v382: the open pass continues (the old path ended it here)
         if(passTargets[4] && ((depthControl&1) || (depthControl&6)==6) && !depthWriteAhead(b))return refuse("render-pass"); // v293
@@ -8707,6 +8981,7 @@ public:
         // layout and the dynamic-state list, and bindings survive render pass changes).
         const bool v340Pipe=v339ZeroDraws && v340SkipPipe && recorded.pipeline && v340PipePass==passKey; // (v340 measurement)
         if(p!=recorded.pipeline && !v340Pipe){vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,p);recorded.pipeline=p;v340PipePass=passKey;}else ++perf.stateSkips;
+        const bool dlSetsDiff=sets!=recorded.sets; // (ios-drawlog: did this draw change the texture/sampler sets)
         const bool v340Other=v339ZeroDraws && v340SkipOther && recorded.sets[0]; // (v340 measurement)
         if(sets!=recorded.sets && !v340Other && !v341bBaseline) { // v341b: only the changed sets, one call per run of them
             for(unsigned s=0;s<4;) {
@@ -8727,10 +9002,14 @@ public:
                 // v311 (diagnostic measurement): the 16 KB-range set while diag-v311-ubo-big exists and both banks' offsets leave room in the ring
         const bool big=uboBig && constantSetBig && VkDeviceSize(vsBind)+16384<=ring.size && VkDeviceSize(psBind)+16384<=ring.size;
         const VkDescriptorSet cset=big?constantSetBig:constantSet;
+        const bool dlConstDiff=cset!=recorded.constantSet || dynamic!=recorded.dynamic; // (ios-drawlog: did this draw change its constants)
+        const bool tileKeep=iosTileNoConst && recorded.constantSet==cset && dynamic[0]==recorded.dynamic[0] && dynamic[1]==recorded.dynamic[1] &&
+            passTargets[0] && passTargets[4] && passTargets[0]->image.format==VK_FORMAT_R16G16B16A16_SFLOAT &&
+            (indexed?(cachedIndices?cachedIndices->count:std::uint32_t(indices.size())):vertexCount)<=6; // (ios-tile-noconst: measurement)
 #if defined(RECOMP_V291_MUTANT_SET_ONLY) // harness mutant: the dynamic offsets ignored (must differ)
         if(v291Baseline || cset!=recorded.constantSet) {
 #else
-        if(!(v339ZeroDraws && v340SkipConst && recorded.constantSet) && (v291Baseline || cset!=recorded.constantSet || dynamic!=recorded.dynamic)) { // (v340)
+        if(!tileKeep && !((v339ZeroDraws || iosOneTri) && v340SkipConst && recorded.constantSet) && (v291Baseline || cset!=recorded.constantSet || dynamic!=recorded.dynamic)) { // (v340; ios-one-tri, ios-tile-noconst: measurement)
 #endif
             vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,4,1,&cset,3,dynamic.data());
             recorded.constantSet=cset;recorded.dynamic=dynamic;++perf.constBinds;++(big?v311BigBinds:v311SmallBinds);
@@ -8752,7 +9031,93 @@ public:
         VkViewport viewport=screenSpace?VkViewport{0,0,ScreenSpaceExtent,ScreenSpaceExtent,0,1} // v157: NDC made in the shader
                                        :VkViewport{xo-xs,yo+ys,2*xs,-2*ys,zo,zo+zs};
         if(vertexWindowOffset){viewport.x+=float(wox);viewport.y+=float(woy);}
+        if(stripRowOff){viewport.y+=float(stripRowOff);stripRowOff=0;} // ios-meas-strip-onepass (measurement only)
         if(viewport.width<0){viewport.x+=viewport.width;viewport.width=-viewport.width;}
+#if defined(__APPLE__)
+        if(scaleform) { // (ios-hud-fit: the pass sizes Scaleform draws into, logged per window)
+            const std::uint32_t key=(passWidth<<16)|(passHeight&0xFFFFu);
+            for(auto& e:hudSizes){if(e.first==key || !e.second){e.first=key;++e.second;break;}}
+        }
+        // (the HUD pass is 1280x768 on this title: an EDRAM surface padded past the picture's 720 rows, c362 RENDER_IOS_HUD_SIZES;
+        // 560x512 and 320x256 are offscreen Scaleform targets and stay as they are)
+        if(!scaleform && passWidth==1280) { // (ios-hud-fit diagnosis: draws scissored inside the radar's corner, picture rows by the window offset)
+            const std::int32_t px0=sx0-(scissorWindowOffset?wox:0),py0=sy0-(scissorWindowOffset?woy:0),px1=sx1-(scissorWindowOffset?wox:0),py1=sy1-(scissorWindowOffset?woy:0);
+            if(px0>=0 && px1<=360 && py0>=480 && py1<=720 && px1>px0 && py1>py0){auto& o=hudCorner[(psHash&~0xFFFFull)|(passHeight&0xFFFFu)];++o;}
+        }
+        if(!scaleform && passWidth==1280 && passHeight>=720 && passHeight<=768) { // (build 208: shaders new after the first minute)
+            auto [it,fresh]=hudSeenPs.try_emplace(psHash,frame);
+            if(fresh && frame>1800)++hudNewPs[psHash];else if(!fresh && it->second>1800 && hudNewPs.count(psHash))++hudNewPs[psHash];
+        }
+        if(passWidth==560 && passHeight==512) { // (build 208: the radar target's draws: blend word, colour control)
+            auto& o=radarPs[psHash];++o[0];o[1]=std::uint32_t(s.blend[0])^(std::uint32_t(colorControl)<<16);
+        }
+        if(passWidth==1280 && passHeight>=720 && passHeight<=768) { // (ios-hud-fit diagnosis)
+            if(passKey!=hudPassKey){hudPassKey=passKey;hudPassSawUi=false;}
+            if(scaleform)hudPassSawUi=true;
+            else {auto& o=hudOthers[psHash];++o[0];if(sx0<=0 && sy0<=0 && sx1>=1280 && sy1>=720)++o[1];if(hudPassSawUi)++o[2];}
+        }
+        // (the radar's map is not a Scaleform draw: c367/c368 showed it at full size beside its shrunk frame; a67e462d509e7276 was
+        // not it (c368). c369 RENDER_IOS_HUD_CORNER: the one non-Scaleform draw scissored inside the radar's corner of the picture is
+        // pixel shader f0ff7fe255db.... (one per frame, the HUD pass): the map's composite from its offscreen radar target.)
+        const bool hudRadarMap=(psHash>>16)==0xf0ff7fe255dbull;
+        if(hudRadarMap && passWidth==1280){radarCompBlend=std::uint32_t(s.blend[0]);radarCompCc=std::uint32_t(colorControl);++radarCompN;} // (build 208)
+        const bool hudA67e=psHash==0xa67e462d509e7276ull && passWidth==1280 && passHeight>=720 && passHeight<=768; // (build 207)
+        if(hudA67e) {
+            const float ox=float(vertexWindowOffset?wox:0),oy=float(vertexWindowOffset?woy:0);
+            hudA67eVp={std::min(hudA67eVp[0],viewport.x-ox),std::min(hudA67eVp[1],viewport.y-oy),std::max(hudA67eVp[2],viewport.x+viewport.width-ox),
+                       std::max(hudA67eVp[3],viewport.y+viewport.height-oy)};
+            const std::int32_t sox=scissorWindowOffset?wox:0,soy=scissorWindowOffset?woy:0;
+            hudA67eSc={std::min(hudA67eSc[0],sx0-sox),std::min(hudA67eSc[1],sy0-soy),std::max(hudA67eSc[2],sx1-sox),std::max(hudA67eSc[3],sy1-soy)};++hudA67eN;
+        }
+        const int hudPhone=(passWidth==1280 && passHeight>=720 && passHeight<=768)?
+            (psHash==0x1a1a1450f4c4fa2bull?0:psHash==0xb5862f8ab1abc15eull?1:psHash==0x8598fc008dd0f742ull?2:-1):-1; // (build 209)
+        if(hudPhone>=0) {
+            const float ox=float(vertexWindowOffset?wox:0),oy=float(vertexWindowOffset?woy:0);auto& e=hudPhoneVp[unsigned(hudPhone)];
+            if(!hudPhoneN[unsigned(hudPhone)]++)e={1e9f,1e9f,-1e9f,-1e9f};
+            e={std::min(e[0],viewport.x-ox),std::min(e[1],viewport.y-oy),std::max(e[2],viewport.x+viewport.width-ox),std::max(e[3],viewport.y+viewport.height-oy)};
+        }
+        // (build 213) c537b: the 33 draws a frame of vs fd681455cc965f20 / ps 0ba12f55e63824d9 in a full-frame HDR pass (format 97, pass 68
+        // of 94, 43 draws) appear only while the phone is up: hypothesis, the 3D phone itself. Shrunk with the HUD (same factor, same
+        // centre) unless files/private-trace/ios-hud-fit-phone-off; RENDER_IOS_HUD_PHONE3D logs their count and pre-shrink extent.
+        // (build 214: c551d falsified it -- n~1,000 a window in every window, not phone-only; the shrink is removed, the log kept)
+        const bool hudPhone3d=vsHash==0xfd681455cc965f20ull && passWidth==1280 && passHeight>=720 && passHeight<=768;
+        if(hudPhone3d){const float ox=float(vertexWindowOffset?wox:0),oy=float(vertexWindowOffset?woy:0);
+            if(!hudPhone3dN++)hudPhone3dVp={1e9f,1e9f,-1e9f,-1e9f};
+            hudPhone3dVp={std::min(hudPhone3dVp[0],viewport.x-ox),std::min(hudPhone3dVp[1],viewport.y-oy),std::max(hudPhone3dVp[2],viewport.x+viewport.width-ox),std::max(hudPhone3dVp[3],viewport.y+viewport.height-oy)};}
+        // (build 217) the on-screen phone: the game draws it into its own rectangle (928,384)-(1280,720) on the 8888 alias of the HDR
+        // scene, resolves it and composites it with vs c36784e64b1463e2 / ps e2649e6bc8ee4db8 (c537b frame 2822 passes 107-110;
+        // DISCOVERIES 21:10). The fill crop cut it at the right edge; the composite (the radar composite's vertex shader, whose shrink
+        // is right) shrinks with the HUD unless files/private-trace/ios-hud-fit-phone-off.
+        // (build 219) c558b shot-174: with the composite shrunk the body moved in but the screen stayed cut: the screen is drawn
+        // straight into the HDR scene after the composite by two quads (c537b pass 111: vs d7dc395a63244641 / ps 196a64a9be25a4bf and
+        // vs 378e2de385dd7e99 / ps 325cb5da85796d1b, 6 indices each, only in the 7 phone frames of 20), shrunk with it.
+        const bool hudPhoneComposite=(psHash==0xe2649e6bc8ee4db8ull && vsHash==0xc36784e64b1463e2ull) ||
+            (psHash==0x196a64a9be25a4bfull && vsHash==0xd7dc395a63244641ull) || (psHash==0x325cb5da85796d1bull && vsHash==0x378e2de385dd7e99ull);
+        if(hudPhoneComposite && passWidth==1280)++hudPhoneCompN;
+#ifndef RECOMP_THOR_EDITION // (ios-duo: a Thor build's phone signal is its PhoneTracker - recomp::phonecall Up; qolPhoneSeen is the iPad text's)
+        if((psHash==0x196a64a9be25a4bfull && vsHash==0xd7dc395a63244641ull) || (psHash==0x325cb5da85796d1bull && vsHash==0x378e2de385dd7e99ull))
+            qolPhoneSeen=true; // (v717 / iPad 239: the phone pad's signal; qolPhoneFrame counts it once a present)
+#endif
+        const std::int32_t mtSx0=sx0,mtSy0=sy0,mtSx1=sx1,mtSy1=sy1; // (iPad 231, ios-qol: the scissor as the game set it, before ios-hud-fit shrinks it: map_tap.h matches it exactly)
+        if((scaleform || hudRadarMap || (hudPhoneComposite && !iosHudPhoneOff)) && passWidth==1280 && passHeight>=720 && passHeight<=768 && !iosHudFitOff) { // ios-hud-fit
+            const float vx=recomp_ios_visible_x.load(std::memory_order_relaxed),vy=recomp_ios_visible_y.load(std::memory_order_relaxed);
+            const float hx=iosHudFitAniso?vx:std::min(vx,vy),hy=iosHudFitAniso?vy:std::min(vx,vy); // (build 208: uniform, the HUD keeps its shape)
+            if((hx<1.0f || hy<1.0f) && hx>0.25f && hy>0.25f) {
+                // The picture's centre (640,360) in this draw's pass coordinates: the frame is drawn in EDRAM tiles (c365: rows 0-384
+                // and 384-720, each pass offset by PA_SC_WINDOW_OFFSET), so the viewport's centre carries the window offset when
+                // the vertices get it, and the scissor's when the window scissor gets it. The window scissor is shrunk, then
+                // clipped to the tile (the screen scissor) unshrunk, so no seam opens at a tile edge.
+                const float cxv=640.0f+float(vertexWindowOffset?wox:0),cyv=360.0f+float(vertexWindowOffset?woy:0);
+                const float cxs=640.0f+float(scissorWindowOffset?wox:0),cys=360.0f+float(scissorWindowOffset?woy:0);
+                viewport.x=cxv+(viewport.x-cxv)*hx;viewport.width*=hx;viewport.y=cyv+(viewport.y-cyv)*hy;viewport.height*=hy;
+                sx0=std::max<std::int32_t>(std::int32_t(std::floor(cxs+float(windowScissor[0]-cxs)*hx)),screenTl&0x7FFF);
+                sy0=std::max<std::int32_t>(std::int32_t(std::floor(cys+float(windowScissor[1]-cys)*hy)),(screenTl>>16)&0x7FFF);
+                sx1=std::min<std::int32_t>(std::int32_t(std::ceil(cxs+float(windowScissor[2]-cxs)*hx)),screenBr&0x7FFF);
+                sy1=std::min<std::int32_t>(std::int32_t(std::ceil(cys+float(windowScissor[3]-cys)*hy)),(screenBr>>16)&0x7FFF);
+                ++hudFitDraws;
+            }
+        }
+#endif
         viewport.minDepth=std::clamp(viewport.minDepth,0.0f,1.0f);viewport.maxDepth=std::clamp(viewport.maxDepth,0.0f,1.0f);
         if(!recorded.haveViewport || std::memcmp(&viewport,&recorded.viewport,sizeof viewport)) {
             rsSetViewport(cmd,&viewport,in,state);recorded.viewport=viewport;recorded.haveViewport=true; // (fsr-modes: vkCmdSetViewport; host pixels on a scaled pass)
@@ -8767,6 +9132,12 @@ public:
 #ifdef RECOMP_THOR_EDITION
         { // thor-maptap (v658; v659: every draw; v661: + the full map, the pause blur, the tonemap): what this frame drew, for the map-tap macro
             namespace mt=recomp::gpu::maptap;
+#if defined(RECOMP_DUO_EDITION)
+            // ios-duo: the marks from the scissor as the game set it, before ios-hud-fit's shrink (the Duo's full screen fills by crop and
+            // shrinks the HUD), clamped as above: the iPad's own hook does the same (mapTapDrawSeen, RECOMP_TOUCH_MAPTAP builds)
+            const std::int32_t x0=std::clamp<std::int32_t>(mtSx0,0,std::int32_t(passWidth)),y0=std::clamp<std::int32_t>(mtSy0,0,std::int32_t(passHeight));
+            const std::int32_t x1=std::clamp<std::int32_t>(mtSx1,x0,std::int32_t(passWidth)),y1=std::clamp<std::int32_t>(mtSy1,y0,std::int32_t(passHeight));
+#endif
             const unsigned seen=(mt::tabScissor(x0,y0,x1,y1,passWidth)?mt::SeenTab:0u)| // (v698 from v703: +-4, no exact x0)
                                 (x0==1 && mt::fullScissor(x0,y0,x1,y1,passWidth)?mt::SeenFull:0u)|(psHash==mt::BlurPs?mt::SeenBlur:0u)|
                                 (psHash==mt::TonemapPs?mt::SeenPost:0u);
@@ -8777,8 +9148,19 @@ public:
             }
         }
 #endif /* RECOMP_THOR_EDITION */
+#if defined(RECOMP_TOUCH_MAPTAP)
+        { // qol-touch (v700) / iPad 231: the frame's map-tap marks from the UNSHRUNK scissor (clamped as above), out of line
+            const std::int32_t mx0=std::clamp<std::int32_t>(mtSx0,0,std::int32_t(passWidth)),my0=std::clamp<std::int32_t>(mtSy0,0,std::int32_t(passHeight));
+            mapTapDrawSeen(mx0,my0,std::clamp<std::int32_t>(mtSx1,mx0,std::int32_t(passWidth)),std::clamp<std::int32_t>(mtSy1,my0,std::int32_t(passHeight)),passWidth,psHash,in);
+        }
+#endif /* RECOMP_TOUCH_MAPTAP */
         if(x1<=x0 || y1<=y0)++v74.scissorEmpty; // v74: recorded, but can write nothing
-        for(const auto* t:passTargets)noteWrite(t,x0,y0,x1,y1); // v583: the pixels this draw can write (its scissor)
+        // (Claude 2026-10-22, build 201) the same pass and the same rectangle as the previous draw add nothing to the union: skip
+        // the per-target loop (exact; writeClock rises at every pass start, so a new pass always notes its first draw)
+        if(noteCacheOff.load(std::memory_order_relaxed) || writeClock!=noteCache.clock || x0!=noteCache.x0 || y0!=noteCache.y0 || x1!=noteCache.x1 || y1!=noteCache.y1) {
+            for(const auto* t:passTargets)noteWrite(t,x0,y0,x1,y1); // v583: the pixels this draw can write (its scissor)
+            noteCache={writeClock,x0,y0,x1,y1};
+        }
         if(!recorded.haveScissor || std::memcmp(&scissor,&recorded.scissor,sizeof scissor)) {
             rsSetScissor(cmd,&scissor,in,state);recorded.scissor=scissor;recorded.haveScissor=true; // (fsr-modes: vkCmdSetScissor; host pixels on a scaled pass)
         } else ++perf.stateSkips;
@@ -8816,7 +9198,7 @@ public:
             firstIndex=std::uint32_t(indexOffset/4);
 #endif
             ++v341.firstIndexDraws;
-            vkCmdDrawIndexed(cmd,v339ZeroDraws?0u:cachedIndices?cachedIndices->count:std::uint32_t(indices.size()),1,firstIndex,vertexOffset,0);
+            vkCmdDrawIndexed(cmd,v339ZeroDraws?0u:oneTri(cachedIndices?cachedIndices->count:std::uint32_t(indices.size())),1,firstIndex,vertexOffset,0);
         } else if(indexed) {
             #if defined(RECOMP_V291_MUTANT_BUFFER_ONLY)
             if(v291Baseline || indexBuffer!=recorded.indexBuffer) {
@@ -8826,8 +9208,14 @@ public:
                 vkCmdBindIndexBuffer(cmd,indexBuffer,indexOffset,VK_INDEX_TYPE_UINT32);
                 recorded.indexBuffer=indexBuffer;recorded.indexOffset=indexOffset;++perf.indexBinds;
             } else ++perf.indexBindSkips;
-            vkCmdDrawIndexed(cmd,v339ZeroDraws?0u:cachedIndices?cachedIndices->count:std::uint32_t(indices.size()),1,0,vertexOffset,0); // (v123: vertexOffset; v339)
-        } else vkCmdDraw(cmd,v339ZeroDraws?0u:vertexCount,1,0,0);
+            vkCmdDrawIndexed(cmd,v339ZeroDraws?0u:oneTri(cachedIndices?cachedIndices->count:std::uint32_t(indices.size())),1,0,vertexOffset,0); // (v123: vertexOffset; v339)
+        } else vkCmdDraw(cmd,v339ZeroDraws?0u:oneTri(vertexCount),1,0,0);
+        if(!v339ZeroDraws)fanCensus.submit(in.primitive,originalFanIndexed,vertexCount);
+        if(iosDrawLog)if(auto& dl=slots[slotIndex];dl.passProfiled && passProfileOpen && !dl.passInfo.empty() && (iosDrawLogAll || dl.passInfo.back().formats[0]==int(VK_FORMAT_R16G16B16A16_SFLOAT)))
+            GLOG("RENDER_IOS_DRAWLOG f=%llu pass=%zu vs=%016llx ps=%016llx n=%u prim=%u blend=%x cc=%x dc=%x sd=%u cd=%u vb=%u pb=%u",(unsigned long long)frame,dl.passInfo.size()-1,
+                 (unsigned long long)vsHash,(unsigned long long)psHash,cachedIndices?cachedIndices->count:indices.empty()?vertexCount:std::uint32_t(indices.size()),
+                 unsigned(in.primitive),unsigned(s.blend[0]),unsigned(colorControl),unsigned(depthControl),unsigned(dlSetsDiff),unsigned(dlConstDiff),
+                 unsigned(dynamic[0]),unsigned(dynamic[1])); // ios-drawlog (sd/cd: sets / constants changed by this draw; vb/pb: bank offsets)
         ocqDrawEnd(); // occlusion package: and ends (nothing when no query began)
         // v115: the draw writes its pass's surfaces now. A resolve reads the newest writer among the surfaces sharing its
         // EDRAM base and pitch (Target::written); with only the pass-begin stamp, an alias clear issued inside the pass
@@ -8835,125 +9223,25 @@ public:
         // rectangle on 720:0 stamped the HUD surface 720:3, and the phone's resolve then read 720:3 (its pending zero
         // clear) instead of the phone just drawn. Census frames end the pass after every draw, so the phone showed there.
         // files/private-trace/diag-generic-no-draw-stamp restores v114.
-        if(drawStamp && inPass){++writeClock;for(const auto* t:passTargets)if(t)const_cast<Target*>(t)->written=writeClock;++drawStamps;}
+        if(drawStamp && inPass){++writeClock;for(const auto* t:passTargets)if(t){auto* w=const_cast<Target*>(t);w->written=writeClock;if(w->stampSite!=4){w->stampPrev=w->stampSite;w->stampSite=4;}}++drawStamps;}
         ++counters.draws;++perf.draws;++v74.draws;++chunkWork;
+        if(!scaleform && passWidth==1280 && passHeight>=720 && sx0<=0 && sy0<=0 && sx1>=1280 && sy1>=720 &&
+           (indexed?(cachedIndices?cachedIndices->count:std::uint32_t(indices.size())):vertexCount)<=6)iosLastFullPs=psHash; // (ios-notonemap)
         if(const auto* pf=post::postfxShader(psHash)) { // v79: RENDER_POSTFX (first draw, then at most once per 300 frames)
             const auto k=std::size_t(pf-post::PostfxShaders);
             if(!postfxDraws[k]++ || frame>=postfxLogged[k]+300) {
                 postfxLogged[k]=frame;
                 GLOG("RENDER_POSTFX name=%s draws=%llu frame=%llu%s",pf->name,(unsigned long long)postfxDraws[k],(unsigned long long)frame,
-                     post::postfxConstants(RECOMP_PLAY_WHILE_LOUD(pf),*in.pixelConstants).c_str()); // play-config-2: in the play build the constants are not formatted while the line is muted (56 float conversions per frame for the tonemap; play_log.h playWhileLoud)
+                     post::postfxConstants(pf,*in.pixelConstants).c_str());
             fgbTonemap(psHash,in);} // fg-burst (lane B, stage 1a): the tonemap draw's c8-c15 / c130 while diag-fg-burst is armed (out of line; a test of one flag otherwise)
         }
         // v76 shadow counters (a flag per bound image; the caster mark is per bound target).
         bool samplesShadow=false,staleShadow=false;
         for(const auto* im:images)if(im && im->shadowMap){samplesShadow=true;staleShadow=staleShadow || im->resolvedAt!=counters.presents;}
-        if(samplesShadow){++perf.shadowSampleDraws;if(staleShadow)++perf.staleShadowSamples;if(ffOn)ffShadowDraw(psHash,in,images);} // (fixer2: frame facts)
+        if(samplesShadow){++perf.shadowSampleDraws;if(staleShadow)++perf.staleShadowSamples;}
         if(gradient) {
             ++perf.casterDraws;if(!gradientFix)++perf.casterOriginal;
             for(const auto* t:b.t)if(t)const_cast<Target*>(t)->casterPresent=counters.presents;
-        }
-        // v584 (fixer3, G1 / G10, DIAGNOSTIC): fixer2's census SKO check as a lambda: full (census frames: every vertex, the SKO / SKOV
-        // lines as before) or a per-frame scan while diag-frame-facts is armed (at most ~64 vertices per skinned draw, evenly spaced;
-        // logged only when one lies > 10 m from the draw's median skinned position or is NaN: RENDER_FRAME_SKO + one SKOV, 8 per frame).
-        const auto skoScan=[&](bool full) {
-            const unsigned step=full?1u:std::max(1u,(hi-lo+1)/64u);
-            if(!rectList) {
-                const Attribute* kIdx=nullptr;const Attribute* kW=nullptr;const Attribute* kPos=nullptr;
-                for(const auto& at:s.attributes) {
-                    if(at.usage==2 && !kIdx)kIdx=&at;else if(at.usage==1 && !kW)kW=&at;else if(at.usage==0 && !kPos)kPos=&at;
-                }
-                if(kIdx && kW && kPos) {
-                    struct SkoTimer {std::uint64_t* acc;Clock::time_point t;~SkoTimer(){if(acc)*acc+=nsSince(t);}} skoTimer{full?nullptr:&ffSkoNs,full?Clock::time_point{}:Clock::now()}; // v584: the scan's cost
-                    const auto fedAt=[&](const Attribute* at,unsigned v,std::array<float,4>& out)->bool {
-                        out={0,0,0,0};
-                        if(!at || v<lo || at->binding>=streamCount)return false;
-                        const auto& src=sources[at->binding];
-                        if(at->convert) {
-                            const std::size_t off=std::size_t{v-lo}*16;if(!src.data || off+16>src.n)return false;
-                            if(at->format==VK_FORMAT_R32G32B32A32_UINT){std::uint32_t u[4];std::memcpy(u,src.data+off,16);for(unsigned k=0;k<4;++k)out[k]=float(u[k]);}
-                            else std::memcpy(out.data(),src.data+off,16);
-                            return true;
-                        }
-                        const std::size_t off=std::size_t{v-lo}*streamArray[at->binding].stride+at->offset;
-                        if(!src.data || off+4>src.take)return false;
-                        std::array<std::uint8_t,16> tb{};swapCopy(tb.data(),src.data+off,std::min<std::size_t>(16,src.take-off),16,src.endian);
-                        VFetch f=at->fetch;if(at->uintInput){f.isInteger=true;f.isSigned=false;}
-                        out=decodeAttribute(tb.data(),f);return true;
-                    };
-                    const auto& vc=*in.vertexConstants;
-                    const auto row=[&](int r,unsigned c)->float{return r<0 || r>=192?0.0f:regFloat(vc[(64+unsigned(r))*4+c]);};
-                    struct SV {unsigned v;std::array<float,3> p;std::array<int,4> a0;std::array<float,4> w,idx;};
-                    std::vector<SV> sk;unsigned wsumBad=0,unreadable=0;
-                    for(unsigned v=lo;v<=hi && v-lo<4096u;v+=step) {
-                        std::array<float,4> fi{},fw{},fp{};
-                        if(!fedAt(kIdx,v,fi) || !fedAt(kW,v,fw) || !fedAt(kPos,v,fp)){++unreadable;continue;}
-                        SV o{};o.v=v;o.w=fw;o.idx=fi;
-                        const float wsum=fw[0]+fw[1]+fw[2]+fw[3];if(std::fabs(wsum-1.0f)>0.02f)++wsumBad;
-                        for(unsigned k=0;k<4;++k) {
-                            const float t=std::floor((fi[k]>1.5f?fi[k]*3.0f:fi[k]*255.002f*3.0f)+0.5f);
-                            o.a0[k]=std::isnan(t)?0:int(std::clamp(t,-256.0f,255.0f));
-                            for(unsigned j=0;j<3;++j) {
-                                const int r=o.a0[k]+int(j);
-                                o.p[j]+=fw[k]*(row(r,0)*fp[0]+row(r,1)*fp[1]+row(r,2)*fp[2]+row(r,3));
-                            }
-                        }
-                        sk.push_back(o);
-                    }
-                    if(!sk.empty()) {
-                        std::array<float,3> med{};
-                        for(unsigned j=0;j<3;++j){std::vector<float> c;c.reserve(sk.size());for(const auto& o:sk)c.push_back(o.p[j]);std::nth_element(c.begin(),c.begin()+c.size()/2,c.end());med[j]=c[c.size()/2];}
-                        const auto dist=[&](const SV& o){float d=0;for(unsigned j=0;j<3;++j)d+=(o.p[j]-med[j])*(o.p[j]-med[j]);return std::sqrt(d);};
-                        unsigned far=0;float maxd=0;std::vector<std::pair<float,std::size_t>> worst;
-                        std::vector<int> badBones;
-                        for(std::size_t n=0;n<sk.size();++n) {
-                            const float d=dist(sk[n]);if(!(d<=3.0f))++far;if(d>maxd || std::isnan(d))maxd=std::isnan(d)?INFINITY:std::max(maxd,d);
-                            if(!(d<=3.0f))worst.push_back({std::isnan(d)?INFINITY:d,n});
-                            for(unsigned k=0;k<4;++k)if(sk[n].w[k]!=0.0f) {
-                                const int b=sk[n].a0[k];
-                                if(std::find(badBones.begin(),badBones.end(),b)!=badBones.end())continue;
-                                for(unsigned j=0;j<3;++j) {
-                                    const float l=std::sqrt(row(b+int(j),0)*row(b+int(j),0)+row(b+int(j),1)*row(b+int(j),1)+row(b+int(j),2)*row(b+int(j),2));
-                                    if(!(std::fabs(l-1.0f)<=0.05f)){badBones.push_back(b);break;}
-                                }
-                            }
-                        }
-                        std::string bb;for(std::size_t n=0;n<badBones.size() && n<12;++n){char b[16];std::snprintf(b,sizeof b,"%s%d",n?",":"",badBones[n]);bb+=b;}
-                        if(!full) { // v584: the per-frame scan logs a draw only when a sampled vertex left the body by > 10 m (or is NaN)
-                            if(!(maxd>10.0f))return;
-                            ++ffCur.skoBad;++ffSkoWinBad;
-                            // v595 (fold-fixer3): one line pair per vertex shader per 60-present window, at most 4 shaders; the rest only
-                            // in the window's RENDER_FRAME_SKO_SUM (v584-v594 logged up to 8 per FRAME: ~50 lines/s on the Fold, mostly the
-                            // vehicle shaders' rigid branch (idx.x*c249.w > c250.z skips skinning; the CPU model does not take that branch).
-                            if(std::find(ffSkoWinVs.begin(),ffSkoWinVs.begin()+ffSkoWinVsN,vsHash)!=ffSkoWinVs.begin()+ffSkoWinVsN)return;
-                            if(ffSkoWinVsN>=ffSkoWinVs.size()){++ffSkoWinMuted;return;}
-                            ffSkoWinVs[ffSkoWinVsN++]=vsHash;if(ffSkoLines>=8)return;++ffSkoLines;
-                            GLOG("RENDER_FRAME_SKO p=%llu vs=%016llx ps=%016llx verts=%zu step=%u far3m=%u maxd=%.3g median=%.3f,%.3f,%.3f wsum_bad=%u bad_rows=%zu[%s]",
-                                 (unsigned long long)counters.presents,(unsigned long long)vsHash,(unsigned long long)psHash,sk.size(),step,far,double(maxd),
-                                 double(med[0]),double(med[1]),double(med[2]),wsumBad,badBones.size(),bb.c_str());
-                        } else
-                        clog("RENDER_CENSUS SKO i=%u vs=%016llx verts=%zu unreadable=%u far3m=%u maxd=%.3g median=%.3f,%.3f,%.3f wsum_bad=%u bad_rows=%zu[%s]",
-                             cseq,(unsigned long long)vsHash,sk.size(),unreadable,far,double(maxd),double(med[0]),double(med[1]),double(med[2]),wsumBad,badBones.size(),bb.c_str());
-                        std::sort(worst.begin(),worst.end(),[](const auto& a,const auto& b){return a.first>b.first;});
-                        for(std::size_t n=0;n<worst.size() && n<3;++n) {
-                            const auto& o=sk[worst[n].second];std::string rows;
-                            for(unsigned k=0;k<4;++k)if(o.w[k]!=0.0f)for(unsigned j=0;j<3;++j){const int r=o.a0[k]+int(j);char b[96];
-                                std::snprintf(b,sizeof b," r%d=%.4g,%.4g,%.4g,%.4g",r,double(row(r,0)),double(row(r,1)),double(row(r,2)),double(row(r,3)));rows+=b;}
-                            if(!full){GLOG("RENDER_FRAME_SKOV p=%llu v=%u d=%.3g skinned=%.3f,%.3f,%.3f idx=%g,%g,%g,%g a0=%d,%d,%d,%d w=%g,%g,%g,%g%s",(unsigned long long)counters.presents,o.v,double(worst[n].first),
-                                 double(o.p[0]),double(o.p[1]),double(o.p[2]),double(o.idx[0]),double(o.idx[1]),double(o.idx[2]),double(o.idx[3]),o.a0[0],o.a0[1],o.a0[2],o.a0[3],
-                                 double(o.w[0]),double(o.w[1]),double(o.w[2]),double(o.w[3]),rows.c_str());break;}
-                            clog("RENDER_CENSUS SKOV i=%u v=%u d=%.3g skinned=%.3f,%.3f,%.3f idx=%g,%g,%g,%g a0=%d,%d,%d,%d w=%g,%g,%g,%g%s",cseq,o.v,double(worst[n].first),
-                                 double(o.p[0]),double(o.p[1]),double(o.p[2]),double(o.idx[0]),double(o.idx[1]),double(o.idx[2]),double(o.idx[3]),o.a0[0],o.a0[1],o.a0[2],o.a0[3],
-                                 double(o.w[0]),double(o.w[1]),double(o.w[2]),double(o.w[3]),rows.c_str());
-                        }
-                    }
-                }
-            }
-        };
-        if(ffOn && !census.active && !rectList)skoScan(false); // v584: the per-frame skinning scan (timed inside, skinned draws only)
-        if(watchOn && b.t[0]) { // v587: the draws into each colour target since its last watched resolve (diagnostic, switch on only)
-            auto& h=watchHist[b.t[0]];if(h.size()>=24)h.pop_front();
-            h.push_back({vsHash,psHash,wtex,wtexN,unsigned(in.primitive),indexed?unsigned(indices.size()):vertexCount,frame});
         }
 #ifdef RECOMP_THOR_EDITION
         if(psHash==recomp::gpu::maptap::MapLayerPs && images[2] && images[2]->image) // thor-maptap (v665): the pause map's own layer (its composite draw's s2)
@@ -8963,7 +9251,7 @@ public:
             std::string rts;for(unsigned i=0;i<4;++i)if(b.t[i]){rts+=i?",":"";rts+=std::to_string(i)+"="+targetName(b.t[i]);}
             clog("RENDER_CENSUS D i=%u prim=%u n=%zu/%u lo=%u hi=%u vs=%016llx ps=%016llx out=%x rt=%s ds=%s cm=%04x/%04x vp=%.2f,%.2f,%.2f,%.2f,%.4f,%.4f "
                  "sc=%d,%d,%d,%d wo=%d,%d%s pass=%ux%u raster=%x bias=%g/%g hp=%g,%g spec=%u src=%s gfix=%c psv=%x alpha=%u/%u/%g%s ui=%s gs3=%g,%g,%g,%g",
-                 cseq,in.primitive,indexed?indices.size():std::size_t{0},vertexCount,lo,hi,(unsigned long long)vsHash,(unsigned long long)psHash,
+                 cseq,in.primitive,indexed&&!fanExpanded?indices.size():std::size_t{0},vertexCount,lo,hi,(unsigned long long)vsHash,(unsigned long long)psHash,
                  ps.outputs,rts.c_str(),targetName(b.t[4]).c_str(),reg(state,0x2104)&0xFFFF,colorMask,viewport.x,viewport.y,viewport.width,viewport.height,
                  viewport.minDepth,viewport.maxDepth,scissor.offset.x,scissor.offset.y,scissor.offset.x+std::int32_t(scissor.extent.width),
                  scissor.offset.y+std::int32_t(scissor.extent.height),wox,woy,vertexWindowOffset?"+v":"",passWidth,passHeight,s.raster,
@@ -8993,38 +9281,6 @@ public:
             if(census.afConstants.match(vsHash,psHash)) { // artifacts-1: every non-zero constant of a listed draw (c0-c255, %.9g)
                 for(const auto& l:afdiag::constantLines(in.pixelConstants->data(),256,6))clog("RENDER_CENSUS PCA i=%u%s",cseq,l.c_str());
                 for(const auto& l:afdiag::constantLines(in.vertexConstants->data(),256,6))clog("RENDER_CENSUS VCA i=%u%s",cseq,l.c_str());
-                // fixer2 G1 (2026-10-21, DIAGNOSTIC, census only): the POSITION element of every vertex lo..hi (at most 640) as
-                // the module receives it, four per line ("!" = not readable), so a listed draw's geometry can be projected
-                // offline with the constants above (the Prologue's hanging tapers: env cloth strips or torn vertices?).
-                const Attribute* vpos=nullptr;
-                for(const auto& at:s.attributes)if(at.usage==0){vpos=&at;break;}
-                if(vpos && !rectList) {
-                    std::string line;unsigned n=0;
-                    for(unsigned v=lo;v<=hi && v-lo<640u;++v) {
-                        std::array<float,4> out{};bool ok=false;
-                        if(vpos->binding<streamCount) {
-                            const auto& src=sources[vpos->binding];
-                            if(vpos->convert) { // the attribute's own float4 / uint4 stream (one element per vertex from lo)
-                                const std::size_t off=std::size_t{v-lo}*16;
-                                if(src.data && off+16<=src.n) {
-                                    if(vpos->format==VK_FORMAT_R32G32B32A32_UINT){std::uint32_t u[4];std::memcpy(u,src.data+off,16);for(unsigned k=0;k<4;++k)out[k]=float(u[k]);}
-                                    else std::memcpy(out.data(),src.data+off,16);
-                                    ok=true;
-                                }
-                            } else {
-                                const std::size_t off=std::size_t{v-lo}*streamArray[vpos->binding].stride+vpos->offset;
-                                if(src.data && off+4<=src.take) {
-                                    std::array<std::uint8_t,16> tb{};swapCopy(tb.data(),src.data+off,std::min<std::size_t>(16,src.take-off),16,src.endian);
-                                    VFetch f=vpos->fetch;if(vpos->uintInput){f.isInteger=true;f.isSigned=false;}
-                                    out=decodeAttribute(tb.data(),f);ok=true;
-                                }
-                            }
-                        }
-                        char x[112];std::snprintf(x,sizeof x," v%u=%s%.7g,%.7g,%.7g,%.7g",v,ok?"":"!",double(out[0]),double(out[1]),double(out[2]),double(out[3]));
-                        line+=x;if(!(++n%4)){clog("RENDER_CENSUS VP i=%u%s",cseq,line.c_str());line.clear();}
-                    }
-                    if(!line.empty())clog("RENDER_CENSUS VP i=%u%s",cseq,line.c_str());
-                }
             }
             // v76: a draw sampling a shadow map, or a resolved image at s15 (GTA V's gCSMShadowTextureSamp, the cascade
             // map; interiors bind a decoded 4x4 dummy there): which slots, their age in presents, and the pixel constants
@@ -9045,15 +9301,6 @@ public:
                 }
                 if(!line.empty())clog("RENDER_CENSUS PC i=%u%s",cseq,line.c_str());
             }
-            // fixer2 G1 (2026-10-22, DIAGNOSTIC, census only): EVERY skinned draw (BLENDINDICES + BLENDWEIGHT + POSITION inputs),
-            // skinned on the CPU as GTA V's ped shaders do (ped#7v, ped_default#3v, ped_hair_cutout_alpha#3v, ped_wrinkle#3v:
-            // a0_k = floor(index_k * 255.002 * 3 + 0.5), weight k with index k, rows gBoneMtx(a0_k + 0..2) = c64 + a0_k ..,
-            // zero past row 191), from this draw's own constants. One SKO line per draw: the vertices (lo..hi, at most 4096),
-            // how many lie more than 3 m from the median skinned position (a ped is under 2.5 m), the largest distance, weight
-            // sums off 1, referenced bones whose 3x3 rows are not unit length; then up to three SKOV lines for the farthest
-            // vertices with their indices, weights, rows and the rows' values. Question: do some peds' vertices leave the body
-            // (wrong or stale bone rows) and draw the Prologue's dark triangles?
-            if(!rectList)skoScan(true); // (v584: the census SKO lines, unchanged)
             // DIAGNOSTIC v80: the first skinned draw (a BLENDINDICES input) of each of the first four skinned vertex
             // shaders of a census frame (a shadow pass may draw the peds first, with another shader). For the first
             // four vertices: BLENDINDICES / BLENDWEIGHT as fetched (raw: the element's first dword, endian-swapped)
@@ -9109,9 +9356,9 @@ public:
                          sk?(unsigned long long)sk->packets:0ull,sk?(unsigned long long)sk->committed:0ull,sk?(unsigned long long)sk->unreadable:0ull,
                          sk?sk->start:0u,sk?sk->count:0u,sk?sk->last:"no-info",!sk?-2ll:sk->drawsSince==~std::uint64_t{0}?-1ll:(long long)sk->drawsSince);
                     std::vector<int> bones;
-                    const unsigned nv=indexed?unsigned(std::min<std::size_t>(4,indices.size())):std::min(4u,vertexCount);
+                    const unsigned nv=indexed&&!fanExpanded?unsigned(std::min<std::size_t>(4,indices.size())):std::min(4u,vertexCount);
                     for(unsigned k=0;k<nv;++k) {
-                        const unsigned v=indexed?indices[k]:k;
+                        const unsigned v=indexed&&!fanExpanded?indices[k]:k;
                         std::array<float,4> fi{},fw{},fp{};std::uint32_t ri=0,rw=0,rp=0;
                         const bool okI=fed(skinIdx,v,fi,ri),okW=fed(skinW,v,fw,rw);fed(skinPos,v,fp,rp);
                         int a0[4]{};
@@ -9146,6 +9393,15 @@ public:
             }
             clog("RENDER_CENSUS PF i=%u ps=%016llx%s",cseq,(unsigned long long)psHash, // v79 (v100: tag PF; v79 used PC)
                  post::postfxConstants(post::postfxShader(psHash),*in.pixelConstants).c_str());
+#if defined(__APPLE__)
+            if(psHash==0xe2649e6bc8ee4db8ull) // (build 225, diagnostic) the phone composite's BOUND images: what it really samples
+                for(unsigned r=0;r<HeapSlots;++r)if(images[r] && images[r]->image) {
+                    const Image& im=*images[r];
+                    clog("RENDER_CENSUS XI i=%u slot=%u img=%ux%u k=%d levels=%u lod=%u-%u fmt=%d resolved=%u age=%llu view=%p",cseq,r,im.width,im.height,im.k,im.levels,
+                         im.minLod,im.maxLod,int(im.format),unsigned(im.resolvedImage),(unsigned long long)(counters.presents-im.resolvedAt),(void*)im.view);
+                    censusProbe(cseq,char('X'),im,"bound"+std::to_string(r));
+                }
+#endif
             for(unsigned i=0;i<4;++i)if(b.t[i]){censusProbe(cseq,char('A'+i),b.t[i]->image,targetName(b.t[i]));}
             if(b.t[4])censusProbe(cseq,'Z',b.t[4]->image,targetName(b.t[4]));
         }
@@ -9180,7 +9436,15 @@ public:
         if(r[2]<=r[0] || r[3]<=r[1])return refuse("empty-rect");
         const auto b=bound(state,unsigned(std::max(r[3],16)),colorMask,depth);
         if(!b.count)return refuse("no-target");
+#if defined(__APPLE__)
+        if(phoneRect(r[0],r[1],r[2],r[3]) && (phoneClearSeen++%15)==0 && phoneLogs<600) {++phoneLogs; // (build 216, diagnostic) the phone rectangle's clears (DISCOVERIES 21:10)
+            char ts[160]{};std::size_t o=0;
+            for(unsigned i=0;i<5;++i)if(b.t[i])o+=std::snprintf(ts+o,sizeof ts-o,"%s%u:%x/%u/%u",o?",":"",i,b.t[i]->base,b.t[i]->xenosFormat,b.t[i]->pitch);
+            GLOG("RENDER_IOS_PHONE_CLEAR frame=%llu rect=%d,%d,%d,%d mask=%x depth=%u color=%g,%g,%g,%g targets=%s",(unsigned long long)frame,r[0],r[1],r[2],r[3],
+                 colorMask,unsigned(depth),double(in.color[0]),double(in.color[1]),double(in.color[2]),double(in.color[3]),ts);}
+#endif
         const auto passesBefore=perf.passes; // v287
+        setAreaHint(r[0],r[1],r[2],r[3]); // ios-render-area
         if(!ensurePass(b))return refuse("render-pass");
         if(b.t[4] && (in.flags&0x30) && !depthWriteAhead(b))return refuse("render-pass"); // v293
         if(msaa4xSeen){for(unsigned i=0;i<4;++i)msaaStamp(b.t[i]);if(in.flags&0x30)msaaStamp(b.t[4]);} // v591 (the clear's targets)
@@ -9225,6 +9489,7 @@ public:
     // v40: clears one target inside [rect] (a resolve's clear), through a render pass of that target
     // alone, like clear(); depth targets clear depth and stencil.
     bool clearTargetRect(Target& t,const std::array<std::int32_t,4>& rect,const VkClearValue& value) {
+        stripClear(t,rect); // ios-strips
         if(!t.depth) { // v369 (a): the colour clear as the target's own pending clear instead of a pass of its own
             const int blocked=inPass?1:!t.pendingClears.empty()?2:t.residuePending?3:(census.active || v369Mosaic)?4:
                 (legacyClears || colorLoadDontCare || !t.image.image)?5:0;
@@ -9235,6 +9500,7 @@ public:
             }
         }
         Bound b;(t.depth?b.t[4]:b.t[0])=&t;b.count=1;b.width=t.pitch;b.height=t.image.height;b.k=t.image.k; // (fsr-modes: k)
+        setAreaHint(rect[0],rect[1],rect[2],rect[3]); // ios-render-area
         if(!ensurePass(b))return false;
         if(t.depth && !depthWriteAhead(b))return false; // v293 (the clear writes depth and stencil)
         msaaStamp(&t); // v591
@@ -9255,13 +9521,14 @@ public:
     // entry. Callers: no pass open (the entry is applied at t's next pass begin, which every later write of t goes through, or by
     // flushPending before a read), t without pending clears or residue.
     bool v369Defer(Target& t,const std::array<std::int32_t,4>& rect,const VkClearValue& value) {
+        stripClear(t,rect); // ios-strips (a deferred clear also precedes every later read)
         const std::int32_t w=std::int32_t(t.pitch),h=std::int32_t(t.image.height);
         const std::int32_t x0=std::clamp<std::int32_t>(rect[0],0,w),y0=std::clamp<std::int32_t>(rect[1],0,h);
         const std::int32_t x1=std::clamp<std::int32_t>(rect[2],x0,w),y1=std::clamp<std::int32_t>(rect[3],y0,h);
 #if !defined(RECOMP_V369_MUTANT_CLOCK) // test mutant: the skipped pass's bookkeeping left out (v310 staleness / resolve order see it)
-        ++writeClock;t.serial=frame;t.written=writeClock;t.passClock=writeClock;
+        ++writeClock;t.serial=frame;t.written=writeClock;t.passClock=writeClock;t.stampPrev=t.stampSite;t.stampSite=5;
 #endif
-        t.writes[t.writesN%v310::WriteRing]={writeClock,t.edramRows,0,0,0,0};++t.writesN;noteWrite(&t,x0,y0,x1,y1); // v583: the skipped pass and its clear
+        t.writes[t.writesN%v310::WriteRing]={writeClock,t.edramRows,0,0,0,0};++t.writesN;noteCache.clock=~0ull;noteWrite(&t,x0,y0,x1,y1); // v583: the skipped pass and its clear
         if(x1<=x0 || y1<=y0){++v369.deferredEmpty;return true;}
 #if !defined(RECOMP_V369_MUTANT_DROP) // test mutant: the deferred clear is lost
         Target::PendingClear p;p.rects.push_back({x0,y0,x1,y1});p.value=value;p.own=true;t.pendingClears.push_back(std::move(p));
@@ -9292,7 +9559,7 @@ public:
     bool resolve(const ResolveInput& in,const char** why) {
         struct Account {Perf& p;Clock::time_point t;~Account(){p.resolveNs+=nsSince(t);}} account{perf,Clock::now()};
         const unsigned cseq=census.active?census.seq++:0;
-        const auto refuse=[&](const char* w){if(why)*why=w;note("resolve-refused",w);if(ffOn)ffRefused(w,true); // (v579)
+        const auto refuse=[&](const char* w){if(why)*why=w;note("resolve-refused",w);
             if(census.active)clog("RENDER_CENSUS X i=%u resolve why=%s flags=%08x",cseq,w,in.flags);return false;};
         if(!in.state || in.state->size()<13860)return refuse("input");
         const auto desc=XenosTextureDescription::decode(in.destinationFetch);
@@ -9347,6 +9614,25 @@ public:
         t->lastUse=frame; // v96
         std::array<std::int32_t,4> sr{0,0,std::int32_t(desc->width),std::int32_t(desc->height)};
         if(in.sourceRect)sr=*in.sourceRect;
+#if defined(__APPLE__)
+        if(t->pitch==1280 && !depthSource && (sr[0]>0 || sr[1]>0 || sr[2]<1280 || sr[3]<720) && hudResolveLogs<60) {++hudResolveLogs; // (ios-hud-fit diagnosis)
+            const std::array<std::int32_t,2> pt=in.destinationPoint?*in.destinationPoint:std::array<std::int32_t,2>{0,0};
+            GLOG("RENDER_IOS_HUD_RESOLVE rect=%d,%d,%d,%d pt=%d,%d dst=%ux%u base=%x fmt=%u frame=%llu",sr[0],sr[1],sr[2],sr[3],pt[0],pt[1],desc->width,desc->height,
+                 t->base,t->xenosFormat,(unsigned long long)frame);}
+#endif
+#if defined(__APPLE__)
+        // (build 218, diagnostic A/B: files/private-trace/ios-phone-exact-source) the phone rectangle's save resolve asks for the HDR
+        // scene's format at base 2d0 but took the 8888 alias as "newer-alias" in every logged frame (c558b); this switch takes the
+        // exact target instead, for that rectangle only, to test whether the pale band is the save's wrong source.
+        const char* phoneWas=choice;
+        if(phoneExactSource && exact && t!=exact && !depthSource && phoneRect(sr[0],sr[1],sr[2],sr[3])){t=exact;choice="phone-exact";}
+        if(!depthSource && phoneRect(sr[0],sr[1],sr[2],sr[3]) && (phoneSeen++%15)==0 && phoneLogs<600) {++phoneLogs; // (build 216, diagnostic) the phone rectangle's resolves (218: 1 in 15)
+            const std::array<std::int32_t,2> pt=in.destinationPoint?*in.destinationPoint:std::array<std::int32_t,2>{0,0};
+            GLOG("RENDER_IOS_PHONE_RESOLVE frame=%llu rect=%d,%d,%d,%d pt=%d,%d want=%x/%u chosen=%x/%u/%s was=%s v369=%u exact=%u written=%llu/%llu sites=%u,%u/%u,%u clear=%u dst=%08x/%ux%u fmt=%u",
+                 (unsigned long long)frame,sr[0],sr[1],sr[2],sr[3],pt[0],pt[1],base,format,t->base,t->xenosFormat,choice,phoneWas,unsigned(v369PassOps),unsigned(exact!=nullptr),
+                 (unsigned long long)(exact?exact->written:0),(unsigned long long)t->written,unsigned(exact?exact->stampSite:0),unsigned(exact?exact->stampPrev:0),unsigned(t->stampSite),unsigned(t->stampPrev),unsigned(clearColor),unsigned(desc->baseAddress),desc->width,desc->height,unsigned(desc->format));}
+#endif
+        if(stripLive(*t,sr[1],sr[3])){++stripStats.resolves;GLOG("RENDER_IOS_STRIP_RESOLVE base=%x pitch=%u fmt=%u rows=%d-%d live=%d-%d frame=%llu",t->base,t->pitch,t->xenosFormat,sr[1],sr[3],t->stripY0,t->stripY1,(unsigned long long)frame);} // ios-strips
         std::array<std::int32_t,2> dp{0,0};if(in.destinationPoint)dp=*in.destinationPoint;
         const auto key=physicalAddress(desc->baseAddress);
         const char* copied="copied";Resolved* r=nullptr;
@@ -9363,11 +9649,22 @@ public:
             else {++v74.subUnplaceable;char b[48];std::snprintf(b,sizeof b,"mip=%u/%u slice=%u/%u",in.mip,shape.levels,in.slice,shape.layers);
                 note("resolve-subresource-unplaceable",b);}
         }
-        if(nullCopy)copied="null-copy-command";
+        // ios-probe-slice (player option): a cube-face resolve of the learned probe target, face != this frame's: no copy (the face
+        // keeps its previous picture); the clears below stay
+        bool probeSkipCopy=false;
+        if(placed && !depthSource && in.slice<6 && pitch<=256) {
+            if(!probeLearned || probeBase!=t->base || probeFmt!=t->xenosFormat || probePitch!=t->pitch)
+                {probeLearned=true;probeBase=t->base;probeFmt=t->xenosFormat;probePitch=t->pitch;
+                 GLOG("RENDER_IOS_PROBE learned base=%x fmt=%u pitch=%u",probeBase,probeFmt,probePitch);}
+            probeFaceNext=in.slice+1;
+            if(iosProbeSlice && in.slice!=unsigned(frame%6)){probeSkipCopy=true;++probeStats.copies;}else if(iosProbeSlice)++probeStats.keptCopies;
+        }
+        if(probeSkipCopy)copied="probe-sliced";
+        else if(nullCopy)copied="null-copy-command";
         else if(subresource && !placed){copied="mip-or-slice-skipped";++(depthSource?v74.subDepthSkipped:v74.subSkipped);} // v35 copied a level's rectangle over the base level
         else if(!(depthSource?copyDepth(*t,*desc,key,sr,dp,r):copyColor(*t,*desc,key,sr,dp,format,expBias,r,placed?in.mip:0u,placed?in.slice:0u)))
             return refuse(depthSource?"depth-copy":"color-copy");
-        if(placed){copied="subresource-copied";++v74.subCopied;char b[32];std::snprintf(b,sizeof b,"mip=%u slice=%u",in.mip,in.slice);
+        if(placed && !probeSkipCopy){copied="subresource-copied";++v74.subCopied;char b[32];std::snprintf(b,sizeof b,"mip=%u slice=%u",in.mip,in.slice);
             note("resolve-subresource-copied",b);}
         if(nullCopy || (subresource && !placed))note("resolve-copy-skipped",copied);
         if(expBias && (depthSource || noConvert || !convertPipeline || !convertStorage))note("resolve-exp-bias-ignored");
@@ -9383,7 +9680,7 @@ public:
                 if(targetedBarriers)hazards({},{t->image.image});else barrier();
                 vkCmdClearColorImage(cmd,t->image.image,VK_IMAGE_LAYOUT_GENERAL,&v.color,1,&range);afterWrite();
             } else if(!clearTargetRect(*t,region,v))return refuse("clear-colour");
-            t->written=++writeClock;
+            t->written=++writeClock;t->stampPrev=t->stampSite;t->stampSite=6;
             aliasClear(*t,region,in.clearColor,cseq); // v55
         }
         if(clearDepth) {
@@ -9392,10 +9689,29 @@ public:
             VkClearValue v{};v.depthStencil={std::clamp(in.clearDepth,0.0f,1.0f),in.clearStencil&0xFF};
             if(dfFloat)v.depthStencil.depth=dfClearDepth(depthTarget,in.clearDepth); // depth-float: the 20e4 value
             if(!depthTarget || !clearTargetRect(*depthTarget,region,v))return refuse("clear-depth");
-            depthTarget->written=++writeClock;
+            depthTarget->written=++writeClock;depthTarget->stampPrev=depthTarget->stampSite;depthTarget->stampSite=7;
         }
         endPass(__LINE__);
         ++counters.resolves;++chunkWork;
+        { // ios-resolve-kinds (Claude 2026-10-17, diagnostic): how many resolves could hand the source image to the texture
+          // instead of copying (colour, cleared by the same resolve, the whole target, a same-size plain copy at 0,0)
+            auto& k=iosResolveKinds;++k.total;
+            if(depthSource){++k.depth;if(clearDepth)++k.depthClear;}
+            else {
+                ++k.color;
+                if(clearColor) {
+                    ++k.colorClear;
+                    const bool whole=sr[0]==0 && sr[1]==0 && sr[2]>=std::int32_t(t->image.width) && sr[3]>=std::int32_t(t->image.height);
+                    if(whole) {
+                        ++k.colorClearWhole;
+                        if(r && r->width==t->image.width && r->height==t->image.height && !dp[0] && !dp[1] && !placed && !nullCopy) {
+                            ++k.colorClearWholeSame;
+                            if(!r->mode && r->image.format==t->image.format){++k.swapCandidates;k.swapTexels+=std::uint64_t(r->width)*r->height;}
+                        }
+                    }
+                }
+            }
+        }
         if(r){r->frame=frame;r->seq=cseq;
             // v76: a shadow map when shadow casters drew the source target in this present.
             r->image.shadowMap=t->casterPresent==counters.presents;r->image.resolvedImage=true;r->image.resolvedAt=counters.presents;
@@ -9405,25 +9721,15 @@ public:
 #endif /* RECOMP_THOR_EDITION */
         if(census.active) {
             clog("RENDER_CENSUS R i=%u flags=%08x src=%u samples=%x clear=%u%u null=%u exp=%d mip=%u slice=%u rect=%d,%d,%d,%d pt=%d,%d "
-                 "dst=%08x f%u %ux%u%s/p%u sw%u%u%u%u sg%u%u%u%u ex%d copy=%s conv=%u/%d from=%s(%s) depth_target=%s zclear=%g/%u params=%08x surf=%08x ci=%08x di=%08x shadow=%u caller=%08x/%08x",
+                 "dst=%08x f%u %ux%u sw%u%u%u%u sg%u%u%u%u ex%d copy=%s conv=%u/%d from=%s(%s) depth_target=%s zclear=%g/%u params=%08x surf=%08x ci=%08x di=%08x shadow=%u",
                  cseq,flags,source,(flags>>4)&7,unsigned(clearColor),unsigned(clearDepth),unsigned(nullCopy),expBias,in.mip,in.slice,
-                 sr[0],sr[1],sr[2],sr[3],dp[0],dp[1],key,desc->format,desc->width,desc->height,desc->tiled?"t":"l",desc->pitchTexels,desc->swizzle[0],desc->swizzle[1],desc->swizzle[2],
+                 sr[0],sr[1],sr[2],sr[3],dp[0],dp[1],key,desc->format,desc->width,desc->height,desc->swizzle[0],desc->swizzle[1],desc->swizzle[2],
                  desc->swizzle[3],desc->sign[0],desc->sign[1],desc->sign[2],desc->sign[3],desc->exponentBias,copied,r?r->mode:0u,r?r->bakedExp:0,targetName(t).c_str(),choice,
                  targetName(depthTarget).c_str(),in.clearDepth,in.clearStencil,in.parameters,surface,source<4?reg(state,infos[source]):0u,reg(state,0x2002),
-                 unsigned(r && r->image.shadowMap),in.caller,in.caller2);
+                 unsigned(r && r->image.shadowMap));
             censusProbe(cseq,'S',t->image,targetName(t));
             if(r){char b[24];std::snprintf(b,sizeof b,"res:%08x",key);censusProbe(cseq,'D',r->image,b);}
             if(depthTarget && depthTarget!=t)censusProbe(cseq,'Z',depthTarget->image,targetName(depthTarget));
-        }
-        if(watchOn && std::find(watchAddrs.begin(),watchAddrs.end(),key)!=watchAddrs.end()) { // v587
-            GLOG("RENDER_WATCH_RESOLVE addr=%08x frame=%llu present=%llu src=%s(%s) rect=%d,%d,%d,%d pt=%d,%d f%u %ux%u %s/p%u copy=%s flags=%08x",key,
-                 (unsigned long long)frame,(unsigned long long)counters.presents,targetName(t).c_str(),choice,sr[0],sr[1],sr[2],sr[3],dp[0],dp[1],
-                 desc->format,desc->width,desc->height,desc->tiled?"t":"l",desc->pitchTexels,copied,flags);
-            auto& h=watchHist[t];unsigned k=0;
-            for(const auto& w:h){char tx[64]="";int o=0;for(unsigned j=0;j<w.texN && o<56;++j)o+=std::snprintf(tx+o,sizeof tx-o,"%s%08x",j?",":"",w.tex[j]);
-                GLOG("RENDER_WATCH_DRAW addr=%08x k=%u vs=%016llx ps=%016llx tex=%s prim=%u n=%u frame=%llu",key,k++,(unsigned long long)w.vs,
-                     (unsigned long long)w.ps,tx,w.prim,w.count,(unsigned long long)w.frame);}
-            h.clear();
         }
         if(why)*why=depthSource?"generic-depth-resolve-recorded":"generic-resolve-recorded";
         return true;
@@ -9577,6 +9883,7 @@ public:
     // sharing those tiles is cleared at the same tile-local pixels. The same storage format keeps the clear
     // value; a zero clear is zero in every format; any other value across formats is skipped and counted.
     void aliasClear(const Target& x,const std::array<std::int32_t,4>& rect,const std::array<float,4>& color,unsigned seq) {
+        stripClear(x,rect); // ios-strips
         if(!edramClearAlias || legacyClears || x.depth || !x.image.image)return;
         if(x.samples || sixtyFourBit(x.xenosFormat)){vkw2Note("edram-clear-alias","source-unsupported");return;}
         edram::Cleared cleared{};
@@ -9617,7 +9924,7 @@ public:
                 if(u.pendingClears.size()<=64)++res.pendingFlushes;
                 if(!flushPending(u)){vkw2Note("edram-clear-alias","flush-failed");continue;}
             }
-            u.written=++writeClock;
+            u.written=++writeClock;u.stampPrev=u.stampSite;u.stampSite=8;
             vkw2Note("edram-clear-alias",slot>=0?"cleared-in-pass":"deferred"); // (vk-worker-2 bit 2)
             if(census.active)clog("RENDER_CENSUS AC i=%u from=%s to=%s rects=%zu first=%d,%d,%d,%d zero=%u mode=%s",seq,targetName(&x).c_str(),
                 targetName(&u).c_str(),rects.size(),rects[0].x0,rects[0].y0,rects[0].x1,rects[0].y1,unsigned(zero),slot>=0?"now":"deferred");
@@ -9711,6 +10018,11 @@ public:
         }
         r.mode=convert?mode:0;r.bakedExp=convert?desc.exponentBias:0;
         endPass(__LINE__);
+        auto resolveIdentityCurrent=[&]() noexcept {return resolve_identity::Identity{slots[slotIndex].seFrame,word64(cmd),slotIndex,slots[slotIndex].chunks-1};};
+        auto resolveIdentityClock=[]() noexcept {return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());};
+        auto& resolveIdentitySlot=slots[slotIndex];
+        resolve_identity::Observation resolveObservation(resolveIdentityEnabled && resolveIdentitySlot.passProfiled,
+            resolveIdentitySlot.resolveIdentity,resolveIdentitySlot.passCount,resolveIdentityClock,resolveIdentityCurrent);
         // v74: the destination level's extent (level 0 before v74).
         const unsigned lw=std::max(1u,r.width>>mip),lh=std::max(1u,r.height>>mip);
         const unsigned w=unsigned(std::max(1,sr[2]-sr[0])),h=unsigned(std::max(1,sr[3]-sr[1]));
@@ -9718,15 +10030,32 @@ public:
         const std::int32_t dx=std::clamp(dp[0],0,std::int32_t(lw)),dy=std::clamp(dp[1],0,std::int32_t(lh));
         const std::uint32_t cw=std::min<std::uint32_t>({w,t.image.width-std::uint32_t(sx),lw-std::uint32_t(dx)});
         const std::uint32_t ch=std::min<std::uint32_t>({h,t.image.height-std::uint32_t(sy),lh-std::uint32_t(dy)});
+        if(auto* e=resolveObservation.event()) {
+            e->source=word64(t.image.image);e->destination=word64(r.image.image);
+            e->srcW=t.image.width;e->srcH=t.image.height;e->dstW=r.image.width;e->dstH=r.image.height;
+            e->srcFormat=int(t.image.format);e->dstFormat=int(r.image.format);
+            e->sx=sx;e->sy=sy;e->dx=dx;e->dy=dy;e->cw=cw;e->ch=ch;e->mip=mip;e->slice=slice;
+            e->mode=mode;e->exponent=exponent;e->branch=!(cw && ch)?0:convert?2:1;
+        }
         if(cw && ch){if(mip<32)r.levelsWritten|=1u<<mip;}
         if(cw && ch && convert) {
             // Storage writes need an identity view (the sampled view carries the swizzle).
             if(!depthPoolRoom(1)){note("resolve-refused","convert-flush");return false;} // v96
+            ++convertViewStats.viewRequests;
+            const bool canBorrow=convert_view_reuse::eligible(r,mip,slice);
+            if(canBorrow)++convertViewStats.eligible;
             VkImageView storageView=VK_NULL_HANDLE;
-            VkImageViewCreateInfo v{};v.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;v.image=r.image.image;v.viewType=VK_IMAGE_VIEW_TYPE_2D;
-            v.format=VK_FORMAT_R16G16B16A16_SFLOAT;v.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,mip,1,slice,1};
-            if(!makeView(v,storageView)){note("resolve-refused","convert-storage-view");return false;}
-            viewLater(storageView);
+            if(convertViewPolicy==convert_view_reuse::Policy::Enabled && canBorrow) {
+                storageView=r.image.view; // Borrow only; lifetime stays with the existing resolved image.
+                ++convertViewStats.borrowed;
+            } else {
+                VkImageViewCreateInfo v{};v.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;v.image=r.image.image;v.viewType=VK_IMAGE_VIEW_TYPE_2D;
+                v.format=VK_FORMAT_R16G16B16A16_SFLOAT;v.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,mip,1,slice,1};
+                if(!makeView(v,storageView)){++convertViewStats.createFailed;note("resolve-refused","convert-storage-view");return false;}
+                ++convertViewStats.created;
+                viewLater(storageView);
+                ++convertViewStats.retireScheduled;
+            }
             VkDescriptorSet set=VK_NULL_HANDLE;
             VkDescriptorSetAllocateInfo a{};a.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;a.descriptorPool=depthPool;a.descriptorSetCount=1;a.pSetLayouts=&depthSetLayout;
             if(vkAllocateDescriptorSets(d.device,&a,&set)!=VK_SUCCESS){note("resolve-refused","convert-descriptor");return false;}
@@ -9754,6 +10083,7 @@ public:
             rsResolveCopy(t.image,r.image,c); // fsr-modes: v458's vkCmdCopyImage at 16; the scaled rectangle, or a blit into a guest-sized destination
             afterWrite();
         }
+        resolveObservation.finish(true); // CPU wall duration only; before existing writeback metadata work.
         if(mip==0 && slice==0) { // v73: what the destination memory holds now, for vertex fetches of this address (exact: the image texels are
             // the memory texels' values: no conversion, no exponent, the image in the destination's own format).
             // (v100: only a base-level, first-layer resolve (v71's only kind) describes the base memory the gather reads.)
@@ -9869,16 +10199,13 @@ public:
             const auto [lo,hi]=wb::touched(*l,c.copy.x,c.copy.y,c.copy.w,c.copy.h);
             if(hi<=lo){++out.delta.refused;continue;}
             std::array<std::uint8_t,16> before{};std::size_t shown=0;bool edited=false;
-            const bool fow=wb::cpuWritten(l->plan.desc.format);std::uint32_t fowBefore=0,fowAfter=0; // v840
             const auto status=writer(c.copy.physical+lo,hi-lo,[&](std::vector<std::uint8_t>& guest) {
                 if(guest.size()!=hi-lo)return false;
                 shown=std::min<std::size_t>(guest.size(),16);std::memcpy(before.data(),guest.data(),shown);
-                if(fow)fowBefore=fowRevealed(guest.data(),guest.size());
                 std::vector<std::uint8_t> level(l->span,0);std::memcpy(level.data()+lo,guest.data(),guest.size());
                 const auto n=wb::write(*l,c.copy.source,c.texels.data(),std::size_t{c.copy.w}*wb::sourceBytes(c.copy.source),
                                        c.copy.x,c.copy.y,c.copy.w,c.copy.h,c.copy.swap,level,why);
                 if(n)std::memcpy(guest.data(),level.data()+lo,guest.size());
-                if(fow)fowAfter=fowRevealed(guest.data(),guest.size());
                 edited=n.has_value();
                 if(edited && wb::cpuWritten(l->plan.desc.format))out.published.push_back({c.copy.physical,lo,hi,wb::publicationHash(guest.data(),guest.size())}); // v668
                 return edited;
@@ -9893,14 +10220,6 @@ public:
             if(status!=WriteStatus::Published && status!=WriteStatus::Unchanged)out.refusals.push_back(statusName);
             // The first publications of each destination (and every one in a census frame): the guest bytes the
             // CPU would have read before (v71 never wrote them) and the resolved texels now in memory.
-            if(fow && (status==WriteStatus::Published || status==WriteStatus::Unchanged) && fowLines<400) {
-                const auto seen=fowRevealedLogged.find(c.copy.physical);
-                if(seen==fowRevealedLogged.end() || seen->second!=fowAfter || fowBefore!=fowAfter) {
-                    ++fowLines;fowRevealedLogged[c.copy.physical]=fowAfter;
-                    GLOG("RENDER_GENERIC_FOW_WRITEBACK addr=%08x %ux%u status=%s revealed_before=%u revealed_after=%u bytes=%u",
-                         c.copy.physical,l->plan.width,l->plan.height,statusName,fowBefore,fowAfter,hi-lo);
-                }
-            }
             auto& logged=wbLogged[c.copy.physical];
             if(logged<3 || batch.census) {
                 ++logged;
@@ -10161,7 +10480,9 @@ public:
     // armed here starts at the next synchronous present (the frame after the next one is captured synchronously).
     std::optional<std::vector<std::uint8_t>> present(std::uint32_t address,unsigned width,unsigned height,const char** why,bool queued=false) {
         struct Account {Perf& p;Clock::time_point t;~Account(){p.presentNs+=nsSince(t);}} account{perf,Clock::now()};
+        if(waitTimingEnabled)waitCompletedReadback.reset();
         ++presentCount; // v73: resolves after this belong to the next present interval
+        probeFaceNext=0; // ios-probe-slice: the next frame's faces start at 0
         // v75: resolves whose frames completed (waited below or earlier) reach guest memory on the way out.
         // v215: the synchronous caller (global present()) publishes the completed writebacks after releasing rendererMutex.
         const auto it=resolved.find(physicalAddress(address));
@@ -10193,17 +10514,35 @@ public:
         // game's own tonemap matches the reference tone); files/private-trace/diag-gamma-on restores it.
         static unsigned gammaCheck=0;static bool gamma=true;
         if(!(gammaCheck++%30))gamma=access(RECOMP_APP_PATH("/private-trace/diag-gamma-on"),F_OK)==0; // v67: off by default
-        auto& presentImage=presentImages[gamma?1:0]; // v96: a member (v71: a function static), for RENDER_GENERIC_RESOURCES
         // v255 (direct_present.h): once the presenter owns the window and knows the scan-out tables, the UNORM present image is
         // drawn to the window on the GPU instead of read back (the CPU mapping and the app's pack, as one pass). Frames that
         // need the readback (census, frame interpolation, the v79 ramp, the sRGB present image) keep it.
         const bool direct=!gamma && !frameInterp && !census.active && !census.armed && !displayRampActive && width==recomp::gpu::direct::SourceWidth &&
             height==recomp::gpu::direct::SourceHeight && recomp::gpu::direct::presenter().gpuReady();
-        const bool sampled=!gamma && recomp::gpu::direct::presenter().gpuReady();
+        iosSharedFrame.reset();
+        const bool iosSharedEligible=recomp::ios_shared::producer && syncPresent && !queued && !gamma && !frameInterp &&
+            !census.active && !census.armed && !displayRampActive && width==1280 && height==720 && queue==d.queue;
+        const bool iosAsyncSelected=recomp::ios_async_shared::enabled && recomp::ios_async_shared::adopted.load(std::memory_order_acquire);
+        if(iosAsyncSelected && (!iosSharedEligible || recomp::ios_async_shared::stopRequested.load(std::memory_order_acquire)))
+            throw std::runtime_error("async shared source eligibility lost after adoption");
+        const bool sampled=(!gamma && recomp::gpu::direct::presenter().gpuReady()) || iosSharedEligible;
         // lane fsr-stage-b: the present image's extent. width x height (v463) unless a scale is applied and the frame is `direct`:
         // then the render size, and the presenter scales that to the window (stage A blitted every frame to width x height).
         const unsigned pw=rsbPresentW(width,direct),ph=rsbPresentH(height,direct);
-        if(!presentImage.image || presentImage.width!=pw || presentImage.height!=ph || (sampled && !presentSampled[gamma?1:0])) {
+        std::optional<recomp::ios_async_shared::Mailbox::Producer> iosProducing;
+        if(iosAsyncSelected) {
+            const bool newPool=!iosAsyncSources.mailbox();
+            iosAsyncSources.ensure(pw,ph,1,
+                [&](Image& image,unsigned w,unsigned h){return makeImage(w,h,1,VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT,false,identity,image);},
+                [&](Image& image){destroyImageNow(image);});
+            if(newPool)GLOG("RENDER_IOS_ASYNC_SHARED_POOL images=3 bytes=%llu width=%u height=%u epoch=1",(unsigned long long)iosAsyncSources.bytes(),pw,ph);
+            iosProducing=iosAsyncSources.mailbox()->begin(1,pw,ph);
+            if(!iosProducing)throw std::runtime_error("async shared source pool unavailable");
+        }
+        auto& presentImage=iosProducing?iosAsyncSources.select(*iosProducing):presentImages[gamma?1:0];
+        if(!iosAsyncSelected && (!presentImage.image || presentImage.width!=pw || presentImage.height!=ph || (sampled && !presentSampled[gamma?1:0]))) {
             rsbForget(presentImage.view); // lane fsr-stage-b (review): the presenter forgets its set for this view (nothing without a scale)
             if(presentImage.image && !baseResources)destroyLater(presentImage); // v96 (v71 dropped the old one)
             presentImage={};
@@ -10212,6 +10551,12 @@ public:
                           (sampled?VK_IMAGE_USAGE_SAMPLED_BIT:0),VK_IMAGE_ASPECT_COLOR_BIT,false,identity,presentImage)){if(why)*why="present-image";return std::nullopt;}
             presentSampled[gamma?1:0]=sampled;
         }
+        if(recomp::ios_shared::producer && iosSourceGeneration==UINT64_MAX)throw std::runtime_error("shared source generation overflow");
+        if(recomp::ios_shared::producer)++iosSourceGeneration;
+        // Mark before recording the first image reference, not only before submit:
+        // abandoned recording must quarantine this slot until recorder reset + GPU drain.
+        if(iosProducing && !iosAsyncSources.mailbox()->markSubmitted(*iosProducing))
+            throw std::runtime_error("async shared source recording rejected");
         toGeneral(presentImage);
         const auto& src=it->second.image;
         // v20 debug view: with files/private-trace/diag-mosaic present, show a 3x3 grid of the colour
@@ -10219,6 +10564,27 @@ public:
         // v24: the same check reads the diag-generic-sync / diag-generic-nocache switches.
         static unsigned mosaicCheck=0;static bool mosaic=false;
         if(!(mosaicCheck++%30)) {
+            GLOG("RENDER_DIAG_PASS_POLICY requested=%s effective_profile=%u effective_dump=%u",
+                 iospassdiag::name(passProfilingPolicy),unsigned(gpuPassProfile),unsigned(v338PassDump));
+            GLOG("RENDER_DIAG_SMALL_FAN enabled=%u candidates=%llu expanded=%llu capacity_fallbacks=%llu max_vertices=64 idx_on=%u idx_expanded=%llu idx_restart=%llu",
+                 unsigned(smallFanPolicy==fan_indices_candidate::StartupPolicy::Enabled || iosFanSmall),
+                 (unsigned long long)smallFanCandidates,(unsigned long long)smallFanExpanded,(unsigned long long)smallFanCapacityFallbacks,
+                 unsigned(iosFanIndexed),(unsigned long long)idxFanExpanded,(unsigned long long)idxFanRestart);
+            GLOG("RENDER_DIAG_FAN_LIMIT max_vertices=%u",largeFanLimit);
+            GLOG("RENDER_DIAG_CONVERT_VIEW_REUSE enabled=%u view_requests=%llu eligible=%llu borrowed=%llu created=%llu retire_scheduled=%llu create_failed=%llu",
+                 unsigned(convertViewPolicy==convert_view_reuse::Policy::Enabled),
+                 (unsigned long long)convertViewStats.viewRequests,(unsigned long long)convertViewStats.eligible,
+                 (unsigned long long)convertViewStats.borrowed,(unsigned long long)convertViewStats.created,
+                 (unsigned long long)convertViewStats.retireScheduled,(unsigned long long)convertViewStats.createFailed);
+            GLOG("RENDER_DIAG_FAN_RANGES large_enabled=%u eligible_3_64=%llu eligible_65_96=%llu eligible_gt96=%llu submitted_3_64=%llu submitted_65_96=%llu submitted_gt96=%llu eligible_indexed=%llu submitted_indexed=%llu large_expanded=%llu large_capacity_fallbacks=%llu",
+                 unsigned(largeFanPolicy==fan_large_candidate::Policy::Enabled),
+                 (unsigned long long)fanCensus.eligible.small,(unsigned long long)fanCensus.eligible.large,(unsigned long long)fanCensus.eligible.above,
+                 (unsigned long long)fanCensus.submitted.small,(unsigned long long)fanCensus.submitted.large,(unsigned long long)fanCensus.submitted.above,
+                 (unsigned long long)fanCensus.eligible.indexed,(unsigned long long)fanCensus.submitted.indexed,
+                 (unsigned long long)largeFanExpanded,(unsigned long long)largeFanCapacityFallbacks);
+            GLOG("RENDER_DIAG_FAN_LARGE_RANGES eligible_97_128=%llu eligible_129_256=%llu eligible_gt256=%llu eligible_max=%u submitted_97_128=%llu submitted_129_256=%llu submitted_gt256=%llu submitted_max=%u",
+                 (unsigned long long)fanCensus.eligible.n97_128,(unsigned long long)fanCensus.eligible.n129_256,(unsigned long long)fanCensus.eligible.above256,fanCensus.eligible.maxNonindexed,
+                 (unsigned long long)fanCensus.submitted.n97_128,(unsigned long long)fanCensus.submitted.n129_256,(unsigned long long)fanCensus.submitted.above256,fanCensus.submitted.maxNonindexed);
             mosaic=access(RECOMP_APP_PATH("/private-trace/diag-mosaic"),F_OK)==0;v369Mosaic=mosaic; // (v369: no deferral while on)
             const bool sync=access(RECOMP_APP_PATH("/private-trace/diag-generic-sync"),F_OK)==0;
             const bool nocache=access(RECOMP_APP_PATH("/private-trace/diag-generic-nocache"),F_OK)==0;
@@ -10407,26 +10773,61 @@ public:
             hazards({src.image},{presentImage.image});
             vkCmdBlitImage(cmd,src.image,VK_IMAGE_LAYOUT_GENERAL,presentImage.image,VK_IMAGE_LAYOUT_GENERAL,1,&blit,VK_FILTER_LINEAR);
         }
+#if defined(RECOMP_TOUCH_MAPTAP)
+        mapTapPresentTouch(mosaic,presentImage,pw,ph); // qol-touch (v700) / iPad 231: a MAP-tab frame of the macro -> the last frame without it
+#endif
 #ifdef RECOMP_THOR_EDITION
         if(!mosaic)mapTapPresent(presentImage,pw,ph); // thor-maptap (v658): a MAP-tab frame of the macro -> the last frame without it
 #endif /* RECOMP_THOR_EDITION */
-        afterWrite();ffPresent(presentImage,pw,ph);fgbPresent(presentImage); // (fixer2: ffPresent, the frame facts; one branch while off. v582: + the luma grid)
-        // fg-burst (lane B, stage 1a): the blitted picture and the depth into the ring / the read-out, while armed (out of line; a test of one flag otherwise)
-        // v309: the frame-rate counter (files/private-trace/diag-fps-overlay), drawn over the frame's top-right corner: a strip
-        // rendered on the CPU when its half-second window closes, copied from the ring every frame (~27 KB, one copy command).
+        afterWrite();fgbPresent(presentImage); // fg-burst (lane B, stage 1a): the blitted picture and the depth into the ring / the read-out, while armed (out of line; a test of one flag otherwise)
+        // v309: the frame-rate counter (files/private-trace/diag-fps-overlay). iPad (SPEC 5.5 / §12, the Fold's v713): a game-style label,
+        // "60 FPS" white with a black drop shadow and no box (with frame generation the real rate small and grey beside it), rebuilt when
+        // the meter's half-second window closes and copied each frame as its opaque runs (one copy command, one region per run);
+        // files/private-trace/diag-fps-detail = the v309 strip (fps, ms, max) instead. The corner is v713's fpsCorner: top left at 0.075 of
+        // the shown width (just right of HIDE), inside the part the screen shows when filled; diag-fps-right = the top-right corner.
         {
             const auto nowNs=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
-            if(fpsMeter.present(nowNs,500'000'000ull,recomp::fg::secondPresents.load(std::memory_order_relaxed)) && fpsOverlay) // (v572: + the pairs' second pictures)
-                fpsStrip=v309::render(v309::text(fpsMeter.fps,fpsMeter.shownFps,fpsMeter.ms,fpsMeter.worstMs));
-            if(fpsOverlay && v309::stripShown() && !census.active && !census.armed && !fpsStrip.rgba.empty() && fpsStrip.width+8<=pw && fpsStrip.height+8<=ph) { // (lane fsr-stage-b: pw, ph; v826: v309::stripShown)
-                if(const auto at=allocate(fpsStrip.rgba.size())) {
-                    std::memcpy(static_cast<std::uint8_t*>(ring.mapped)+*at,fpsStrip.rgba.data(),fpsStrip.rgba.size());
-                    VkBufferImageCopy c{};c.bufferOffset=*at;c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
-                    // top-right corner (the APK's development label covers the top-left of the screen)
-                    c.imageOffset={std::int32_t(pw-fpsStrip.width-8),8,0};c.imageExtent={fpsStrip.width,fpsStrip.height,1};
-                    hazards({},{presentImage.image});
-                    vkCmdCopyBufferToImage(cmd,ring.buffer,presentImage.image,VK_IMAGE_LAYOUT_GENERAL,1,&c);
-                    afterWrite();
+            static const bool fpsRight=access(RECOMP_APP_PATH("/private-trace/diag-fps-right"),F_OK)==0;
+            static const bool fpsDetail=access(RECOMP_APP_PATH("/private-trace/diag-fps-detail"),F_OK)==0;
+            static v713::Label fpsLabel;static std::vector<VkBufferImageCopy> fpsRegions; // (present() runs on one thread)
+            const bool fpsClosed=fpsMeter.present(nowNs,500'000'000ull,recomp::fg::secondPresents.load(std::memory_order_relaxed)); // (v572: + the pairs' second pictures)
+            if(fpsClosed) {
+                recomp_fps_shown.store(float(fpsMeter.shownFps),std::memory_order_relaxed);recomp_fps_real.store(float(fpsMeter.fps),std::memory_order_relaxed);
+                recomp_fps_ms.store(float(fpsMeter.ms),std::memory_order_relaxed); // (SPEC 12.5 v2: for recomp_fps_v1)
+            }
+            if(fpsClosed && fpsOverlay) {
+                if(fpsDetail)fpsStrip=v309::render(v309::text(fpsMeter.fps,fpsMeter.shownFps,fpsMeter.ms,fpsMeter.worstMs));
+                else fpsLabel=v713::render(fpsMeter.fps,fpsMeter.shownFps);
+            }
+            const unsigned fw=fpsDetail?fpsStrip.width:fpsLabel.width,fh=fpsDetail?fpsStrip.height:fpsLabel.height;
+            const auto& fbytes=fpsDetail?fpsStrip.rgba:fpsLabel.rgba;
+            const bool appLabel=!fpsDetail && v714::appDrawing(fpsNowMs(),recomp_fps_app_ms.load(std::memory_order_relaxed)); // (SPEC 12.5 v2: the app draws it)
+            if(fpsOverlay && !appLabel && !census.active && !census.armed && !fbytes.empty() && fw+8<=pw && fh+8<=ph) { // (lane fsr-stage-b: pw, ph)
+                if(const auto at=allocate(fbytes.size())) {
+                    std::memcpy(static_cast<std::uint8_t*>(ring.mapped)+*at,fbytes.data(),fbytes.size());
+                    double vx=1.0,vy=1.0;
+#if defined(__APPLE__)
+                    vx=double(recomp_ios_visible_x.load(std::memory_order_relaxed));vy=double(recomp_ios_visible_y.load(std::memory_order_relaxed)); // screen-fit (2026-10-20)
+#endif
+                    std::int32_t inX=std::int32_t(double(pw)*(1.0-vx)/2.0),inY=std::int32_t(double(ph)*(1.0-vy)/2.0);
+                    if(inX<0 || std::uint32_t(inX)*2+fw+16>pw)inX=0;
+                    if(inY<0 || std::uint32_t(inY)*2+fh+16>ph)inY=0;
+                    const std::uint32_t shown=pw-2*std::uint32_t(inX);
+                    const std::int32_t ox=fpsRight?std::int32_t(pw)-inX-std::int32_t(fw)-8:inX+std::int32_t(std::max(8u,shown*3u/40u)),oy=inY+8;
+                    fpsRegions.clear();
+                    if(fpsDetail) {
+                        VkBufferImageCopy c{};c.bufferOffset=*at;c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};c.imageOffset={ox,oy,0};c.imageExtent={fw,fh,1};
+                        fpsRegions.push_back(c);
+                    } else for(const auto& r:fpsLabel.runs) {
+                        VkBufferImageCopy c{};c.bufferOffset=*at+(VkDeviceSize(r.y)*fw+r.x)*4;c.bufferRowLength=fw;c.bufferImageHeight=fh;
+                        c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};c.imageOffset={ox+r.x,oy+r.y,0};c.imageExtent={r.w,1,1};
+                        fpsRegions.push_back(c);
+                    }
+                    if(!fpsRegions.empty()) {
+                        hazards({},{presentImage.image});
+                        vkCmdCopyBufferToImage(cmd,ring.buffer,presentImage.image,VK_IMAGE_LAYOUT_GENERAL,std::uint32_t(fpsRegions.size()),fpsRegions.data());
+                        afterWrite();
+                    }
                 }
             }
         }
@@ -10439,7 +10840,8 @@ public:
             const bool shown=recomp::gpu::direct::presenter().presentGpu(queue,presentImage.image,presentImage.view,presentTag);
             ++(shown?directFrames:directDropped);
             // The previous frame's slot completes as before (one frame in flight); no image comes back from it.
-            if(slotCount>1 && !syncPresent){if(!waitSlot((lastSubmitted+slotCount-1)%slotCount)){if(why)*why="submit";return std::nullopt;}}
+            // (ios-frames-in-flight: the OLDEST slot, which is the previous frame with two slots and the one before it with three)
+            if(slotCount>1 && !syncPresent){if(!waitSlot((lastSubmitted+1)%slotCount)){if(why)*why="submit";return std::nullopt;}}
             else if(!submit()){if(why)*why="submit";return std::nullopt;}
             ready.reset();primer.reset();
             if(!shown && !recomp::gpu::direct::presenter().usable()) { // (the presenter stopped: later frames read back again)
@@ -10486,6 +10888,25 @@ public:
         }
         if(frameStatsLeft){--frameStatsLeft;logFrameStats(rgba,width,height);} // v73 (diagnostic)
         ++counters.presents;++perf.frames;++v74.frames;
+#if defined(__APPLE__)
+        { // ios-qos-worker-low (Claude 2026-10-17; scheduling only): the thread that records the frame's Vulkan commands (the async
+          // pipeline worker, recomp-render-w, ~60 % of a performance core) asks for utility QoS (efficiency cores) while
+          // files/private-trace/ios-qos-worker-low is present (RECOMP_IOS_SWITCHES_*), else default. CPU and GPU share one power
+          // budget (c105/c116/c129). Re-read every 30 presents; RENDER_IOS_QOS thread=worker logs each change with the thread name.
+            static thread_local int applied=-1;static thread_local unsigned n=0;
+            if(!(n++%30)) {
+                // ios-qos-worker-high (Claude 2026-10-21; scheduling only): user-interactive QoS while present (c159: the worker on
+                // efficiency cores made frames slower; c400-c403: heavy-route late frames follow renderer CPU). low wins if both.
+                const int want=access(RECOMP_APP_PATH("/private-trace/ios-qos-worker-low"),F_OK)==0?1:
+                               access(RECOMP_APP_PATH("/private-trace/ios-qos-worker-high"),F_OK)==0?2:0;
+                if(want!=applied) {
+                    const int rr=pthread_set_qos_class_self_np(want==1?QOS_CLASS_UTILITY:want==2?QOS_CLASS_USER_INTERACTIVE:QOS_CLASS_DEFAULT,0);
+                    char name[32]={0};pthread_getname_np(pthread_self(),name,sizeof name);
+                    GLOG("RENDER_IOS_QOS thread=worker name=%s want=%d result=%d",name,want,rr);applied=want;
+                }
+            }
+        }
+#endif
         seFrameEnd(); // submit-early: the heaviest pass of this frame becomes the next frame's prediction (out of line)
         if(writeWatch().installed()) { // v260
             writeWatch().nextFrame();
@@ -10699,6 +11120,8 @@ public:
                 gpuPassProfile=access(RECOMP_APP_PATH("/private-trace/diag-v287-gpu-passes"),F_OK)==0; // v287 (diagnostic)
                 v338PassDump=gpuPassProfile && access(RECOMP_APP_PATH("/private-trace/diag-v338-pass-dump"),F_OK)==0;
                 gcForceV287(gpuPassProfile,v338PassDump); // gpu-cost: host tests only (RECOMP_GC_TEST_FORCE_V287), else nothing
+                const auto passPolicyState=iospassdiag::apply(passProfilingPolicy,gpuPassProfile,v338PassDump);
+                gpuPassProfile=passPolicyState.profile;v338PassDump=passPolicyState.dump;
                 static bool v290File=false;const bool v290Window=v290File; // v290: diag-v290-baseline = v289's map probes (formats, code versions, textures)
                 v290File=access(RECOMP_APP_PATH("/private-trace/diag-v290-baseline"),F_OK)==0;v290Baseline=v290File;
                 static bool v293File=false;const bool v293Window=v293File; // v293: diag-v293-baseline = every depth attachment stored
@@ -10721,6 +11144,24 @@ public:
                 // diag-v280-limit30 restores the game's own 30 fps limit. diag-v280-limit60 still forces 60 (the flag = 60 on).
                 v280File=access(RECOMP_APP_PATH("/private-trace/diag-v280-limit60"),F_OK)==0 ||
                          access(RECOMP_APP_PATH("/private-trace/diag-v280-limit30"),F_OK)!=0;
+                const auto guestLimitPolicy=static_cast<iosguestlimit::Policy>(recomp_ios_guest_frame_limit_mode?recomp_ios_guest_frame_limit_mode():0u);
+                v280File=iosguestlimit::resolve60(guestLimitPolicy,v280File);
+                { // (build 202, MEASUREMENT) ios-notecache-off: the draw site's noteCache bypassed (in-run A/B of its cost)
+                    const bool off=access(RECOMP_APP_PATH("/private-trace/ios-notecache-off"),F_OK)==0;
+                    if(off!=noteCacheOff.load(std::memory_order_relaxed)){noteCacheOff.store(off,std::memory_order_relaxed);GLOG("RENDER_IOS_NOTECACHE off=%u",unsigned(off));}
+                }
+                { // ios-vs-trim: on for the next window's NEW pipelines (logged at each change)
+                    {const bool nc=access(RECOMP_APP_PATH("/private-trace/ios-vs-noclip"),F_OK)==0;
+                     if(nc!=vsTrim.noClip.load(std::memory_order_relaxed)){vsTrim.noClip.store(nc,std::memory_order_relaxed);GLOG("RENDER_IOS_VS_NOCLIP on=%u",unsigned(nc));}}
+                    const bool on=access(RECOMP_APP_PATH("/private-trace/ios-vs-trim"),F_OK)==0;
+                    if(on!=vsTrim.on.load(std::memory_order_relaxed)) {
+                        vsTrim.on.store(on,std::memory_order_relaxed);
+                        std::lock_guard lock(vsTrim.m);
+                        GLOG("RENDER_IOS_VS_TRIM on=%u made=%llu hits=%llu unchanged=%llu failed=%llu unknown=%llu recorded_mb=%.1f",unsigned(on),
+                             (unsigned long long)vsTrim.made,(unsigned long long)vsTrim.hits,(unsigned long long)vsTrim.unchanged,
+                             (unsigned long long)vsTrim.failed,(unsigned long long)vsTrim.unknown,double(vsTrim.bytes)/1048576.0);
+                    }
+                }
                 if(recomp_v280_apply_limiter)recomp_v280_apply_limiter(v280File);
                 static bool v279File=false;const bool v279Window=v279File; // v279: diag-v279-baseline = scene IRQs through the worker handoff
                 v279File=access(RECOMP_APP_PATH("/private-trace/diag-v279-baseline"),F_OK)==0;
@@ -10764,6 +11205,10 @@ public:
                 static bool v302File=false;const bool v302Window=v302File; // v302
                 v302File=access(RECOMP_APP_PATH("/private-trace/diag-v302-baseline"),F_OK)==0;v302Baseline=v302File;
                 fpsOverlay=access(RECOMP_APP_PATH("/private-trace/diag-fps-overlay"),F_OK)==0; // v309
+#if defined(__APPLE__)
+                fpsOverlay=recomp::apple::launcher::bridge::fps(fpsOverlay);
+                recomp_fps_on.store(fpsOverlay?1:0,std::memory_order_relaxed); // (SPEC 12.5 v2: recomp_fps_v1's answer: the Frame-Rate Counter setting)
+#endif
                 static bool v308File=false;const bool v308Window=v308File; // v308
                 v308File=access(RECOMP_APP_PATH("/private-trace/diag-v308-baseline"),F_OK)==0;
 #if defined(RECOMP_V308_TEST_BASELINE)
@@ -10782,6 +11227,69 @@ public:
                 v339zd=access(RECOMP_APP_PATH("/private-trace/diag-v339-zero-draws"),F_OK)==0;
                 v339zs=access(RECOMP_APP_PATH("/private-trace/diag-v339-zero-scissor"),F_OK)==0;
                 v339ZeroDraws=v339zd;v339ZeroScissor=v339zs;
+                iosOneTri=access(RECOMP_APP_PATH("/private-trace/ios-one-tri"),F_OK)==0; // ios-one-tri (measurement only)
+                iosOneTriHdr=access(RECOMP_APP_PATH("/private-trace/ios-one-tri-hdr"),F_OK)==0; // ios-one-tri-hdr (measurement only)
+                iosHdrQuadSkip=access(RECOMP_APP_PATH("/private-trace/ios-hdrquad-skip"),F_OK)==0; // ios-hdrquad-skip (measurement only)
+                iosTileNoConst=access(RECOMP_APP_PATH("/private-trace/ios-tile-noconst"),F_OK)==0; // ios-tile-noconst (measurement only)
+                iosFanIndexed=access(RECOMP_APP_PATH("/private-trace/ios-fan-indexed"),F_OK)==0; // ios-fan-indexed (exact)
+                iosFanSmall=access(RECOMP_APP_PATH("/private-trace/ios-fan-small"),F_OK)==0; // ios-fan-small (exact)
+                iosDrawLog=access(RECOMP_APP_PATH("/private-trace/ios-drawlog"),F_OK)==0; // ios-drawlog (diagnostic)
+                iosDrawLogAll=access(RECOMP_APP_PATH("/private-trace/ios-drawlog-all"),F_OK)==0;iosDrawLog=iosDrawLog || iosDrawLogAll;
+                iosDepthNoneDontCare=access(RECOMP_APP_PATH("/private-trace/ios-depthnone-dontcare"),F_OK)==0; // ios-depthnone-dontcare
+                iosNoGpuTs=access(RECOMP_APP_PATH("/private-trace/ios-no-gpu-ts"),F_OK)==0; // ios-no-gpu-ts
+                iosGpuTsAll=access(RECOMP_APP_PATH("/private-trace/ios-gpu-ts-all"),F_OK)==0; // ios-gpu-ts-all
+                {const bool was=iosInertDepth;iosInertDepth=access(RECOMP_APP_PATH("/private-trace/ios-inert-depth"),F_OK)==0 && access(RECOMP_APP_PATH("/private-trace/ios-inert-depth-off"),F_OK)!=0; // ios-inert-depth (-off: the reversed A/B order, Claude 2026-10-18)
+                 GLOG("RENDER_IOS_INERT_DEPTH on=%u draws=%llu",unsigned(was),(unsigned long long)inertDepthDraws);inertDepthDraws=0;}
+                iosSkipStripPass=access(RECOMP_APP_PATH("/private-trace/ios-skip-strip-pass"),F_OK)==0;
+                iosMeasStripOnePass=access(RECOMP_APP_PATH("/private-trace/ios-meas-strip-onepass"),F_OK)==0; // (MEASUREMENT ONLY)
+                {const bool was=iosShadowSkip3;iosShadowSkip3=access(RECOMP_APP_PATH("/private-trace/ios-shadow-skip-band3"),F_OK)==0 || // (player option)
+                     (iosLauncherShadowNear() && access(RECOMP_APP_PATH("/private-trace/ios-shadow-skip-band3-off"),F_OK)!=0); // launcher Shadow Distance: Near (-off: A/B)
+                 GLOG("RENDER_IOS_SHADOW on=%u bands=%llu,%llu,%llu,%llu skipped=%llu",unsigned(was),(unsigned long long)shadowBand[0],(unsigned long long)shadowBand[1],
+                      (unsigned long long)shadowBand[2],(unsigned long long)shadowBand[3],(unsigned long long)shadowSkipped);shadowBand={};shadowSkipped=0;}
+                {const bool was=!iosHudFitOff;iosHudFitOff=access(RECOMP_APP_PATH("/private-trace/ios-hud-fit-off"),F_OK)==0; // ios-hud-fit
+                 GLOG("RENDER_IOS_HUD_FIT on=%u draws=%llu vx=%.3f vy=%.3f",unsigned(was),(unsigned long long)hudFitDraws,
+                      double(recomp_ios_visible_x.load(std::memory_order_relaxed)),double(recomp_ios_visible_y.load(std::memory_order_relaxed)));hudFitDraws=0;
+                 char hs[256];int at=0;for(const auto& e:hudSizes)if(e.second && at<200)at+=std::snprintf(hs+at,sizeof hs-at,"%ux%u:%u ",e.first>>16,e.first&0xFFFFu,e.second);
+                 if(at)GLOG("RENDER_IOS_HUD_SIZES %s",hs);hudSizes={};
+                 std::vector<std::pair<std::uint64_t,std::array<std::uint32_t,3>>> ho(hudOthers.begin(),hudOthers.end());
+                 std::sort(ho.begin(),ho.end(),[](const auto& a,const auto& b){return a.second[0]>b.second[0];});
+                 char os[1024];int ot=0;for(std::size_t i=0;i<ho.size() && i<12 && ot<900;++i)
+                     ot+=std::snprintf(os+ot,sizeof os-ot,"%016llx:%u/%u/%u ",(unsigned long long)ho[i].first,ho[i].second[0],ho[i].second[1],ho[i].second[2]);
+                 if(ot)GLOG("RENDER_IOS_HUD_OTHERS n=%zu %s",ho.size(),os);hudOthers.clear();
+                 char cs[512];int ct=0;for(const auto& [k,v]:hudCorner)if(ct<450)ct+=std::snprintf(cs+ct,sizeof cs-ct,"%012llx/h%u:%u ",(unsigned long long)(k>>16),unsigned(k&0xFFFF),v);
+                 if(ct)GLOG("RENDER_IOS_HUD_CORNER %s",cs);hudCorner.clear();
+                 char ns[512];int nt=0;for(const auto& [k,v]:iosNoTonemapPs)if(nt<450)nt+=std::snprintf(ns+nt,sizeof ns-nt,"%016llx:%u ",(unsigned long long)k,v);
+                 if(nt)GLOG("RENDER_IOS_NOTONEMAP %s",ns);iosNoTonemapPs.clear();
+                 iosHudFitAniso=access(RECOMP_APP_PATH("/private-trace/ios-hud-fit-aniso"),F_OK)==0; // (build 208)
+                 if(!hudNewPs.empty()){char hn[640];int nn=0;for(const auto& [k,v]:hudNewPs)if(nn<560)nn+=std::snprintf(hn+nn,sizeof hn-nn,"%016llx:%u ",(unsigned long long)k,v);
+                     GLOG("RENDER_IOS_HUD_NEW frame=%llu %s",(unsigned long long)frame,hn);for(auto& [k,v]:hudNewPs)v=0;}
+                 if(radarCompN || !radarPs.empty()){char rs[640];int rn=0;for(const auto& [k,v]:radarPs)if(rn<540)rn+=std::snprintf(rs+rn,sizeof rs-rn,"%016llx:%u/%08x ",(unsigned long long)k,v[0],v[1]);
+                     GLOG("RENDER_IOS_RADAR comp_n=%u comp_blend=%08x comp_cc=%08x aniso=%u draws %s",radarCompN,radarCompBlend,radarCompCc,unsigned(iosHudFitAniso),rs);radarPs.clear();radarCompN=0;}
+                 phoneExactSource=access(RECOMP_APP_PATH("/private-trace/ios-phone-exact-source"),F_OK)==0; // (build 218)
+                 phoneSkipRestore=access(RECOMP_APP_PATH("/private-trace/ios-phone-skip-restore"),F_OK)==0; // (build 221)
+                 if(phoneRestoreSkips){GLOG("RENDER_IOS_PHONE_RESTORE_SKIPS n=%llu",(unsigned long long)phoneRestoreSkips);phoneRestoreSkips=0;}
+                 {const bool was=!phoneDepthKeep;phoneDepthKeep=access(RECOMP_APP_PATH("/private-trace/ios-phone-depth-keep"),F_OK)==0; // (build 230)
+                  if(phoneDepthAlways){GLOG("RENDER_IOS_PHONE_DEPTH on=%u always=%llu",unsigned(was),(unsigned long long)phoneDepthAlways);phoneDepthAlways=0;}}
+                 {const bool pw=!iosHudPhoneOff;iosHudPhoneOff=access(RECOMP_APP_PATH("/private-trace/ios-hud-fit-phone-off"),F_OK)==0; // (build 207)
+                  if(hudPhoneCompN){GLOG("RENDER_IOS_HUD_PHONE_COMPOSITE on=%u n=%u",unsigned(pw),hudPhoneCompN);hudPhoneCompN=0;}
+                  if(hudPhone3dN){GLOG("RENDER_IOS_HUD_PHONE3D on=%u n=%u vp=%.0f,%.0f-%.0f,%.0f",unsigned(pw),hudPhone3dN,double(hudPhone3dVp[0]),double(hudPhone3dVp[1]),double(hudPhone3dVp[2]),double(hudPhone3dVp[3]));hudPhone3dN=0;}
+                  for(unsigned q=0;q<3;++q)if(hudPhoneN[q]){const auto& e=hudPhoneVp[q];
+                      GLOG("RENDER_IOS_HUD_PHONE on=%u ps=%s n=%u vp=%.0f,%.0f-%.0f,%.0f",unsigned(pw),q==0?"1a1a1450f4c4fa2b":q==1?"b5862f8ab1abc15e":"8598fc008dd0f742",
+                           hudPhoneN[q],double(e[0]),double(e[1]),double(e[2]),double(e[3]));hudPhoneN[q]=0;}
+                  if(hudA67eN)GLOG("RENDER_IOS_HUD_A67E on=%u n=%u vp=%.0f,%.0f-%.0f,%.0f sc=%d,%d-%d,%d",unsigned(pw),hudA67eN,double(hudA67eVp[0]),double(hudA67eVp[1]),
+                                   double(hudA67eVp[2]),double(hudA67eVp[3]),hudA67eSc[0],hudA67eSc[1],hudA67eSc[2],hudA67eSc[3]);
+                  hudA67eN=0;hudA67eVp={1e9f,1e9f,-1e9f,-1e9f};hudA67eSc={1<<30,1<<30,-(1<<30),-(1<<30)};}}
+                {const bool was=iosProbeSlice;iosProbeSlice=access(RECOMP_APP_PATH("/private-trace/ios-probe-slice"),F_OK)==0 && access(RECOMP_APP_PATH("/private-trace/ios-probe-slice-off"),F_OK)!=0; // ios-probe-slice (player option)
+                 GLOG("RENDER_IOS_PROBE on=%u learned=%u skipped_draws=%llu skipped_copies=%llu kept_copies=%llu",unsigned(was),unsigned(probeLearned),
+                      (unsigned long long)probeStats.draws,(unsigned long long)probeStats.copies,(unsigned long long)probeStats.keptCopies);probeStats={};}
+                {const bool was=iosRenderArea;iosRenderArea=access(RECOMP_APP_PATH("/private-trace/ios-render-area"),F_OK)==0 && access(RECOMP_APP_PATH("/private-trace/ios-render-area-off"),F_OK)!=0; /* (-off: reversed A/B order, Claude 2026-10-18) */ // ios-render-area (opt-in: c123c -1.4 ms, c127 +0.9 ms: no resolvable effect)
+                 GLOG("RENDER_IOS_AREA on=%u limited=%llu full=%llu splits=%llu area_share=%.3f",unsigned(was),(unsigned long long)areaStats.limited,
+                      (unsigned long long)areaStats.full,(unsigned long long)areaStats.splits,areaStats.fullPx?double(areaStats.areaPx)/double(areaStats.fullPx):0.0);areaStats={};}
+                GLOG("RENDER_IOS_STRIPS residue=%llu full_clears=%llu later_other_frame=%llu skipped=%llu draws=%llu later_draws=%llu later_depth=%llu resolves=%llu redirected=%llu",(unsigned long long)stripStats.residue,(unsigned long long)stripStats.fullClears,(unsigned long long)stripStats.laterOtherFrame,(unsigned long long)stripStats.skipped,(unsigned long long)stripStats.draws,
+                     (unsigned long long)stripStats.laterDraws,(unsigned long long)stripStats.laterDepth,(unsigned long long)stripStats.resolves,(unsigned long long)stripStats.redirected);stripStats={};
+                {const bool on=iosPreBarrier;iosPreBarrier=access(RECOMP_APP_PATH("/private-trace/ios-prebarrier"),F_OK)==0; // ios-prebarrier
+                 GLOG("RENDER_IOS_PREBARRIER on=%u splits=%llu pre=%llu keys=%zu",unsigned(on),(unsigned long long)preStats.splits,
+                      (unsigned long long)preStats.pre,preBarrierImages.size());preStats={};}
                 static bool v340c=false,v340p=false,v340o=false;const bool v340cWindow=v340c,v340pWindow=v340p,v340oWindow=v340o; // v340 (measurement)
                 v340c=access(RECOMP_APP_PATH("/private-trace/diag-v340-skip-const"),F_OK)==0;
                 v340p=access(RECOMP_APP_PATH("/private-trace/diag-v340-skip-pipe"),F_OK)==0;
@@ -10798,7 +11306,7 @@ public:
                 v346s=access(RECOMP_APP_PATH("/private-trace/diag-v346-main-spin"),F_OK)==0;
                 static bool v347s=false;const bool v347sWindow=v347s; // v347: diag-v347-spin100 (100 us; wins over the 40 us switch)
                 v347s=access(RECOMP_APP_PATH("/private-trace/diag-v347-spin100"),F_OK)==0;
-                ::recomp_v346_main_spin_us.store(parkWatchPoll(v347s?100u:v346s?40u:0u),std::memory_order_relaxed); // park-watch (v531): with neither of its files the older files' value as before
+                ::recomp_v346_main_spin_us.store(v347s?100u:v346s?40u:0u,std::memory_order_relaxed);
                 static bool v348f=false;const bool v348Window=v348f; // v348 (diagnostic): 400 us before each audio frame submission
                 v348f=access(RECOMP_APP_PATH("/private-trace/diag-v348-audio-spin"),F_OK)==0;
                 ::recomp_v348_audio_spin_us.store(v348f?400u:0u,std::memory_order_relaxed); // (400 us x 187.5 submissions/s = 75 ms/s)
@@ -10829,6 +11337,11 @@ public:
                 v363FlatMaps=v363f;
                 static bool v369f=false;const bool v369Window=v369f; // v369: diag-v369-pass-ops (exact; default off)
                 v369f=access(RECOMP_APP_PATH("/private-trace/diag-v369-pass-ops"),F_OK)==0;
+#if defined(__APPLE__)
+                // ios-v369 (Claude 2026-10-17, candidate): on iOS the pass ops are on unless files/private-trace/ios-v369-off (c161: the
+                // 24 resolve-clear passes a frame fold into the next pass's load clear; Android rejected it for CPU cost, iOS is GPU-bound)
+                v369f=v369f || access(RECOMP_APP_PATH("/private-trace/ios-v369-off"),F_OK)!=0;
+#endif
 #if defined(RECOMP_V369_TEST_ON)
                 v369f=true;
 #endif
@@ -10969,12 +11482,6 @@ public:
                 v311File=access(RECOMP_APP_PATH("/private-trace/diag-v311-ubo-big"),F_OK)==0;uboBig=v311File;
                 v586NoRemap=access(RECOMP_APP_PATH("/private-trace/diag-v586-no-remap"),F_OK)==0; // v586 (polled; the remaps stay, unused)
                 v591Off=access(RECOMP_APP_PATH("/private-trace/diag-v591-no-msaa-alias"),F_OK)==0; // v591 (polled)
-                { // v587: the resolve watch list (hex addresses)
-                    const auto f=afdiag::loadKeyFilter(RECOMP_APP_PATH("/private-trace/diag-resolve-watch"));
-                    watchAddrs.clear();for(const auto k:f.keys)watchAddrs.push_back(physicalAddress(std::uint32_t(k)));
-                    const bool was=watchOn;watchOn=f.active && !watchAddrs.empty();
-                    if(watchOn!=was){watchHist.clear();GLOG("RENDER_WATCH on=%u addresses=%zu",unsigned(watchOn),watchAddrs.size());}
-                }
                 static bool v310File=false;const bool v310Window=v310File; // v310
                 v310File=access(RECOMP_APP_PATH("/private-trace/diag-v310-baseline"),F_OK)==0;
 #if defined(RECOMP_V310_TEST_BASELINE)
@@ -11053,19 +11560,16 @@ public:
                 awWindow(); // async-wake: diag-aw-* (V210Z aw_* + RENDER_DIAG_AW, own lines; out of line)
                 msWindow(); // main-sched: diag-ms-* (V210Z ms_* + RENDER_DIAG_MS, own lines; out of line)
                 mw2Window(); // main-waits-2: diag-mw2-* (V210Z mw2_* + RENDER_DIAG_MW2, own lines; out of line)
-                swWindow(); // scene-wait: diag-sw-watch / -500 (V210Z sw_* + RENDER_DIAG_SW, own lines; out of line)
                 pxWindow(); // prime-exchange: diag-px-* (V210Z px_* + RENDER_DIAG_PX, own lines; out of line)
                 recomp::diag::quietLogWindow(); // quiet-log: diag-quiet-log (V210Z quiet_log; diag_log_sample.h, out of line)
                 wfWindow(); // worker-fixed: diag-wf-host-alloc (V210Z wf_* + RENDER_DIAG_WF, own lines; out of line)
                 smWindow(); // span-move: diag-sm-worker (V210Z sm_worker, own line; out of line)
                 paceWindow(); // pace-caps (lane A): diag-pace-* (V210Z pace* + RENDER_DIAG_PACE, own lines; out of line)
-                gcWindow(); recomp::native_imports::window(); // gpu-cost: diag-gc-* (V210Z gc_* + RENDER_DIAG_GC, own lines; out of line); native-imports: diag-native-imports (V210Z native_imports + RENDER_GENERIC_NATIVE + RENDER_DIAG_NATIVE, own lines; out of line)
+                gcWindow(); // gpu-cost: diag-gc-* (V210Z gc_* + RENDER_DIAG_GC, own lines; out of line)
                 {const unsigned fsr=recomp::gpu::direct::presentedFsr.load(std::memory_order_relaxed); // v450 (agent fsr1): the presenter's FSR
                  GLOG("RENDER_GENERIC_V210Z v450_scale_fsr1=%u v450_fsr1_no_rcas=%u",unsigned(fsr!=0),unsigned(fsr==2));} // (mode at the window's end, as v42x)
                 v460GsrWindow(); // v460 (agent gsr1): the presenter's Snapdragon GSR 1 (V210Z v460_scale_gsr1, own line; out of line)
-                fgWindow(); fgbWindow(); ffWindow(); // (fixer2: diag-frame-facts)
-                // frame-gen (lane B): diag-fg-pair-* (V210Z fg_*; counters: the presenter's RENDER_DIRECT_FG; out of line); fg-burst: diag-fg-burst / diag-fg-burst-go (no line while absent)
-                clothWatchWindow(); // v606 (G14 diagnostic)
+                fgWindow(); fgbWindow(); // frame-gen (lane B): diag-fg-pair-* (V210Z fg_*; counters: the presenter's RENDER_DIRECT_FG; out of line); fg-burst: diag-fg-burst / diag-fg-burst-go (no line while absent)
                 vfiWindow(); // lane vfetch-index: diag-generic-no-vfetch-index (V210Z no_vfetch_index + RENDER_GENERIC_VFETCH_INDEX, own lines; out of line)
                 v311BigBinds=v311SmallBinds=0;
                 {const auto& ps=recomp_v266::pollSleep();
@@ -11092,6 +11596,30 @@ public:
         if(textureEvict && baseResources)evictTexturesV74(); // v74 (between frames: nothing of the next frame is recorded yet); v96: maintain()
         // v40: the census covers the frame that starts now (nothing is being recorded at this point).
         if(!queued && census.armed && !census.active){census.armed=false;censusBegin();}
+        if(iosSharedEligible && syncPresent && !frameInterp && !census.active && !census.armed && !displayRampActive && !rgba.empty()) {
+            RecompIosGpuFrameV1 f{};f.structureBytes=sizeof(f);f.version=1;
+            f.deviceEpoch=1;f.sourceGeneration=iosSourceGeneration;f.sourceFrame=counters.presents;
+            f.instance=d.instance;f.physicalDevice=d.physical;f.device=d.device;f.queue=queue;f.queueFamily=d.queueFamily;
+            f.width=width;f.height=height;f.image=presentImage.image;f.view=presentImage.view;
+            f.format=VK_FORMAT_R8G8B8A8_UNORM;f.layout=VK_IMAGE_LAYOUT_GENERAL;
+            f.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+            f.sourceFenceComplete=1;iosSharedFrame=f;
+            if(iosProducing){iosAsyncProduced=std::move(iosProducing);iosProducing.reset();}
+        }
+        if(iosProducing)throw std::runtime_error("async shared source lacks completed frame");
+        if(waitTimingEnabled) {
+            auto& wt=slots[lastSubmitted].waitTiming;
+            if(waitReporter.select(wt)) {
+                GLOG("RENDER_WAIT_FRAME recording_frame=%llu source_frame=%llu source_generation=%llu source_join_valid=%u slot=%u events=%u overflow=%llu invalid=%llu total_reports=%u slow_reports=%u clock=std-steady-ns post_fence_includes_readback=1",
+                    (unsigned long long)wt.recording.frame,(unsigned long long)(iosSharedFrame?iosSharedFrame->sourceFrame:0),
+                    (unsigned long long)(iosSharedFrame?iosSharedFrame->sourceGeneration:0),unsigned(iosSharedFrame && renderwait::sourceJoined(wt,waitCompletedReadback?&*waitCompletedReadback:nullptr,iosSharedFrame->sourceFrame,counters.presents,iosSharedFrame->sourceGeneration,iosSourceGeneration,iosSharedFrame->sourceFenceComplete==1,syncPresent)),wt.recording.slot,
+                    wt.events,(unsigned long long)wt.overflow,(unsigned long long)wt.invalid,waitReporter.total,waitReporter.slow);
+                for(unsigned phase=0;phase<renderwait::PhaseCount;++phase){const auto&t=wt.phases[phase];
+                    GLOG("RENDER_WAIT_PHASE recording_frame=%llu slot=%u phase=%u count=%llu sum_ns=%llu peak_ns=%llu peak_begin_ns=%llu peak_end_ns=%llu peak_command=%llx peak_fence=%llx",
+                        (unsigned long long)wt.recording.frame,wt.recording.slot,phase,(unsigned long long)t.count,(unsigned long long)t.ns,
+                        (unsigned long long)t.peak,(unsigned long long)t.begin,(unsigned long long)t.end,(unsigned long long)t.command,(unsigned long long)t.fence);}
+            }
+        }
         if(why)*why="generic-present";
         return rgba;
     }
@@ -11126,6 +11654,9 @@ public:
         double workerCpuMs=-1,workerWaitMs=-1; // v344: this (worker) thread's CPU and run-queue wait per frame since the last line
         {static std::uint64_t lastRun=0,lastWait=0;std::uint64_t run=0,wait=0;
          if(v344::schedstat("/proc/thread-self/schedstat",run,wait)){if(lastRun){workerCpuMs=double(run-lastRun)*1e-6/f;workerWaitMs=double(wait-lastWait)*1e-6/f;}lastRun=run;lastWait=wait;}}
+        {auto& k=iosResolveKinds;GLOG("RENDER_IOS_RESOLVE_KINDS frames=%llu total=%llu depth=%llu depth_clear=%llu color=%llu color_clear=%llu clear_whole=%llu clear_whole_same=%llu swap_candidates=%llu swap_mtexels=%.2f",
+            (unsigned long long)perf.frames,(unsigned long long)k.total,(unsigned long long)k.depth,(unsigned long long)k.depthClear,(unsigned long long)k.color,
+            (unsigned long long)k.colorClear,(unsigned long long)k.colorClearWhole,(unsigned long long)k.colorClearWholeSame,(unsigned long long)k.swapCandidates,double(k.swapTexels)*1e-6);k=IosResolveKinds{};}
         GLOG("RENDER_GENERIC_TIMING frames=%llu frame_ms=%.1f qd_ms=%.1f cd_ms=%.1f rcpu_ms=%.2f rwait_ms=%.2f mcpu_ms=%.2f mwait_ms=%.2f wcpu_ms=%.2f wwait_ms=%.2f renderer_ms=%.2f draw_ms=%.2f shader_ms=%.2f index_ms=%.2f vertex_ms=%.2f "
              "texture_ms=%.2f clear_ms=%.2f resolve_ms=%.2f present_ms=%.2f wait_ms=%.2f readback_ms=%.2f draws=%.0f reader_calls=%.0f "
              "reader_kb=%.0f fingerprint_reads=%.0f binding_hits=%.0f binding_misses=%.0f sets=%.0f vertex_kb=%.0f indices=%.0f "
@@ -11141,8 +11672,14 @@ public:
              perf.setsCreated/f,perf.vertexBytes/1024.0/f,perf.indices/f,perf.stateSkips/f,perf.ringPeak/1048576.0,codes.size(),
              (unsigned long long)codes.hits,(unsigned long long)codes.misses,(unsigned long long)codes.collisions,bindings.size(),
              slotCount,unsigned(syncPresent),unsigned(cachesEnabled),unsigned(readbackCached),readbackType==~0u?-1:int(readbackType),
-             perf.gpuNs*ms,perf.gpuSamples/f,perf.passes/f,perf.barriers/f,perf.barriersSkipped/f,perf.pipelinesCreated/f,perf.pipelineNs*ms,
+             perf.gpuSamples?double(perf.gpuNs)/double(perf.gpuSamples)*1e-6:0.0,perf.gpuSamples/f,perf.passes/f, // (ios-gpu-ts: per timed frame)
+             perf.barriers/f,perf.barriersSkipped/f,perf.pipelinesCreated/f,perf.pipelineNs*ms,
              unsigned(targetedBarriers));
+#if defined(__APPLE__)
+        recompIosWindowGpuUs.store(unsigned(std::min(perf.gpuSamples?double(perf.gpuNs)/double(perf.gpuSamples)*1e-3:0.0,1e9)),std::memory_order_relaxed); // ios-qos-adaptive (per timed frame: timestamps are sampled 1/16)
+        {static int startPhase=-2;const int now=recomp::ios_switches::abPhase(); // ios-switches: the A/B phase at the window's start and end
+         if(now>=0)GLOG("RENDER_IOS_AB start=%d end=%d",startPhase,now);startPhase=now;}
+#endif
         GLOG("RENDER_DIAG_V294_MODULES ubo_banks=%u rewritten=%llu unbanked=%llu refused=%llu",unsigned(uboBanks),
              (unsigned long long)v294.rewritten,(unsigned long long)v294.unbanked,(unsigned long long)v294.refused);
         GLOG("RENDER_DIAG_V293 baseline=%u available=%u none_passes=%.1f store_passes=%.1f splits=%.2f framebuffers=%zu",unsigned(v293Baseline),
@@ -11876,15 +12413,16 @@ public:
     std::vector<Vkw4AttrMemo> vkw4AttrMemos;std::uint64_t vkw4AttrTrims=0;
 #include "fg_burst_renderer.inc" // fg-burst (lane B, stage 1a): the capture diag-fg-burst (last: the members above keep v463's offsets)
 #include "fg_gen_renderer.inc" // framegen-1b: the generator's inputs, diag-fg-between (last: the members above keep v465's offsets)
-#include "frame_facts_renderer.inc" // fixer2: the frame facts (after it: the members above keep their offsets)
 #ifdef RECOMP_THOR_EDITION
 #include "hud_replay_renderer.inc" // hud4 (v597): the second screen's minimap replay (last: the members above keep their offsets)
 #include "wheel_replay_renderer.inc" // thor-wheel (v605): the weapon wheel on the lower screen (after hud4's members)
-#include "map_tap_renderer.inc" // thor-maptap (v658): the MAP-tab frames of the map-tap macro hidden (after thor-wheel's members)
 #endif /* RECOMP_THOR_EDITION */
+#if defined(RECOMP_THOR_EDITION) || defined(RECOMP_TOUCH_MAPTAP)
+#include "map_tap_renderer.inc" // thor-maptap (v658) / qol-touch (v700) / iPad 231: the map-tap macro's renderer half (last members)
+#endif
 };
 
-std::mutex rendererMutex;
+recomp::ios_shared::RendererMutex rendererMutex;
 std::unique_ptr<Renderer> renderer;
 
 // ======== v111: the pipelined renderer (docs/fable/PERF_PLAN.md change 1) ========
@@ -11916,9 +12454,18 @@ std::unique_ptr<Renderer> renderer;
 // draws/clears/resolves queued or executing at most. v185: 1024 (v111-v184: 256; v184 house: the render thread stalled
 // 13 times, 3.6 ms per frame, on a full queue while the worker averaged 30 of 43 ms). The order and every drain are
 // unchanged. files/private-trace/diag-generic-async-depth-256 (read once, at renderer start) restores 256.
+// ios-pipe-big (Claude, 2026-10-16; read once, at renderer start; patch builder agent's item 4): a deeper queue, RECOMP_IOS_PIPE_DEPTH
+// items (default 4096, 1024..16384): only how far the capture may run ahead of the renderer thread before push() waits; same
+// items, order and drains (the v185 256 -> 1024 knob). c76: the render thread's push stalls 13-19 ms/frame -> 0 on foot.
 unsigned asyncDepth() {
-    static const unsigned depth=access(RECOMP_APP_PATH("/private-trace/diag-generic-async-depth-256"),F_OK)==0
-        ? 256u : 1024u;
+    static const unsigned depth=[]{
+        const unsigned base=access(RECOMP_APP_PATH("/private-trace/diag-generic-async-depth-256"),F_OK)==0 ? 256u : 1024u;
+        if(access(RECOMP_APP_PATH("/private-trace/ios-pipe-big"),F_OK)!=0)return base;
+        unsigned big=4096u;
+        if(const char* e=std::getenv("RECOMP_IOS_PIPE_DEPTH")){const unsigned long v=std::strtoul(e,nullptr,10);if(v)big=unsigned(std::min<unsigned long>(v,16384ul));}
+        big=std::max(big,1024u);
+        GLOG("RENDER_IOS_PIPE_BIG depth=%u (was %u)",big,base);
+        return big;}();
     return depth;
 }
 constexpr std::chrono::microseconds AsyncSpin{40};       // an idle renderer thread polls this long before it sleeps
@@ -12007,9 +12554,18 @@ struct AsyncCounters {
         rlQuietResets=0,rlFrontValidations=0,rlFrontRevalidations=0,rlCodeHits=0,rlCodeMisses=0,rlSlot2Hits=0,rlVerifyChecks=0,rlVerifyBad=0;
 };
 
+static async::WorkerScopeHooks asyncWorkerScope(bool enabled) {
+#if defined(__APPLE__)
+    if(enabled)return {&iosasyncworkerqos::controller(),&iosasyncworkerqos::enter,&iosasyncworkerqos::leave};
+#else
+    (void)enabled;
+#endif
+    return {};
+}
+
 class AsyncFront {
 public:
-    explicit AsyncFront(Renderer& renderer):r(renderer),pipe([this](const async::Item& item){execute(item);},asyncDepth(),AsyncSpin,"recomp-render-w",asyncDrainSpin()) {
+    explicit AsyncFront(Renderer& renderer,bool workerQos=false):r(renderer),pipe([this](const async::Item& item){execute(item);},asyncDepth(),AsyncSpin,"recomp-render-w",asyncDrainSpin(),asyncWorkerScope(workerQos)) {
         workerViewer=[this](std::uint32_t a,std::uint32_t n){return r.asyncView(a,n);};
         workerReader=[this](std::uint32_t a,std::uint32_t n)->std::optional<std::vector<std::uint8_t>> {
             if(const auto* v=r.asyncView(a,n))return std::vector<std::uint8_t>(v,v+n);
@@ -12161,7 +12717,7 @@ public:
         DrawInput converted;const DrawInput* use=&in; // v236: a refused capture draws synchronously with converted indices
         if(in.rawIndices){converted=in;converted.rawIndices=nullptr;converted.indices.resize(in.rawIndexCount);
             recomp::gpu::hot::bigEndianIndices(in.rawIndices,in.rawIndexCount,in.rawIndex32,converted.indices.data());use=&converted;}
-        const char* w=nullptr;const bool ok=renderer->draw(*use,data,&w);if(why)*why=w;logResult('d',w);
+        const char* w=nullptr;const bool ok=renderer->draw(*use,data,&w);if(!w)w="draw-unreported";if(why)*why=w;logResult('d',w);
         { // v204 DIAGNOSTIC: what the synchronous fallback did with the draw the capture refused (first 16, then powers of two)
             static std::uint64_t fallbackLogged=0;const auto n=++fallbackLogged;
             if(n<=16 || !(n&(n-1)))GLOG("RENDER_DIAG_DRAW_FALLBACK n=%llu ok=%u why=%s planned=%u",(unsigned long long)n,unsigned(ok),w?w:"-",unsigned(planned));
@@ -12204,7 +12760,7 @@ public:
         DrawInput converted;const DrawInput* use=&in; // v236: a refused capture draws synchronously with converted indices
         if(in.rawIndices){converted=in;converted.rawIndices=nullptr;converted.indices.resize(in.rawIndexCount);
             recomp::gpu::hot::bigEndianIndices(in.rawIndices,in.rawIndexCount,in.rawIndex32,converted.indices.data());use=&converted;}
-        const char* w=nullptr;const bool ok=renderer->draw(*use,data,&w);if(why)*why=w;logResult('d',w);
+        const char* w=nullptr;const bool ok=renderer->draw(*use,data,&w);if(!w)w="draw-unreported";if(why)*why=w;logResult('d',w);
         { // v204 DIAGNOSTIC: what the synchronous fallback did with the draw the capture refused (first 16, then powers of two)
             static std::uint64_t fallbackLogged=0;const auto n=++fallbackLogged;
             if(n<=16 || !(n&(n-1)))GLOG("RENDER_DIAG_DRAW_FALLBACK n=%llu ok=%u why=%s planned=%u",(unsigned long long)n,unsigned(ok),w?w:"-",unsigned(planned));
@@ -12403,6 +12959,7 @@ private:
                 r.asyncSpans=&p->spans;std::swap(r.viewer,workerViewer);
                 struct Restore {AsyncFront& f;DrawPacket* p;DrawInput& in;~Restore(){f.r.asyncSpans=nullptr;std::swap(f.r.viewer,f.workerViewer);in.indices.swap(p->indices);}}
                     restore{*this,p,in};
+                if(const auto us=v562ItemSpinUs.load(std::memory_order_relaxed))v562SpinUs(us); // ios-spin-worker-items (measurement only)
 #ifndef RECOMP_THOR_EDITION
                 const char* w=nullptr;lastOk=r.draw(in,workerReader,&w);lastWhy=w;logResult('d',w);
 #else /* RECOMP_THOR_EDITION */
@@ -13930,16 +14487,33 @@ bool installWriteWatch(std::uint8_t* base) {
     GLOG("RENDER_GENERIC_V260 write_watch_installed=%u page=%ld",unsigned(ok),sysconf(_SC_PAGESIZE));
     return ok;
 }
+bool retireIosAsyncSharedSources() {
+    // Called after executor producer stop + dispatcher join, never from Main's
+    // inactive/input cleanup. No app callback or registry lock may be held.
+    recomp::ios_async_shared::requestStop();
+    if(asyncFront)asyncFront->drainFor(AsyncFront::Reason::Other);
+    GuestLock lock;
+    return !renderer || renderer->retireAsyncSources();
+}
 bool initialize(ProbeDevice& device,const char* packPath) {
+#if defined(__APPLE__)
+    const bool workerQos=iosasyncworkerqos::configureFromEnvironment();
+#else
+    const bool workerQos=false;
+#endif
     std::lock_guard lock(rendererMutex);
     if(renderer)return true;
+    if(recomp::ios_shared::producer && access(RECOMP_APP_PATH("/private-trace/diag-generic-sync"),F_OK)!=0)
+        throw std::runtime_error("shared device presentation requires diag-generic-sync");
     auto r=std::make_unique<Renderer>(device);
     if(!r->initialize(packPath))return false;
     renderer=std::move(r);
+    if(recomp::ios_async_shared::enabled)
+        recomp::ios_async_shared::retireSources.store(&retireIosAsyncSharedSources,std::memory_order_release);
     // v111: the renderer thread (idle until the pipeline is on), and the mode for the first frame.
     const bool syncFile=access(RECOMP_APP_PATH("/private-trace/diag-generic-sync-renderer"),F_OK)==0;
     renderer->asyncWanted=asyncForced>=0?asyncForced==1:(GENERIC_RENDERER_ASYNC_DEFAULT && !syncFile);
-    asyncFront=new AsyncFront(*renderer);
+    asyncFront=new AsyncFront(*renderer,workerQos);
     renderer->asyncPipeline=&asyncFront->pipe;
     asyncFront->pipe.setIdleHook(&AsyncFront::seIdleHook,asyncFront); // submit-early (returns at once unless diag-se-idle / armed)
     asyncFront->pipe.setAheadHook(&AsyncFront::vkw3Ahead,asyncFront); // vk-worker-3 (returns at once unless diag-vkw3-prefetch)
@@ -13965,7 +14539,7 @@ bool draw(const DrawInput& in,const Reader& data,const char** why) {
 #if defined(GENERIC_RENDERER_TEST_STATE_READS)
     struct InDraw {InDraw(){testInDraw=true;}~InDraw(){testInDraw=false;}} inDraw;
 #endif
-    const char* w=nullptr;const bool ok=renderer && renderer->draw(drawIn,data,&w);if(why && renderer)*why=w;if(renderer)logResult('d',w);
+    const char* w=nullptr;const bool ok=renderer && renderer->draw(drawIn,data,&w);if(renderer && !w)w="draw-unreported";if(why && renderer)*why=w;if(renderer)logResult('d',w);
     return ok;
 }
 bool clear(const ClearInput& in,const char** why) {
@@ -13988,6 +14562,20 @@ std::atomic<std::uint64_t> slowBarrierNs{0}; // v134 (diagnostic): render-thread
 struct SlowFrameMark {async::Clock::time_point t{};std::uint64_t draws=0,textures=0,texBytes=0,pipelines=0,images=0,resolves=0,waitNs=0,maintains=0,barrierNs=0;
                      std::array<std::uint64_t,6> sites{};}; // v137: per-site images
 SlowFrameMark slowPrev;async::Clock::time_point slowLastLog{};std::uint64_t slowFrames=0,slowPresents=0;
+#if defined(__APPLE__)
+// ios-slow-cpu (Claude 2026-10-17, diagnostic): CPU time of the main loop's, the audio's and this (render) host thread over a slow
+// frame's interval, read at every present (thread_info, ~1 us each): which thread was busy while the frame was late.
+extern "C" std::atomic<unsigned> recomp_ios_main_port,recomp_ios_audio_port; // trace_runner.cpp
+inline std::uint64_t iosThreadCpuNs(unsigned port) noexcept {
+    if(!port)return 0;
+    thread_basic_info_data_t info{};mach_msg_type_number_t cnt=THREAD_BASIC_INFO_COUNT;
+    if(thread_info(thread_act_t(port),THREAD_BASIC_INFO,reinterpret_cast<thread_info_t>(&info),&cnt)!=KERN_SUCCESS)return 0;
+    return (std::uint64_t(info.user_time.seconds)+info.system_time.seconds)*1000000000ull+
+           (std::uint64_t(info.user_time.microseconds)+info.system_time.microseconds)*1000ull;
+}
+struct IosSlowCpu {unsigned mainPort=0,audioPort=0;std::uint64_t main=0,audio=0,render=0;};
+IosSlowCpu iosSlowPrev;
+#endif
 // v134/v177: the slow-frame line (a present more than 80 ms after the previous one), under rendererMutex.
 void slowFrameStats(Renderer& r,async::Clock::time_point start,async::Clock::time_point drained) {
     const SlowFrameMark now{start,r.counters.draws,r.counters.textures,r.slowTexBytes,r.counters.pipelines,r.slowImagesMade,r.counters.resolves,
@@ -13997,6 +14585,21 @@ void slowFrameStats(Renderer& r,async::Clock::time_point start,async::Clock::tim
         (unsigned long long)slowPresents,(unsigned long long)r.counters.pipelines,(unsigned long long)r.recipesRecorded,(unsigned long long)r.recipesVariant,
         (unsigned long long)r.recipesUnrecordable,(unsigned long long)r.recipesDuplicate,(unsigned long long)r.recipeWriteFailures,
         r.prewarmCompiled.load(),r.prewarmFailed.load(),r.prewarmSkipped.load(),unsigned(r.prewarmDone.load()));
+#if defined(__APPLE__)
+    IosSlowCpu cpuNow;cpuNow.mainPort=recomp_ios_main_port.load(std::memory_order_relaxed);cpuNow.audioPort=recomp_ios_audio_port.load(std::memory_order_relaxed);
+    cpuNow.main=iosThreadCpuNs(cpuNow.mainPort);cpuNow.audio=iosThreadCpuNs(cpuNow.audioPort);
+    {const thread_act_t self=mach_thread_self();cpuNow.render=iosThreadCpuNs(unsigned(self));mach_port_deallocate(mach_task_self(),self);}
+    const auto cpuDelta=[&](std::uint64_t now_,std::uint64_t prev,bool same){return same && now_>=prev?double(now_-prev)*1e-6:-1.0;};
+    const double mainCpu=cpuDelta(cpuNow.main,iosSlowPrev.main,cpuNow.mainPort==iosSlowPrev.mainPort),
+                 audioCpu=cpuDelta(cpuNow.audio,iosSlowPrev.audio,cpuNow.audioPort==iosSlowPrev.audioPort),
+                 renderCpu=cpuDelta(cpuNow.render,iosSlowPrev.render,true);
+    iosSlowPrev=cpuNow;
+#endif
+#if defined(__APPLE__)
+    if(slowPrev.t!=async::Clock::time_point{} && !(slowPresents%600)) // ios-slow-cpu: an ordinary present interval for comparison
+        GLOG("RENDER_IOS_SLOW_CPU baseline=1 interval_ms=%.1f main_cpu_ms=%.1f audio_cpu_ms=%.1f render_cpu_ms=%.1f main_port=%u audio_port=%u",
+             double(async::nanos(slowPrev.t,start))*1e-6,mainCpu,audioCpu,renderCpu,cpuNow.mainPort,cpuNow.audioPort);
+#endif
     if(slowPrev.t!=async::Clock::time_point{}) {
         const double interval=double(async::nanos(slowPrev.t,start))*1e-6;
         if(interval>80.0) {
@@ -14013,6 +14616,10 @@ void slowFrameStats(Renderer& r,async::Clock::time_point start,async::Clock::tim
                      (unsigned long long)(now.sites[0]-slowPrev.sites[0]),(unsigned long long)(now.sites[1]-slowPrev.sites[1]),
                      (unsigned long long)(now.sites[2]-slowPrev.sites[2]),(unsigned long long)(now.sites[3]-slowPrev.sites[3]),
                      (unsigned long long)(now.sites[4]-slowPrev.sites[4]),(unsigned long long)(now.sites[5]-slowPrev.sites[5]));
+#if defined(__APPLE__)
+                GLOG("RENDER_IOS_SLOW_CPU interval_ms=%.1f main_cpu_ms=%.1f audio_cpu_ms=%.1f render_cpu_ms=%.1f main_port=%u audio_port=%u (-1 = thread changed)",
+                     interval,mainCpu,audioCpu,renderCpu,cpuNow.mainPort,cpuNow.audioPort);
+#endif
             }
         }
     }
@@ -14030,6 +14637,69 @@ void recycleFrame(std::vector<std::uint8_t>&& frame) {
     if(r->spareFrame.capacity()<frame.capacity())r->spareFrame=std::move(frame);
 }
 std::optional<std::vector<std::uint8_t>> present(std::uint32_t address,unsigned width,unsigned height,const char** why) {
+#if defined(__APPLE__)
+    { // ios-qos (Claude, 2026-10-16): this runs on the game's render thread (the present hook). With files/private-trace/ios-qos-render
+      // it asks iOS for user-interactive QoS (performance cores first), else the QoS it started with (default). Re-read every 30
+      // presents, so an in-run A/B (RECOMP_IOS_SWITCHES_AB=ios-qos-render;P) flips it; RENDER_IOS_QOS logs each change.
+        // ios-qos-adaptive (Claude, 2026-10-16; scheduling only): CPU and GPU share one power budget (c105/c116: user-interactive
+        // QoS cut the render thread's CPU 18.7 -> 13.8 ms/frame but cost the GPU +2.5..+6.6 ms). With files/private-trace/
+        // ios-qos-adaptive the render thread asks for user-interactive QoS only while the last timing window's GPU time leaves
+        // room (enter < 28 ms, leave > 31.5 ms), else default.
+        static thread_local int applied=-1;static thread_local unsigned n=0;
+        recomp_ios_last_present_ns.store(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()),std::memory_order_relaxed); // (ios-stall-sampler: EVERY present;
+            // build 163-165 stored it only every 30th present, so the watcher saw ~1 s "gaps": c396's captures were that artifact)
+        if(!(n++%30)) {
+            { // ios-qos-guest-low: the executor leaves this thread (the game's render thread) alone
+                recomp_ios_render_guest_token.store(recomp::bootstrap::currentGuestThreadToken(),std::memory_order_relaxed);
+            }
+            int want=access(RECOMP_APP_PATH("/private-trace/ios-qos-render"),F_OK)==0?1:0;
+            // ios-qos-render-low (Claude 2026-10-17, DIAGNOSTIC: c154b's 483 ms display stall came after the render thread had been put
+            // on utility QoS): utility QoS for the render thread while present (2)
+            if(!want && access(RECOMP_APP_PATH("/private-trace/ios-qos-render-low"),F_OK)==0)want=2;
+            if(!want && access(RECOMP_APP_PATH("/private-trace/ios-qos-adaptive"),F_OK)==0) {
+                const double g=recompIosWindowGpuUs.load(std::memory_order_relaxed)/1000.0;
+                want=g>0 && (applied==1?g<31.5:g<28.0)?1:0; // (c118: 29/31 oscillated; c119: 25/28.5 never engaged; now 28/31.5)
+            }
+            if(want!=applied) {
+                const int r=pthread_set_qos_class_self_np(want==1?QOS_CLASS_USER_INTERACTIVE:want==2?QOS_CLASS_UTILITY:QOS_CLASS_DEFAULT,0);
+                GLOG("RENDER_IOS_QOS thread=render want=%d result=%d gpu_ms=%.2f",want,r,recompIosWindowGpuUs.load(std::memory_order_relaxed)/1000.0);applied=want;
+            }
+        }
+    }
+    { // ios-rcpu (Claude, 2026-10-16; measurement output only): the CPU time of the thread that runs the render guest thread, per
+      // frame, from thread_info of the calling host thread (a change of host thread restarts the delta); every 60 presents.
+        static std::uint64_t lastTid=0;static double lastCpu=0,acc=0;static unsigned frames=0,moves=0;
+        thread_basic_info_data_t info{};mach_msg_type_number_t cnt=THREAD_BASIC_INFO_COUNT;const mach_port_t self=mach_thread_self();
+        if(thread_info(self,THREAD_BASIC_INFO,reinterpret_cast<thread_info_t>(&info),&cnt)==KERN_SUCCESS) {
+            const double cpu=(info.user_time.seconds+info.system_time.seconds)*1e3+(info.user_time.microseconds+info.system_time.microseconds)/1e3;
+            std::uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+            if(tid==lastTid)acc+=cpu-lastCpu;else ++moves;
+            lastTid=tid;lastCpu=cpu;
+        }
+        mach_port_deallocate(mach_task_self(),self);
+        if(++frames==60) {
+            GLOG("RENDER_IOS_RCPU ms=%.2f moves=%u",acc/60.0,moves);acc=0;frames=0;moves=0;
+            // ios-rusage (Claude 2026-10-20; measurement output only): the whole process's CPU cycles and instructions per frame
+            // (proc_pid_rusage V4). Thread CPU time varies ~50 % with clocks and core placement between runs (c306 vs c317), so
+            // compiled-in A/Bs compare cycles: the work, not the heat. mhz = cycles per microsecond of process CPU time.
+            static std::uint64_t lastCycles=0,lastInstr=0,lastCpuNs=0;
+            rusage_info_v4 ri{};
+            if(recomp_proc_pid_rusage(getpid(),RUSAGE_INFO_V4,reinterpret_cast<rusage_info_t*>(&ri))==0) {
+                static mach_timebase_info_data_t tb{};if(!tb.denom)mach_timebase_info(&tb);
+                const std::uint64_t cpuNs=(ri.ri_user_time+ri.ri_system_time)*tb.numer/tb.denom;
+                if(lastCycles) {
+                    const double cyc=double(ri.ri_cycles-lastCycles),ins=double(ri.ri_instructions-lastInstr),ns=double(cpuNs-lastCpuNs);
+                    GLOG("RENDER_IOS_RUSAGE cycles_m=%.2f instr_m=%.2f ipc=%.3f cpu_ms=%.2f mhz=%.0f",cyc/60e6,ins/60e6,cyc>0?ins/cyc:0.0,ns/60e6,ns>0?cyc/(ns/1e3):0.0);
+                }
+                lastCycles=ri.ri_cycles;lastInstr=ri.ri_instructions;lastCpuNs=cpuNs;
+            }
+        }
+    }
+#endif
+    recomp::ios_async_shared::AdoptedUnwindGuard unwind(
+        []()noexcept{return recomp::ios_async_shared::enabled && recomp::ios_async_shared::adopted.load(std::memory_order_acquire);},
+        []()noexcept{std::fprintf(stderr,"RENDER_IOS_ASYNC_SHARED_TERMINAL reason=renderer-unwind-after-adoption uncaught=%d\n",std::uncaught_exceptions());std::_Exit(4);});
     const auto start=async::Clock::now();
     auto& q=queuedPresent;
     if(q.engaged && asyncFront && pipelined()) { // v177
@@ -14075,19 +14745,29 @@ std::optional<std::vector<std::uint8_t>> present(std::uint32_t address,unsigned 
     }
     if(asyncFront)asyncFront->drainFor(AsyncFront::Reason::Present); // every queued draw of the frame first (then v109's present)
     const auto drained=async::Clock::now();
-    std::optional<std::vector<std::uint8_t>> image;bool prepare=false;
+    std::unique_lock<std::recursive_mutex> iosSourceLease(recomp::ios_shared::producerGate,std::defer_lock);
+    std::optional<RecompIosGpuFrameV1> iosFrame;
+    std::optional<recomp::ios_async_shared::Mailbox::Producer> iosProduced;
+    std::shared_ptr<recomp::ios_async_shared::Mailbox> iosPool;
+    std::optional<std::vector<std::uint8_t>> image;bool prepare=false;bool iosAsyncRequired=false;
     Renderer::WritebackBatch wbBatch;Renderer* wbRenderer=nullptr; // v215
     {
         GuestLock lock;
         if(!renderer){if(why)*why="unavailable";return std::nullopt;}
         if(q.pending && asyncFront){asyncFront->mailbox.image.reset();asyncFront->mailbox.ready=false;q.pending=false;q.engaged=false;} // v177
+        iosAsyncRequired=recomp::ios_async_shared::enabled && recomp::ios_async_shared::adopted.load(std::memory_order_acquire);
 #ifdef RECOMP_THOR_EDITION
         renderer->hud4Present(); // hud4 (v597): the minimap replay of a frame presented here (not queued); a call only
         renderer->wheelPresent(); // thor-wheel (v605): nothing was collected here (no execute()); the collector restarts
 #endif /* RECOMP_THOR_EDITION */
         image=renderer->present(address,width,height,why);
+        iosFrame=renderer->iosSharedFrame;
+        if(renderer->iosAsyncProduced) {
+            iosProduced=std::move(renderer->iosAsyncProduced);renderer->iosAsyncProduced.reset();
+            iosPool=renderer->iosAsyncSources.mailbox();
+        }
         wbBatch=renderer->takeWritebackBatch();wbRenderer=renderer.get(); // v215
-        if(queuedPresentWanted() && asyncFront && image && pipelined()) { // v177
+        if(!recomp::ios_shared::producer && queuedPresentWanted() && asyncFront && image && pipelined()) { // v177
             if(!q.engaged && ++q.successes>=120){q.engaged=true;++q.engagedTimes;GLOG("RENDER_GENERIC_QUEUED_PRESENT on=1 engaged=%llu",(unsigned long long)q.engagedTimes);}
         } else q.successes=0;
         afterPresent();
@@ -14097,6 +14777,44 @@ std::optional<std::vector<std::uint8_t>> present(std::uint32_t address,unsigned 
     if(wbRenderer && !wbBatch.list.empty()) { // v215: outside rendererMutex (see Renderer::takeWritebackBatch)
         const auto result=wbRenderer->publishWritebackBatch(wbBatch);
         GuestLock lock;if(renderer.get()==wbRenderer)wbRenderer->mergeWritebackResult(result);
+    }
+    if(iosAsyncRequired && (!iosProduced || !iosFrame || !image))std::_Exit(4);
+    if(iosProduced) {
+        // Full guest-visible writeback is already published above. This only
+        // queues owned source/reference data; it is not a display acceptance.
+        if(!iosFrame || !image || !iosPool || !iosFrame->sourceFenceComplete)std::_Exit(4);
+        const auto resource=iosProduced->resource();
+        if(resource.image!=recomp::ios_async_shared::handleBits(iosFrame->image) ||
+           resource.view!=recomp::ios_async_shared::handleBits(iosFrame->view) ||
+           resource.epoch!=iosFrame->deviceEpoch || resource.width!=iosFrame->width || resource.height!=iosFrame->height)std::_Exit(4);
+        const auto result=recomp::ios_async_shared::enqueueFrame(iosPool,std::move(*iosProduced),*iosFrame,std::move(*image));
+        if(result!=recomp::ios_async_shared::QueueResult::Queued)std::_Exit(4);
+        image.reset();if(why)*why="ios-shared-queued";
+    } else if(iosFrame && image && recomp::ios_shared::producer) {
+        // v215 publication above may wait on the guest registry: never retain
+        // the producer gate across it. Reacquire and revalidate the exact source
+        // generation before the synchronous lease begins.
+        iosSourceLease.lock();
+        const auto iosConsumer=recomp::ios_shared::producer.load();
+        void* const iosConsumerUser=recomp::ios_shared::producerUser.load();
+        if(!iosConsumer || !iosConsumerUser)std::_Exit(4); // binding closed while awaiting lease
+        {GuestLock lock;
+            if(!renderer || !renderer->iosSharedFrame ||
+               renderer->iosSourceGeneration!=iosFrame->sourceGeneration ||
+               renderer->iosSharedFrame->image!=iosFrame->image ||
+               renderer->iosSharedFrame->view!=iosFrame->view ||
+               renderer->presentImages[0].image!=iosFrame->image || renderer->presentImages[0].view!=iosFrame->view ||
+               renderer->presentImages[0].format!=VK_FORMAT_R8G8B8A8_UNORM || !renderer->presentSampled[0] ||
+               renderer->presentImages[0].levels!=1 || renderer->presentImages[0].layers!=1 ||
+               renderer->presentImages[0].width!=iosFrame->width || renderer->presentImages[0].height!=iosFrame->height ||
+               renderer->d.instance!=iosFrame->instance || renderer->d.physical!=iosFrame->physicalDevice ||
+               renderer->d.device!=iosFrame->device || renderer->queue!=iosFrame->queue ||
+               renderer->d.queueFamily!=iosFrame->queueFamily || iosFrame->deviceEpoch!=1)iosFrame->sourceFenceComplete=0;
+        }
+        const int result=iosConsumer(iosConsumerUser,*iosFrame,image->data(),image->size());
+        if(result==RECOMP_IOS_GPU_ACCEPTED)image->clear(); // existing empty-frame hook: exactly one display
+        else if(result!=RECOMP_IOS_GPU_INELIGIBLE)std::_Exit(4); // callback closes outside renderer/queue locks
+        iosSourceLease.unlock(); // prepareNext may need worker progress through producerGate
     }
     if(prepare)asyncFront->prepareNext(); // v123 (after the lock: the renderer thread runs it while this thread returns to the game)
     return image;
@@ -14176,18 +14894,7 @@ void guestDrainTo(std::uint64_t seq){if(seq && pipelined())asyncFront->drainFor(
 void guestReadBarrier(){static const bool skip=::access(RECOMP_APP_PATH("/private-trace/diag-measure-no-read-barrier"),F_OK)==0;
     if(skip)return;
     if(asyncFront){const auto t=async::Clock::now();asyncFront->drainFor(AsyncFront::Reason::Barrier);
-    slowBarrierNs.fetch_add(std::uint64_t(async::nanos(t,async::Clock::now())),std::memory_order_relaxed);}
-    if(clothWatchPending.load(std::memory_order_relaxed)) { // v606 (G14 diagnostic)
-        // v611 (crash-fixer): the v183 commit hooks (noteNativeSubmissionMayCommitAt, e.g. under submitNativePostOutputStorageCoherency)
-        // call this barrier while their thread holds the registry lock R; the kick's viewer takes R again (RegistryReader) and that
-        // thread never returned (v608 freezes 3h58ei7o, m43plpwr: R -> m -> R, every other guest thread then queued on R). Under R
-        // the kick stays pending for the next barrier (the submission handler's own, not under R): same comparison, one barrier later.
-#if !defined(RECOMP_V611_MUTANT_KICK_UNDER_R) // test mutant: v606-v610's kick under R
-        if(recomp_registry_held_by_this_thread()){clothKickDeferred.fetch_add(1,std::memory_order_relaxed);return;}
-#endif
-        GuestLock lock;if(renderer)clothWatchKick(renderer->viewer);
-    }
-} // (idle: one uncontended lock)
+    slowBarrierNs.fetch_add(std::uint64_t(async::nanos(t,async::Clock::now())),std::memory_order_relaxed);}} // (idle: one uncontended lock)
 void censusNote(const char* site,const char* detail) {
     if(pipelined())return; // (no census frame is active while pipelined)
     GuestLock lock;
@@ -14203,17 +14910,9 @@ extern "C" void recomp_v319_note_commit(const std::uint8_t* device) noexcept {
     v319Pending.orIn(v319::readDirty(device));v319Snapped=true;
 }
 #ifdef RECOMP_THOR_EDITION
-// thor-radio v832 (android-qol's v714, the Thor's copy; appended at the file's end so no line above moves): the frame-rate counter's
-// rates for the app's label {shown fps, real fps, frame ms}; 1 while the Frame-Rate Counter setting is on (the app then draws the label and
-// the library draws none: map_tap_renderer.inc thorFpsDraw), 0 when off. Lock-free; any thread.
-extern "C" __attribute__((visibility("default"))) int recomp_fps_v1(float* out,int n) {
-    namespace v=recomp::gpu::generic::v714;
-    v::fpsAppMs.store(v::nowMs(),std::memory_order_relaxed);
-    if(out && n>=3){out[0]=v::fpsShown.load(std::memory_order_relaxed);out[1]=v::fpsReal.load(std::memory_order_relaxed);out[2]=v::fpsMs.load(std::memory_order_relaxed);}
-    return v::fpsOn.load(std::memory_order_relaxed);
-}
 // thor-radio v832: the lower screen's button row for the app's trainer button (drawn by the app beside the library's Quick Save): bit 0 =
 // the Quick Save button is shown now (the lower screen shows the HUD map: no wheel, phone, pause screen, Loading or hidden HUD).
+// (ios-duo: v850's end-of-file hunk without its recomp_fps_v1, which 238e already exports)
 extern "C" __attribute__((visibility("default"))) int recomp_lower_buttons_v1() {
     return recomp::gpu::maptap::machine().saveShown()?1:0;
 }

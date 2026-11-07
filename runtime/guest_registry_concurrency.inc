@@ -353,7 +353,7 @@ void registryAccount(RegistryThreadState& state, RegistryLockSite& site, std::ui
     if (maxBlockingHoldTicks > batch->maxBlockingHoldTicks) batch->maxBlockingHoldTicks = maxBlockingHoldTicks;
     if (++batch->sections >= 64) { auto* keep = batch->site; batch->flush(); batch->site = keep; }
 }
-#include "play_registry_account.h" // play-config-2 (v527): in the play build registryAccount(...) is not called from here on: the per-thread batch table of the hold accounting is off (nothing without -DRECOMP_PLAY_BUILD=1)
+
 void RegistrySection::noteAcquired(bool contended, std::uint64_t waitTicks) noexcept {
     // Acquisitions and waits are accounted with the hold at the end of the section (publishHold);
     // a relock inside a unique section adds one acquisition and its wait.
@@ -619,7 +619,7 @@ void registryMaybeLog(RegistryThreadState& state) noexcept {
     const auto now = registryTicks();
     auto next = registryCounters.nextLogTicks.load(std::memory_order_relaxed);
     if (now < next) return;
-    if (!registryCounters.nextLogTicks.compare_exchange_strong(next, now + registryNsToTicks(RECOMP_DIAG_ONLY(5'000'000'000ull) RECOMP_PLAY_ONLY(1'000'000'000'000'000'000ull)), // play-config-2: armed, then never due (31 years): no RENDER_DIAG_REGISTRY_* block, same control flow
+    if (!registryCounters.nextLogTicks.compare_exchange_strong(next, now + registryNsToTicks(5'000'000'000ull),
             std::memory_order_relaxed)) return;
     if (next == 0) return; // First call arms the timer.
     const auto u = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
@@ -1129,14 +1129,4 @@ const std::uint8_t* registrySnapshotGraphicsView(const void* snapshot, std::uint
     return s.addressSpace->translate(arena);
 }
 
-// v611 (crash-fixer, 2026-10-22; v608 Thor freezes 3h58ei7o / m43plpwr): whether the calling thread holds R in any of its open
-// sections (every holder of R is a section, see guest_registry_concurrency.h). The renderer's guestReadBarrier asks it before
-// work that reads through the registry's viewer (which takes R: a second acquisition on the same thread never returns).
-bool registryHeldByThisThread() noexcept {
-    for (const RegistrySection* s = registryThreadState().current; s; s = s->previous)
-        if (s->holdsMutex()) return true;
-    return false;
-}
-
 } // namespace recomp::bootstrap
-extern "C" bool recomp_registry_held_by_this_thread() noexcept { return recomp::bootstrap::registryHeldByThisThread(); } // v611

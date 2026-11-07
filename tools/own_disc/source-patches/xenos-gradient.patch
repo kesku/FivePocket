@@ -1,0 +1,55 @@
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -251,7 +251,9 @@
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
+-    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    // v76: getGradients is translated too (it was dropped like the other non-sampling fetch opcodes).
++    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights &&
++        instr.opcode != FetchOpcode::GetTextureGradients)
+         return;
+ 
+     if (instr.isPredicated)
+@@ -262,6 +264,41 @@
+         indent();
+         out += "{\n";
+         ++indentation;
++    }
++
++    // v76: getGradients (Xenos fetch opcode 18) of a two-component source: result XZ = ddx(source.xy),
++    // YW = ddy(source.xy) (Xenia ucode.h semantics), then the usual fetch destination swizzle. Dropping it
++    // left the destination holding its previous value: GTA V's shadow-caster pixel shaders bias their depth
++    // by 2 * (|ddx| + |ddy|) of the light-space depth, and with the interpolated padding (1, 1) there every
++    // shadow-map texel was written as "no occluder" (census v52-v67: all shadow maps read 0).
++    if (instr.opcode == FetchOpcode::GetTextureGradients)
++    {
++        uint32_t written = 0;
++        for (size_t i = 0; i < 4; i++)
++        {
++            const auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
++            if (swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W)
++                ++written;
++        }
++        if (written != 0)
++        {
++            const char s0 = SWIZZLES[instr.srcSwizzle & 0x3];
++            const char s1 = SWIZZLES[(instr.srcSwizzle >> 2) & 0x3];
++            indent();
++            print("r{}.", instr.dstRegister);
++            printDstSwizzle(instr.dstSwizzle, false);
++            print(" = float4(ddx(r{0}.{1}), ddy(r{0}.{1}), ddx(r{0}.{2}), ddy(r{0}.{2})).", instr.srcRegister, s0, s1);
++            printDstSwizzle(instr.dstSwizzle, true);
++            out += ";\n";
++        }
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
+     }
+ 
+     auto printSrcRegister = [&](size_t componentCount)

@@ -83,9 +83,9 @@ def require_hash(path, wanted):
         raise ValueError('input/output hash differs: ' + Path(path).name)
 
 
-def run_codegen(root, work, generator=None, context=None):
+def run_codegen(root, work, generator=None, context=None, config=None):
     """generator, context: another host's build of the generator and the header it ships with (default: this Mac's)."""
-    cfg = root / 'local-analysis/regen/flags-off/recomp.toml'
+    cfg = Path(config) if config is not None else root / 'local-analysis/regen/flags-off/recomp.toml'
     dst = work / 'codegen-input/recomp.toml'
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(generator_config(cfg.read_text(), cfg.parent, work / 'input/default.xex'), encoding='utf-8', newline='\n')
@@ -150,7 +150,7 @@ def run_recipe(root, work, recipe=None):
 def check_work(root, work):
     """Everything a stage writes is game-derived: it stays under the ignored local-analysis/builder."""
     # (2026-10-24) resolved on both sides: local-analysis/builder may itself be a link (.builder since 2026-10-10)
-    if not Path(work).resolve().is_relative_to((Path(root).resolve() / 'local-analysis/builder').resolve()):
+    if Path(work).resolve().is_relative_to(Path(root).resolve()) and not Path(work).resolve().is_relative_to((Path(root).resolve() / 'local-analysis/builder').resolve()):
         raise SystemExit('the work folder must lie in local-analysis/builder of the repository')
 
 
@@ -162,12 +162,17 @@ def main():
     ap.add_argument('--recipe', type=Path)
     ap.add_argument('--generator', type=Path)
     ap.add_argument('--context', type=Path)
+    ap.add_argument('--config', type=Path)
     args = ap.parse_args()
     root, work = args.repo.resolve(), args.work.resolve()
     check_work(root, work)
     if args.stage == 'codegen':
-        run_codegen(root, work, args.generator.resolve() if args.generator else None,
-                    args.context.resolve() if args.context else None)
+        if args.config:
+            run_codegen(root, work, args.generator.resolve() if args.generator else None,
+                        args.context.resolve() if args.context else None, args.config.resolve())
+        else:
+            run_codegen(root, work, args.generator.resolve() if args.generator else None,
+                        args.context.resolve() if args.context else None)
     else:
         run_recipe(root, work, args.recipe.resolve() if args.recipe else None)
 
