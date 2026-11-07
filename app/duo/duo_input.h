@@ -14,7 +14,6 @@ struct Input {
     WheelGesture lower;MapTouch top;
     int mask=WheelGesture::mask(false,false,false);bool lastLb=false;
     Pad lastOut{};std::uint32_t serial=0;bool merged=false;
-    WheelGesture::State lastLowerState=WheelGesture::State::IDLE;MapTouch::State lastTopState=MapTouch::State::IDLE;
 };
 // The pad the game is given (in.m held by the caller; t = the gesture clock in ms): the physical / on-screen-control state with the
 // gestures merged as WheelTouch.merge does (buttons OR'd, the right stick replaced only while a gesture pushes). An unchanged result
@@ -39,4 +38,5 @@ template<class State> inline void mergeCore(Input& in,State& st,long long t,Pad*
     st.leftTrigger=decltype(st.leftTrigger)(o.leftTrigger);st.rightTrigger=decltype(st.rightTrigger)(o.rightTrigger);
     st.packet=0x40000000u|((in.serial&0x3Fu)<<24)|(st.packet&0x00FFFFFFu); // (map_tap.h uses bit 31 for its own presses)
 }
+
 }

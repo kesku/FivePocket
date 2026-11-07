@@ -34,14 +34,15 @@ inline bool sampled(std::atomic<unsigned long long>& count, unsigned long long e
     return k <= 64 || k % every == 0 || logAll.load(std::memory_order_relaxed);
 }
 
-#if defined(__APPLE__)
-inline bool appleQuietDefault() noexcept {
-    static const bool quietByDefault=[] {
+inline bool verboseDiagnosticsEnabled() noexcept {
+    static const bool enabled=[] {
         const char* verbose=std::getenv("RECOMP_VERBOSE_DIAGNOSTICS");
-        return !(verbose && verbose[0]=='1' && verbose[1]=='\0');
+        return verbose && verbose[0]=='1' && verbose[1]=='\0';
     }();
-    return quietByDefault;
+    return enabled;
 }
+#if defined(__APPLE__)
+inline bool appleQuietDefault() noexcept { return !verboseDiagnosticsEnabled(); }
 // Apple forwards diagnostics through synchronous stdio; opt in to verbose
 // diagnostics before launch rather than putting that I/O on every frame.
 inline std::atomic<bool> quiet{RECOMP_PLAY_QUIET_AT_START || appleQuietDefault()};

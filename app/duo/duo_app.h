@@ -14,6 +14,7 @@
 #include "duo_state.h"
 #include "duo_gesture.h"
 #include "duo_input.h"
+#include "touch_diagnostics.h"
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
@@ -60,18 +61,23 @@ inline bool hasWord(const std::string& text,const char* word) {
     return false;
 }
 
-// ---- the touch log (2026-10-24, owner: "duo needs to fix its touch controls as they dont work"; no console in his sessions):
-// files/private-trace/duo-touch.log, appended with a millisecond stamp per line, at most 512 KiB per launch (then silent), opened
-// on the first line. Lines: every on-screen control's down / up (FullTouchControls.hpp), every Duo touch view's touches and gesture
-// state, every change of what mergePad gives the game. Any thread (its own mutex). Labelled touch input; never physical proof.
-inline std::mutex& touchLogMutex() {static auto* m=new std::mutex;return *m;}
+// Touch diagnostics share the process-wide verbose policy. The sink is reached only after the gate and budget check.
+inline void writeTouchLine(void*, diagnostics::Target target, const char* line, std::size_t bytes) noexcept {
+    if(target==diagnostics::Target::Console){std::fwrite(line,1,bytes,stderr);return;}
+    static FILE* file=nullptr;static bool tried=false;
+    if(!tried && !root().empty()) {
+        tried=true;file=std::fopen((root()+"/private-trace/duo-touch.log").c_str(),"a");
+        if(file)std::fprintf(file,"---- launch split=%d\n",ds::split.load());
+    }
+    if(file){std::fwrite(line,1,bytes,file);std::fflush(file);}
+}
+inline long long touchDiagnosticClock(void*) noexcept {return nowMs();}
+inline diagnostics::TouchLog& touchDiagnostics() {
+    static auto* log=new diagnostics::TouchLog(writeTouchLine,touchDiagnosticClock);
+    return *log;
+}
 inline void touchLog(const char* line) noexcept {
-    std::lock_guard l(touchLogMutex());
-    static FILE* f=nullptr;static bool tried=false;static std::size_t bytes=0;
-    if(!tried && !root().empty()){tried=true;f=std::fopen((root()+"/private-trace/duo-touch.log").c_str(),"a");
-        if(f)std::fprintf(f,"---- launch split=%d\n",ds::split.load());}
-    if(!f || bytes>512*1024)return;
-    bytes+=std::size_t(std::fprintf(f,"%lld %s\n",nowMs(),line));std::fflush(f);
+    touchDiagnostics().write(diagnostics::Target::File,[&](char* out,std::size_t size){std::snprintf(out,size,"%s",line);});
 }
 // ---- input (main thread: touches; guest threads: mergePad; one mutex)
 // (struct Input and the merge itself: duo_input.h, host-tested)
@@ -82,30 +88,15 @@ inline void readMask() {
     in.mask=WheelGesture::mask(ok && hasWord(t,"wheel=main"),ok && hasWord(t,"radio=main"),ok && hasWord(t,"character=main"));
     in.lower.nativeMap(true); // (the Duo library always runs the map macro: map_tap.h is in every Duo build)
     in.lower.phoneTouch(true);in.lower.saveTouch(true);in.lower.phoneTapAt(true); // (v815 / v820 / v828: WheelTouch's markers; the Duo links v850's map_tap.h, phone_touch.h, quick_save.h)
-    std::fprintf(stderr,"APPLE_IOS_DUO_TOUCH mask=%x map_tap=library\n",unsigned(in.mask));
+    touchDiagnostics().write(diagnostics::Target::Console,[&](char* line,std::size_t size) {
+        std::snprintf(line,size,"APPLE_IOS_DUO_TOUCH mask=%x map_tap=library",unsigned(in.mask));
+    });
 }
 inline void cancelAll() {auto& in=input();std::lock_guard l(in.m);in.lower.cancel();in.top.cancel();}
-inline void logStates(Input& in) {
-    {char l[160];std::snprintf(l,sizeof l,"gesture lower=%d buttons=%04x stick=%d,%d top=%d buttons=%04x rs=%d,%d",int(in.lower.state()),
-        unsigned(in.lower.buttons()),in.lower.rightX(),in.lower.rightY(),int(in.top.state()),unsigned(in.top.buttons()),in.top.rightX(),in.top.rightY());
-     static std::string last;if(last!=l){last=l;touchLog(l);}}
-    if(in.lower.state()!=in.lastLowerState){in.lastLowerState=in.lower.state();
-        std::fprintf(stderr,"APPLE_IOS_DUO_WHEEL_TOUCH state=%d buttons=%04x stick=%d,%d (touch input)\n",int(in.lower.state()),unsigned(in.lower.buttons()),in.lower.rightX(),in.lower.rightY());}
-    if(in.top.state()!=in.lastTopState){in.lastTopState=in.top.state();
-        std::fprintf(stderr,"APPLE_IOS_DUO_MAP_TOUCH state=%d rx=%d ry=%d (touch input)\n",int(in.top.state()),in.top.rightX(),in.top.rightY());}
-}
-// The pad user 0 is given (any guest thread): the physical / touch-control state with the gestures merged as WheelTouch.merge does
-// (buttons OR'd, the right stick replaced only while a gesture pushes). A changed result gets a packet number of its own.
-template<class State> inline void mergePad(State& st) noexcept {
+// The gesture clock remains input work; diagnostic timestamps are requested only by an enabled writer.
+template<class State> inline void mergePad(State& state) noexcept {
     if(!ds::split.load(std::memory_order_relaxed))return;
-    auto& in=input();std::lock_guard l(in.m);
-    Pad p{},o{};mergeCore(in,st,nowMs(),&p,&o);
-    logStates(in);
-    { // (the touch log: what the game is given, on every change of the input or the result)
-        char l[200];std::snprintf(l,sizeof l,"pad in=%04x ls=%d,%d rs=%d,%d t=%u,%u out=%04x rs=%d,%d ls=%d,%d t=%d,%d",unsigned(p.buttons),p.leftX,p.leftY,
-            p.rightX,p.rightY,unsigned(p.leftTrigger),unsigned(p.rightTrigger),unsigned(o.buttons),o.rightX,o.rightY,o.leftX,o.leftY,o.leftTrigger,o.rightTrigger);
-        static std::string last;if(last!=l){last=l;touchLog(l);}
-    }
+    mergeInput(input(),state,[]{return nowMs();},touchDiagnostics());
 }
 
 // ---- the library's lower-screen window (recomp_set_hud_window_v1 before the V6 entry)
@@ -247,8 +238,13 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
 - (BOOL)openTrainer:(const char*)by {
     PortQolTouchView* q=_trainer.qol;
     const BOOL ok=q && [q duoOpenTrainer];
-    std::fprintf(stderr,"APPLE_IOS_DUO_LOWER_TRAINER %s opened=%d (touch input)\n",by,ok?1:0);
-    {char line[96];std::snprintf(line,sizeof line,"trainer %s opened=%d",by,ok?1:0);recomp::duo::app::touchLog(line);}
+    auto& log=recomp::duo::app::touchDiagnostics();
+    log.write(recomp::duo::diagnostics::Target::Console,[&](char* line,std::size_t size) {
+        std::snprintf(line,size,"APPLE_IOS_DUO_LOWER_TRAINER %s opened=%d (touch input)",by,ok?1:0);
+    });
+    log.write(recomp::duo::diagnostics::Target::File,[&](char* line,std::size_t size) {
+        std::snprintf(line,size,"trainer %s opened=%d",by,ok?1:0);
+    });
     if(ok)[_trainer playOpen];
     return ok;
 }
@@ -266,8 +262,9 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
     auto& in=recomp::duo::app::input();std::lock_guard l(in.m);const long long t=recomp::duo::app::nowMs();const CGSize sz=[self space];
     for(UITouch* u in touches) {
         const CGPoint p=[self map:u];
-        {char line[128];std::snprintf(line,sizeof line,"view %s down x=%.0f y=%.0f space=%.0fx%.0f",kind==DuoTouchLower?"lower":"top",p.x,p.y,sz.width,sz.height);
-         recomp::duo::app::touchLog(line);}
+        recomp::duo::app::touchDiagnostics().write(recomp::duo::diagnostics::Target::File,[&](char* line,std::size_t size) {
+            std::snprintf(line,size,"view %s down x=%.0f y=%.0f space=%.0fx%.0f",kind==DuoTouchLower?"lower":"top",p.x,p.y,sz.width,sz.height);
+        });
         if(!first){first=u;second=nil;
             if(kind==DuoTouchLower) {
                 int r[4]{};if(recomp_duo_lower_map_rect_v1(r))in.lower.tapZone(float(r[0]),float(r[1]),float(r[2]),float(r[3])); // (the map's own area)
@@ -276,7 +273,7 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
         else if(!second && u!=first){second=u;
             if(kind==DuoTouchLower)in.lower.pointerDown(t,p.x,p.y);else in.top.pointerDown(t,p.x,p.y);}
     }
-    recomp::duo::app::logStates(in);
+    recomp::duo::app::touchDiagnostics().states(in.lower,in.top);
 }
 - (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
     if(kind==DuoTouchLower) {
@@ -287,7 +284,9 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
             if(!edge.move((long long)(std::uintptr_t)(__bridge void*)u,t0,float(p.x),float(p.y)))continue;
             bool wheel=false;{auto& in=recomp::duo::app::input();std::lock_guard l(in.m);wheel=in.lastLb;}
             PortQolTouchView* q=_trainer.qol;const bool allowed=q && [q duoTrainerAllowed] && !wheel;
-            std::fprintf(stderr,"APPLE_IOS_DUO_LOWER_TRAINER edge-swipe allowed=%d (touch input)\n",allowed?1:0);
+            recomp::duo::app::touchDiagnostics().write(recomp::duo::diagnostics::Target::Console,[&](char* line,std::size_t size) {
+                std::snprintf(line,size,"APPLE_IOS_DUO_LOWER_TRAINER edge-swipe allowed=%d (touch input)",allowed?1:0);
+            });
             if(allowed && [self openTrainer:"edge-swipe"]){recomp::duo::app::cancelAll();first=second=nil;held=YES;return;}
         }
     }
@@ -297,7 +296,7 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
     if(second){const CGPoint b=[self map:second];
         if(kind==DuoTouchLower)in.lower.move2(t,a.x,a.y,b.x,b.y);else in.top.move2(t,a.x,a.y,b.x,b.y);}
     else if(kind==DuoTouchLower)in.lower.move(t,a.x,a.y,sz.width,sz.height);else in.top.move(t,a.x,a.y);
-    recomp::duo::app::logStates(in);
+    recomp::duo::app::touchDiagnostics().states(in.lower,in.top);
 }
 - (void)lift:(NSSet<UITouch*>*)touches event:(UIEvent*)event {
     if(kind==DuoTouchLower) {
@@ -309,8 +308,9 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
         }
     }
     auto& in=recomp::duo::app::input();std::lock_guard l(in.m);const long long t=recomp::duo::app::nowMs();
-    {char line[64];std::snprintf(line,sizeof line,"view %s up touches=%lu",kind==DuoTouchLower?"lower":"top",(unsigned long)touches.count);
-     recomp::duo::app::touchLog(line);}
+    recomp::duo::app::touchDiagnostics().write(recomp::duo::diagnostics::Target::File,[&](char* line,std::size_t size) {
+        std::snprintf(line,size,"view %s up touches=%lu",kind==DuoTouchLower?"lower":"top",(unsigned long)touches.count);
+    });
     for(UITouch* u in touches) {
         if(u!=first && u!=second)continue;
         if(kind==DuoTouchLower)in.lower.pointerUp(t);else in.top.pointerUp(t); // (either finger of a pinch: the pinch ends; no-op otherwise)
@@ -318,7 +318,7 @@ typedef NS_ENUM(NSInteger,DuoTouchKind){DuoTouchLower,DuoTouchTop};
         if(u==first){first=nil;if(kind==DuoTouchLower)in.lower.up(t);else in.top.up(t);}
     }
     if(!first)second=nil;
-    recomp::duo::app::logStates(in);
+    recomp::duo::app::touchDiagnostics().states(in.lower,in.top);
 }
 - (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {[self lift:touches event:event];}
 - (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {[self lift:touches event:event];}

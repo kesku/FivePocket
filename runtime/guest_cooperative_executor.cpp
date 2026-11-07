@@ -155,7 +155,11 @@ extern "C" __attribute__((weak)) std::atomic<bool> recomp_v241_baseline; // v241
 // outermost exclusive scope they run at nice +10 (restored to 0 when it ends), so the guest threads the stop waits for get
 // the big cores first. v240 outdoor timelines: time-to-safepoint + enqueue ~450 us of a ~1 ms stop, 2.14 stops/frame, with
 // cpu3-6 ~90% busy. A/B: diag-v241-baseline (no yield).
-namespace { std::array<std::atomic<int>, 4> stopYieldTids{}; std::atomic<unsigned long long> stopYields{0}; bool stopYieldApplied = false; }
+namespace { std::array<std::atomic<int>, 4> stopYieldTids{}; std::atomic<unsigned long long> stopYields{0};
+#if defined(__ANDROID__) || defined(__linux__)
+bool stopYieldApplied = false;
+#endif
+}
 extern "C" void recomp_register_stop_yield_thread(int tid) {
     for (auto& t : stopYieldTids) { int expected = 0; if (t.compare_exchange_strong(expected, tid)) return; if (expected == tid) return; }
 }
@@ -1486,6 +1490,7 @@ void stopYieldLocked(bool yield) { // v241 (under the scheduler lock: begin/clea
 }
 void clearExclusiveLocked(ParallelState& S) {
     stopYieldLocked(false); // v241
+    if (S.exclusiveOwner) recomp::diag::timeline::mark(recomp::diag::timeline::ExclusiveEnd);
     S.exclusiveOwner = nullptr;
     S.exclusiveOwnerView.store(nullptr, std::memory_order_release);
     setExclusiveDomainsLocked(S, ~0ull); // v191
@@ -1578,7 +1583,6 @@ bool beginExclusiveLocked(ParallelState& S, Task& t, std::unique_lock<std::mutex
 void endExclusiveLocked(ParallelState& S, Task& t) {
     if (S.exclusiveOwner != &t || !S.exclusiveDepth) return;
     if (--S.exclusiveDepth) return;
-    recomp::diag::timeline::mark(recomp::diag::timeline::ExclusiveEnd); // v159
     clearExclusiveLocked(S);
 }
 
@@ -1877,7 +1881,7 @@ bool parallelWait(ParallelState& S, Task& t, const Ready& ready, std::optional<C
             }
         }
         t.timedPark = false;
-        recomp::diag::timeline::mark(recomp::diag::timeline::ParkEnd, notified ? 1 : 2); // v159
+        if (notified) recomp::diag::timeline::mark(recomp::diag::timeline::ParkEnd, 1);
         if (S.terminal) {
             t.inWait = false;
             cancelRun(lock);
@@ -1895,6 +1899,7 @@ bool parallelWait(ParallelState& S, Task& t, const Ready& ready, std::optional<C
             }
         }
         const bool deadlineReached = deadline && Clock::now() >= *deadline;
+        if (!notified) recomp::diag::timeline::mark(recomp::diag::timeline::ParkEnd, deadlineReached ? 3 : 2);
         polled = !notified && !deadlineReached;
         if (notified) {
             S.counters.wakeNotified.fetch_add(1, std::memory_order_relaxed);
@@ -2412,6 +2417,7 @@ void logCounters(ParallelState& S, bool final) {
 // exists (the harness touches it when a freeze rule fires), at most every 30 s: every live task's state,
 // domain, priority and last slow-path label, then the registry's per-thread last-import dump (waits
 // carry handle creator/signaler and guest stack return addresses). The file is left for the old path.
+#if defined(__ANDROID__)
 void dumpTasksForFreeze(ParallelState& S) {
     struct Row { std::uint32_t token; unsigned domain; int priority; TaskState state; bool inWait; const char* label; std::uint64_t entries; };
     std::vector<Row> rows;
@@ -2431,6 +2437,7 @@ void dumpTasksForFreeze(ParallelState& S) {
     diagnosticDumpImports();
     executorLog("RENDER_DIAG_FREEZE_DUMP tasks=%zu", rows.size());
 }
+#endif
 
 // v199: native stacks at a stall, independent of the supervisor (which needs the scheduler lock to run at all).
 // Every 5 s it samples the live tasks' guest entry counts, taking S.sched only by try_lock (up to 1 s). Three samples
@@ -2478,7 +2485,9 @@ void supervisorMain(ParallelState& S) {
     struct JoinWatchdog { std::atomic<bool>& stop; std::thread& thread;
         ~JoinWatchdog() { stop.store(true, std::memory_order_release); if (thread.joinable()) thread.join(); } } joinWatchdog{watchdogStop, watchdog};
     RECOMP_SCHED_LOCK(lock);
+#if defined(__ANDROID__)
     Clock::time_point lastFreezeDump{};
+#endif
     for (;;) {
         while (!S.zombies.empty()) {
             std::thread zombie = std::move(S.zombies.back());
