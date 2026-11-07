@@ -1,4 +1,7 @@
 #pragma once
+#define RECOMP_IOS_SWITCHES_NO_MACRO
+#include "ios_switches.h" // (Claude) the scaler poll's switch files go through the launch-environment overrides (by name, no macro)
+#undef RECOMP_IOS_SWITCHES_NO_MACRO
 // Attempt v255 (goal step 5 prerequisite, "direct present"). Until v254 every displayed frame went GPU -> CPU -> GPU: the
 // renderer read the 1280x720 front buffer back (slot readback, opaqueRgbaInto), the presenter thread mapped it through
 // the scan-out (VulkanEngine::mapNativeScanout: identity scaler copy + the game's gamma ramp as three 256-entry tables),
@@ -92,11 +95,19 @@
 #include <pthread.h> // latency-path (lat2): the watcher's name
 #include <sched.h> // latency-path (lat2): the watcher's little-core mask
 #include <unistd.h>
-#include <dlfcn.h> // display-rate vote (v522): ANativeWindow_setFrameRate is looked up at run time (API 30)
-#include "fr_vote.h"
 #include <vulkan/vulkan_android.h>
 #include "direct_present_spirv.h"
 #include "fg_gen_spirv.h" // framegen-1b: the generator's five passes
+#elif defined(__APPLE__)
+// ios-direct-present (Claude, 2026-10-16): the same presenter on iOS/iPadOS. The app's "window" is its CAMetalLayer, passed
+// through V6's acquireWindow as an opaque pointer; MoltenVK makes the surface (VK_EXT_metal_surface, which device.cpp enables
+// with diag-direct-present). Everything else (passes, scalers, pacing through VK_GOOGLE_display_timing) is the Android code.
+#include <android/log.h> // (platform/apple/include/android/log.h: the port's log shim)
+#include <pthread.h>
+#include <unistd.h>
+#include <vulkan/vulkan_metal.h>
+#include "direct_present_spirv.h"
+#include "fg_gen_spirv.h"
 #endif
 struct ANativeWindow;
 #include "recomp_app_dir.h" // data-paths: the app's files directory.
@@ -106,7 +117,12 @@ bool displayTimingEnabled(); // device.cpp (v318): VK_GOOGLE_display_timing enab
 bool directPresentWanted();                  // device.cpp (v255)
 VkQueue probePresentQueue(VkDevice device);  // device.cpp (v259): a queue of the family only for vkQueuePresentKHR, or null
 unsigned probeFamilyQueueCount();            // device.cpp (v259)
+std::pair<VkQueue,uint32_t> probeSideQueue(VkDevice device); // device.cpp (ios-side-queue): another family's queue, or null
 }
+extern "C" std::atomic<int> recomp_ios_render_sixteenths; // (generic_renderer.cpp: the applied render scale, 16 = 100 %)
+extern "C" std::atomic<int> recomp_ios_settings_upscaler; // (generic_renderer.cpp: the player's scaler.txt picks an upscaler)
+extern "C" std::atomic<unsigned> recomp_ios_layout_gen; // (generic_renderer.cpp; build 192: bumped by a drawable-size change)
+inline unsigned recompIosExtentLayoutGen=0,recompIosAuditLayoutGen=0; // (build 192: the layout generation the extent was checked at / the audit was recorded at)
 
 namespace recomp::gpu::direct {
 // v410: the presenter's filter mode (0 nearest, 1 linear, 2 cubic), for the renderer's RENDER_GENERIC_V210Y line (ab_windows.py).
@@ -139,7 +155,7 @@ struct Window {
     std::uint64_t (*generation)(void*) noexcept=nullptr;
 };
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__APPLE__)
 #define RECOMP_DIRECT_LOG(...) __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",__VA_ARGS__)
 // pace-caps (lane A): the panel's refresh length as VK_GOOGLE_display_timing reports it for this swapchain, handed to the pacer as
 // the first guess of its vsync estimate (pace_caps.h setRefresh; 0 = not known, the pacer then assumes ~120 Hz as before). One
@@ -148,13 +164,6 @@ struct Window {
     VkRefreshCycleDurationGOOGLE r{};
     const auto get=displayTimingEnabled()?reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(vkGetDeviceProcAddr(device,"vkGetRefreshCycleDurationGOOGLE")):nullptr;
     recomp::pace::refreshIs(get && get(device,swapchain,&r)==VK_SUCCESS?r.refreshDuration:0);
-}
-// display-rate vote (v522): the same read-only query for the log alone (0 = not known). The pacer is NOT told: its vsync
-// estimate stays what the swapchain's creation gave it, as in every build before.
-[[gnu::noinline]] inline std::uint64_t refreshNow(VkDevice device,VkSwapchainKHR swapchain) noexcept {
-    VkRefreshCycleDurationGOOGLE r{};
-    const auto get=displayTimingEnabled()?reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(vkGetDeviceProcAddr(device,"vkGetRefreshCycleDurationGOOGLE")):nullptr;
-    return get && get(device,swapchain,&r)==VK_SUCCESS?r.refreshDuration:0;
 }
 class Presenter {
 public:
@@ -173,6 +182,19 @@ public:
         else if(!window.acquire || !window.release || !window.generation)why="no-window-callbacks";
         else if(!d || !d->device)why="no-device";
         else if(!probeSwapchainEnabled(d->device))why="no-swapchain-extension";
+#if defined(__APPLE__)
+        // ios-direct-present: the app gives its layer only once it is laid out and on screen (acquire returns null before).
+        // That is not a failure: nothing is created, and the next frame asks again (claimPending(); the frame is dropped).
+        if(!why) {
+            std::uint64_t g=0;
+            if(ANativeWindow* w=window.acquire(window.user,&g))window.release(window.user,w);
+            else {
+                tried=false;++claimRetries;
+                if(claimRetries==1 || !(claimRetries%120))RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT claim=wait why=window-not-ready tries=%u",claimRetries);
+                return false;
+            }
+        }
+#endif
         if(!why){dev=d;if(!loadFunctions())why="functions";else if(!createStatic())why="static-objects";else if(!ensureSwapchain())why="swapchain";}
         if(why) {
             RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT claim=0 why=%s",why);
@@ -194,6 +216,8 @@ public:
         return true;
     }
     bool released() {std::lock_guard l(m);return released_;}
+    // ios-direct-present: the first claim found no laid-out window and will be tried again at the next frame.
+    bool claimPending() {std::lock_guard l(m);return !tried && !claimed;}
     // Claimed and not failed: frames it could not show were dropped, not lost with the presenter.
     bool usable() {std::lock_guard l(m);return claimed && !released_ && !broken;}
     // After a failure: nothing of the presenter stays on the window (the app's renderer attaches next).
@@ -253,9 +277,14 @@ public:
     // to `queue` before this call and followed there by a full barrier (Renderer::submitCurrent). False: not shown.
     // v318: `tag` (the frame's present sequence, 0 = none) follows the image to presentNow for the latency probe.
     bool presentGpu(VkQueue queue,VkImage image,VkImageView view,std::uint32_t tag=0) {
-        std::lock_guard l(m);
+        std::unique_lock l(m);
         if(!gpuOn.load(std::memory_order_relaxed) || !claimed || released_ || broken)return false;
         const auto t0=std::chrono::steady_clock::now();
+#if defined(__APPLE__)
+        iosLk=&l;struct ClearLk{std::unique_lock<std::mutex>*& p;~ClearLk(){p=nullptr;}} clearLk{iosLk};
+        if(fgEver)iosAwaitPresented(); // ios-fg-one-acquire: the previous frame's pictures have had their present calls
+        if(!gpuOn.load(std::memory_order_relaxed) || !claimed || released_ || broken)return false;
+#endif
         currentTag=tag;
         fgBefore(queue,image,tag); // frame-gen (lane B): between = the made picture first (no diag-fg-pair-* file: a load and a return)
         const bool ok=presentLocked(queue,view,image,false,{},nullptr);
@@ -286,6 +315,15 @@ private:
 
     std::mutex m;
     std::thread presentThread;std::condition_variable presentCv;std::deque<std::uint32_t> pendingPresents; // v259 (under m)
+#if defined(__APPLE__)
+    // ios-fg-one-acquire (Claude 2026-10-17; c177-c180 GPU watchdog crashes with frame generation): MoltenVK hands out a swapchain
+    // image before its drawable is free and makes the GPU wait for it inside a command buffer; the 3-drawable iOS swapchain then
+    // deadlocked when a pair's second image was acquired while the first picture's present call was still queued behind it.
+    // With frame generation on, every picture's present CALL is made before the next image is acquired: at most one image is
+    // acquired and not yet presented, and every present command precedes any command buffer that waits for a drawable.
+    std::condition_variable presentedCv;std::unique_lock<std::mutex>* iosLk=nullptr; // (iosLk: presentGpu's lock while it runs)
+    std::uint64_t iosWaits=0,iosWaitNs=0,iosWaitTimeouts=0;
+#endif
     std::deque<std::uint32_t> pendingTags;std::uint32_t currentTag=0; // v318: the frame tag of each pending present (under m)
     PFN_vkGetPastPresentationTimingGOOGLE pastTiming=nullptr;std::uint64_t displayTimes=0; // v318 (VK_GOOGLE_display_timing)
     // v337: files/private-trace/diag-v337-lag (read once): every tagged frame asks for its display time (lag_v337.h); the
@@ -295,10 +333,23 @@ private:
     Window window{};
     std::function<ProbeDevice*()> deviceSource;
     ProbeDevice* dev=nullptr;
-    bool tried=false,claimed=false,released_=false,broken=false,recreate=false,lost=false,auditable=false,bgra=false;
+    bool tried=false,claimed=false,released_=false,broken=false,recreate=false,lost=false,auditable=false,bgra=false,fbOnly=false;
+    static bool iosFbOnlyWanted() noexcept { // (ios-fbonly) checked at swapchain creation and every 120 presents
+#if defined(__APPLE__)
+        return recomp_ios_switches_access((std::string(Switches)+"ios-fbonly").c_str(),F_OK)==0;
+#else
+        return false;
+#endif
+    }
     std::atomic<bool> gpuOn{false};
     bool gpuAuditFailed=false,cpuImageGeneral=false;
     ANativeWindow* nw=nullptr;std::uint64_t gen=0;
+    unsigned claimRetries=0; // ios-direct-present (claim())
+    std::uint64_t tmCalls=0,tmTagZero=0,tmRequested=0,tmQueries=0,tmReturned=0,tmActual=0; // ios-direct-present: RENDER_IOS_TIMING
+    // ios-direct-present: on-screen frame times from the driver's actual display times (MTLDrawable presentedTime on iOS):
+    // RENDER_IOS_DISPLAY every 120 displayed frames (1 ms bins; band = within 10 % of 33.33 ms). Presenter thread only.
+    std::uint64_t dispLast=0;std::uint32_t dispLastId=0;std::uint64_t presentCallLastNs=0,dispLongLogs=0;std::array<std::uint32_t,128> dispBins{};std::uint32_t dispN=0,dispOver50=0,dispBand=0,dispClockLogs=0,dispBand16=0,dispOver33=0;
+    std::uint64_t dispMax=0,dispSum=0,dispTotal=0;
     VkSurfaceKHR surface=VK_NULL_HANDLE;VkSwapchainKHR swapchain=VK_NULL_HANDLE;
     VkFormat format=VK_FORMAT_UNDEFINED,passFormat=VK_FORMAT_UNDEFINED;VkExtent2D extent{};VkSurfaceTransformFlagBitsKHR currentTransform{};
     std::vector<VkImage> images;std::vector<VkImageView> views;std::vector<VkFramebuffer> framebuffers;
@@ -316,8 +367,6 @@ private:
     // run); the first entry into each filtered mode audits the next GPU frame. Pass timestamps (when the queue family has them)
     // give the presenter's GPU time per mode, reported per 256 presents.
     Filter filter=Filter::Nearest,auditFilter=Filter::Nearest;bool filterFailed=false,auditCompute=false;unsigned filterPolls=0,filterAudited=0;
-    // display-rate vote (v522, see pollFrameRate): the vote in force (0 none, 120, 60), the window generation it was given to
-    recomp::frv::Vote frVote;
     std::uint64_t filterChanges=0;
     static constexpr unsigned MaxTimed=32;
     VkQueryPool timePool=VK_NULL_HANDLE;double tsNs=0;std::uint64_t tsMask=0;std::array<std::uint8_t,MaxTimed> slotTimed{};
@@ -397,7 +446,6 @@ private:
     std::uint32_t fgW=SourceWidth,fgH=SourceHeight;bool fgSizeLogged=false; // frame generation's two pictures (the source's size when they were made)
     std::uint64_t cpuPresents=0,cpuDropped=0,gpuPresents=0,gpuDropped=0,cpuNs=0,gpuNs=0,acquireNs=0,presentNs=0,
         timeouts=0,outOfDate=0,suboptimal=0,surfaceLost=0,recreated=0,extentChecks=0,extentChanges=0,presentCalls=0;
-    VkExtent2D hwcWindow{};unsigned hwcWidth=0; // v567: diag-measure-hwc-scale (the window's extent; the buffer width, 0 = off)
     VkQueue lastQueue=VK_NULL_HANDLE; // v259: the queue of the latest pass (the present without a present queue)
     // latency-path (lat2): the GPU-done watcher (diag-lat-gpu-done; jobs only while the timeline is armed). A job carries copies
     // of every handle it uses; slotWatch keeps the presenter from resetting, resubmitting or destroying a watched fence.
@@ -411,7 +459,11 @@ private:
     std::vector<std::uint16_t> prevRow,curRow; // (watcher thread only)
     std::mutex gpuDoneMutex;std::condition_variable gpuDoneCv;std::deque<GpuDoneJob> gpuDoneJobs;std::thread gpuDoneThread;bool gpuDoneStop=false;
     std::uint64_t gpuDoneMarked=0,gpuDoneFailed=0,gpuDoneRefused=0; // (under gpuDoneMutex; logged at stop)
+#if defined(__APPLE__)
+    PFN_vkCreateMetalSurfaceEXT createSurface=nullptr;PFN_vkDestroySurfaceKHR destroySurface=nullptr; // ios-direct-present
+#else
     PFN_vkCreateAndroidSurfaceKHR createSurface=nullptr;PFN_vkDestroySurfaceKHR destroySurface=nullptr;
+#endif
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR surfaceSupport=nullptr;PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surfaceCaps=nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surfaceFormats=nullptr;PFN_vkCreateSwapchainKHR createSwapchain=nullptr;
     PFN_vkDestroySwapchainKHR destroySwapchain=nullptr;PFN_vkGetSwapchainImagesKHR swapchainImages=nullptr;
@@ -420,7 +472,11 @@ private:
     bool loadFunctions() {
         const auto i=[&](const char* n){return vkGetInstanceProcAddr(dev->instance,n);};
         const auto d=[&](const char* n){return vkGetDeviceProcAddr(dev->device,n);};
+#if defined(__APPLE__)
+        createSurface=reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(i("vkCreateMetalSurfaceEXT")); // ios-direct-present
+#else
         createSurface=reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(i("vkCreateAndroidSurfaceKHR"));
+#endif
         destroySurface=reinterpret_cast<PFN_vkDestroySurfaceKHR>(i("vkDestroySurfaceKHR"));
         surfaceSupport=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(i("vkGetPhysicalDeviceSurfaceSupportKHR"));
         surfaceCaps=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(i("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
@@ -582,10 +638,35 @@ private:
         return true;
     }
     bool waitAllMine() {for(unsigned k=0;k<acquires.size();++k)if(!waitAcquireSlot(k))return false;return true;}
+#if defined(__APPLE__)
+#define IOS_PRESENTED_NOTIFY presentedCv.notify_all()
+    // ios-fg-one-acquire: wait (m released) until every queued picture's present call was made and none is held.
+    void iosAwaitPresented() noexcept {
+        if(!iosLk || !presentThread.joinable() || stopPresenter)return;
+        if(pendingPresents.empty() && !fgHolding)return;
+        ++iosWaits;const auto t0=std::chrono::steady_clock::now();
+        // ios-gpu-hang (Claude, 2026-10-20; c291: GPU timeouts, device lost, exit 4 after ~60 s of frame generation): going on
+        // after a timed-out wait puts a second acquire outstanding, the deadlock of c177-c180. The wait never timed out in 1,037
+        // logged windows, so it now keeps waiting up to 1 s in 100 ms slices; each timeout is logged at once.
+        const auto done=[&]{return stopPresenter || (pendingPresents.empty() && !fgHolding);};
+        unsigned slices=0;
+        while(!presentedCv.wait_for(*iosLk,std::chrono::milliseconds(100),done)) {
+            if(!slices++)++iosWaitTimeouts;
+            RECOMP_DIRECT_LOG("RENDER_IOS_FG_AWAIT_TIMEOUT slice=%u pending=%zu holding=%d",slices,pendingPresents.size(),int(fgHolding));
+            if(slices>=10)break;
+        }
+        iosWaitNs+=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());
+    }
+#else
+#define IOS_PRESENTED_NOTIFY ((void)0)
+#endif
     // v259: the present thread (under m): presents each image the renderer's pass for it was submitted for, in order.
     void presentLoop() {
 #if defined(__linux__)
         pthread_setname_np(pthread_self(),"recomp-dpresent");
+#elif defined(__APPLE__)
+        pthread_setname_np("recomp-dpresent"); // ios-direct-present: presents on time (it only waits and calls the driver)
+        (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
 #endif
         std::unique_lock l(m);
         for(;;) {
@@ -594,8 +675,9 @@ private:
             auto i=pendingPresents.front();pendingPresents.pop_front(); // (frame-gen: not const, see fgHold)
             const auto tag=popTag();
             fgHold(l,i,tag); // frame-gen (lane B): a held pair's second picture waits for its time (otherwise: a compare and a return)
-            if(!swapchain || i>=renderDone.size())continue;
+            if(!swapchain || i>=renderDone.size()){IOS_PRESENTED_NOTIFY;continue;}
             presentNow(i,tag);
+            IOS_PRESENTED_NOTIFY;
         }
     }
     std::uint32_t popTag() {if(pendingTags.empty())return 0;const auto t=pendingTags.front();pendingTags.pop_front();return t;}
@@ -704,21 +786,44 @@ private:
         if(timing && lagOn){callTag[tag%recomp::v337::Ring]=tag;callAt[tag%recomp::v337::Ring]=recomp::v337::monotonicNs();} // v337
         VkResult pr;
         const auto t1=std::chrono::steady_clock::now();
+        { // ios-slow-display: the presenter's own gap between present calls (diagnostic, at most 40 lines)
+            const auto n=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count());
+            if(presentCallLastNs && n-presentCallLastNs>100'000'000ull && n-presentCallLastNs<2'000'000'000ull && dispLongLogs<40) {
+                ++dispLongLogs;RECOMP_DIRECT_LOG("RENDER_IOS_SLOW_PRESENT_CALL gap_ms=%.1f tag=%u",double(n-presentCallLastNs)*1e-6,tag);
+            }
+            presentCallLastNs=n;
+        }
         if(presentQueue){std::lock_guard q(presentQueueMutex);pr=queuePresent(presentQueue,&pi);}
         else {std::lock_guard q(sharedQueueMutex());pr=queuePresent(lastQueue,&pi);}
         presentNs+=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t1).count());
         recomp::pace::presentCalled(tag); // pace-caps (lane A): release -> present call (a load and a return without a cap)
         if(probe)tl::mark(tl::HostPresentEnd,0,tag);
         fgCalled(tag); // frame-gen (lane B): a pair's second picture stays out of the v337 call ring
+        ++tmCalls;tmTagZero+=!tag;tmRequested+=timing && pastTiming;
+        if(!(tmCalls%600))RECOMP_DIRECT_LOG("RENDER_IOS_TIMING calls=%llu tag_zero=%llu requested=%llu queries=%llu returned=%llu actual=%llu lag=%u past=%u",
+            (unsigned long long)tmCalls,(unsigned long long)tmTagZero,(unsigned long long)tmRequested,(unsigned long long)tmQueries,
+            (unsigned long long)tmReturned,(unsigned long long)tmActual,unsigned(lagOn),unsigned(pastTiming!=nullptr));
         if(timing && pastTiming && (pr==VK_SUCCESS || pr==VK_SUBOPTIMAL_KHR)) {
             std::array<VkPastPresentationTimingGOOGLE,8> past{};std::uint32_t n=std::uint32_t(past.size());
             const auto q=pastTiming(dev->device,swapchain,&n,past.data());
+            ++tmQueries;if(q==VK_SUCCESS || q==VK_INCOMPLETE){tmReturned+=n;for(std::uint32_t k=0;k<n && k<past.size();++k)tmActual+=past[k].actualPresentTime!=0;}
             if(q==VK_SUCCESS || q==VK_INCOMPLETE)
                 for(std::uint32_t k=0;k<n && k<past.size();++k) if(past[k].presentID && past[k].actualPresentTime) {
                     // arg: the driver's present margin in 100 us units (how early the frame was ready for its vsync)
                     const auto margin=std::min<std::uint64_t>(past[k].presentMargin/100000u,65535u);
                     if(probe)tl::markAt(past[k].actualPresentTime,tl::Displayed,std::uint16_t(margin),past[k].presentID);++displayTimes;
                     recomp::pace::displayedAt(past[k].presentID,past[k].actualPresentTime); // pace-caps (lane A): the vsync estimate, slot feedback
+                    // ios-late-display (Claude 2026-10-18, diagnostic): a displayed interval over 40 ms with the driver's times for that frame
+                    // (desired / earliest relative to actual, and the present margin): ready late (earliest after desired) or shown late
+                    if(dispLast && past[k].actualPresentTime>dispLast && (past[k].actualPresentTime-dispLast>40'000'000ull ||
+                       (past[k].actualPresentTime-dispLast<25'000'000ull && dispTotal>2400)) &&
+                       past[k].actualPresentTime-dispLast<=2'000'000'000ull && lateDispLogs<80) {
+                        ++lateDispLogs;const auto rel=[&](std::uint64_t t){return t?(double(std::int64_t(t-past[k].actualPresentTime))*1e-6):0.0;};
+                        RECOMP_DIRECT_LOG("RENDER_IOS_LATE_DISPLAY interval_ms=%.2f id=%u desired_rel_ms=%.2f earliest_rel_ms=%.2f margin_ms=%.2f",
+                            double(past[k].actualPresentTime-dispLast)*1e-6,past[k].presentID,rel(past[k].desiredPresentTime),
+                            rel(past[k].earliestPresentTime),double(past[k].presentMargin)*1e-6);
+                    }
+                    noteDisplayInterval(past[k].actualPresentTime,past[k].presentID); // ios-direct-present (measurement: a few adds)
                     if(probe)tl::markAt(past[k].actualPresentTime,tl::DisplayMargin,lat2::marginUnits(past[k].presentMargin),past[k].presentID); // lat2
                     fgDisplayed(past[k].presentID,past[k].actualPresentTime); // frame-gen (lane B): pair spacing, its vsync estimate
                     if(lagOn) { // v337
@@ -733,6 +838,43 @@ private:
         else if(pr==VK_ERROR_SURFACE_LOST_KHR){lost=true;++surfaceLost;}
         else if(pr!=VK_SUCCESS){broken=true;gpuOn.store(false,std::memory_order_release);RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT broken=present %d",int(pr));}
         return pr==VK_SUCCESS || pr==VK_SUBOPTIMAL_KHR;
+    }
+    // ios-direct-present: one displayed frame at `actual` (driver clock). The interval to the previous displayed frame is the
+    // previous frame's time on screen. Logged every 120 frames, then reset.
+    unsigned lateDispLogs=0; // ios-late-display (diagnostic line budget)
+    [[gnu::noinline]] void noteDisplayInterval(std::uint64_t actual,std::uint32_t id=0) noexcept {
+        // ios-slow-display (Claude 2026-10-17, diagnostic): a displayed interval over 100 ms names how many present IDs it spans
+        // (1 = one frame stayed on screen that long; more = the frames between had no display record, so the interval is not one
+        // frame's time). At most 40 lines per run.
+        if(id && dispLast && actual>dispLast && actual-dispLast>100'000'000ull && actual-dispLast<=2'000'000'000ull && dispLongLogs<40) {
+            ++dispLongLogs;
+            RECOMP_DIRECT_LOG("RENDER_IOS_SLOW_DISPLAY interval_ms=%.1f id=%u prev_id=%u spans=%d",double(actual-dispLast)*1e-6,id,dispLastId,
+                dispLastId?int(id-dispLastId):-1);
+        }
+        if(id)dispLastId=id;
+        if(dispClockLogs<3) {++dispClockLogs; // the clock check: actual against both candidate clocks (once per frame, 3 frames)
+            timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);
+#if defined(__APPLE__)
+            const unsigned long long raw=clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+            const unsigned long long raw=0;
+#endif
+            RECOMP_DIRECT_LOG("RENDER_IOS_DISPLAY_CLOCK actual=%llu uptime_raw=%llu monotonic=%llu",(unsigned long long)actual,raw,
+                (unsigned long long)(std::uint64_t(t.tv_sec)*1000000000ull+std::uint64_t(t.tv_nsec)));
+        }
+        if(actual<=dispLast){if(!dispLast)dispLast=actual;return;}
+        if(!dispLast){dispLast=actual;return;}
+        const std::uint64_t d=actual-dispLast;dispLast=actual;
+        if(d>2'000'000'000ull)return; // (a pause, not a frame)
+        ++dispN;++dispTotal;dispSum+=d;dispMax=std::max(dispMax,d);dispOver50+=d>50'000'000ull;
+        dispBand+=d>=30'000'000ull && d<=36'666'667ull;
+        dispBand16+=d>=15'000'000ull && d<=18'333'333ull;dispOver33+=d>33'400'000ull; // (Claude 2026-10-19: the 60 fps frame-generation target)
+        ++dispBins[std::min<std::uint64_t>(d/1'000'000ull,127)];
+        if(dispN<120)return;
+        const auto pct=[&](unsigned q){std::uint32_t acc=0;for(unsigned i=0;i<128;++i){acc+=dispBins[i];if(acc*100u>=dispN*q)return i;}return 127u;};
+        RECOMP_DIRECT_LOG("RENDER_IOS_DISPLAY n=%u mean_ms=%.2f p50=%u p90=%u p99=%u max_ms=%.1f over50=%u band30=%u total=%llu band16=%u over33=%u",dispN,
+            double(dispSum)/1e6/dispN,pct(50),pct(90),pct(99),double(dispMax)/1e6,dispOver50,dispBand,(unsigned long long)dispTotal,dispBand16,dispOver33);
+        dispN=0;dispOver50=0;dispBand=0;dispBand16=0;dispOver33=0;dispMax=0;dispSum=0;dispBins.fill(0);
     }
     void createScalePipeline() { // v411
         VkShaderModuleCreateInfo sm{};sm.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;sm.codeSize=sizeof ScaleComputeSpirv;sm.pCode=ScaleComputeSpirv;
@@ -1395,18 +1537,31 @@ private:
             std::uint64_t acquiredGen=0;
             nw=window.acquire(window.user,&acquiredGen);gen=acquiredGen;lost=false;
             if(!nw)return false;
+#if defined(__APPLE__)
+            // ios-direct-present: nw is the app's CAMetalLayer (an opaque pointer here; the app keeps it alive for the run)
+            VkMetalSurfaceCreateInfoEXT si{};si.sType=VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+            si.pLayer=reinterpret_cast<const CAMetalLayer*>(nw);
+#else
             VkAndroidSurfaceCreateInfoKHR si{};si.sType=VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;si.window=nw;
+#endif
             if(createSurface(dev->instance,&si,nullptr,&surface)!=VK_SUCCESS){surface=VK_NULL_HANDLE;RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT surface=failed");return false;}
             VkBool32 supported=VK_FALSE;
             if(surfaceSupport(dev->physical,dev->queueFamily,surface,&supported)!=VK_SUCCESS || !supported){RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT surface=unsupported-queue");return false;}
         }
         if(swapchain && !recreate) {
             // v256: a resized window (a new current extent) is recreated for; checked every 120 presents, not per frame.
+#if defined(__APPLE__)
+            // (build 192) a drawable-size change is checked for at once, not at the next 120th present
+            const unsigned layoutGen=recomp_ios_layout_gen.load(std::memory_order_acquire);
+            const bool layoutMoved=layoutGen!=recompIosExtentLayoutGen;recompIosExtentLayoutGen=layoutGen;
+            if((++extentChecks%120) && !layoutMoved)return true;
+#else
             if(++extentChecks%120)return true;
+#endif
             VkSurfaceCapabilitiesKHR now{};
             if(surfaceCaps(dev->physical,surface,&now)!=VK_SUCCESS)return true;
-            if(now.currentExtent.width==extent.width && now.currentExtent.height==extent.height)return true;
-            if(hwcWidth && now.currentExtent.width==hwcWindow.width && now.currentExtent.height==hwcWindow.height)return true; // (v567: the window, not the smaller buffer)
+            const bool fbFlip=iosFbOnlyWanted()!=fbOnly; // (ios-fbonly: the switch flipped, so the swapchain is made again)
+            if(!fbFlip && now.currentExtent.width==extent.width && now.currentExtent.height==extent.height)return true;
             ++extentChanges;
         }
         VkSurfaceCapabilitiesKHR caps{};
@@ -1425,27 +1580,14 @@ private:
         VkExtent2D e=caps.currentExtent;
         if(e.width==0xFFFFFFFFu){e.width=std::clamp(1920u,caps.minImageExtent.width,caps.maxImageExtent.width);
             e.height=std::clamp(1080u,caps.minImageExtent.height,caps.maxImageExtent.height);}
-        // v567 (driving goal, 2026-10-21; MEASUREMENT ONLY, a picture change: the owner judges it): diag-measure-hwc-scale = the
-        // swapchain is made smaller than the window (width from the file's text, default 960; height keeps the window's shape)
-        // and Android's compositor scales it to the window (the Vulkan loader sets SCALE_TO_WINDOW), so the display hardware
-        // does the upscale. A 960-wide buffer gives a 960x540 image rect = the render-size picture, which then takes the 1:1
-        // copy (path one) instead of the down blit + FSR 1 at 2176x1224 (~6 ms of GPU per frame, fs1). Read when the swapchain
-        // is made (a drive-long switch). Absent: as v566.
-        hwcWidth=0;
-        if(FILE* hf=std::fopen((std::string(Switches)+"diag-measure-hwc-scale").c_str(),"r")) {
-            unsigned w=960;if(std::fscanf(hf,"%u",&w)!=1)w=960;std::fclose(hf);
-            if(w>=320 && w<e.width && e.height) {
-                const unsigned h=std::uint32_t((std::uint64_t(w)*e.height+e.width/2)/e.width);
-                if(h>=w*720/1280 && w>=caps.minImageExtent.width && w<=caps.maxImageExtent.width && h>=caps.minImageExtent.height && h<=caps.maxImageExtent.height) {
-                    hwcWindow=e;hwcWidth=w;e={w,h};
-                }
-            }
-        }
-        RECOMP_DIRECT_LOG("RENDER_DIRECT_HWC on=%u window=%ux%u buffer=%ux%u",unsigned(hwcWidth!=0),hwcWidth?hwcWindow.width:e.width,
-            hwcWidth?hwcWindow.height:e.height,e.width,e.height);
         if(!layout(e.width,e.height))return false;
         std::uint32_t count=caps.minImageCount+1;if(caps.maxImageCount)count=std::min(count,caps.maxImageCount);
-        const bool transferSrc=(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_SRC_BIT)!=0;
+        // ios-fbonly (Claude 2026-10-21): without TRANSFER_SRC the swapchain's only use is the colour attachment, so MoltenVK makes
+        // the CAMetalLayer framebufferOnly and Core Animation may use display-optimised drawables (hypothesis: cheaper system
+        // composition; fill costs +1.2-1.4 ms of GPU per frame, c357/c358). The audit and the motion-probe band copies need
+        // TRANSFER_SRC and are skipped while it is off (`auditable`). files/private-trace/ios-fbonly (or a switch list) selects it.
+        fbOnly=iosFbOnlyWanted();
+        const bool transferSrc=!fbOnly && (caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_SRC_BIT)!=0;
         VkCompositeAlphaFlagBitsKHR alpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         for(const auto a:{VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
                           VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR})if(caps.supportedCompositeAlpha&a){alpha=a;break;}
@@ -1463,6 +1605,7 @@ private:
         swapchain=VK_NULL_HANDLE;
         if(r!=VK_SUCCESS){RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT swapchain=failed %d",int(r));return false;}
         swapchain=made;format=chosen.format;extent=e;bgra=format==VK_FORMAT_B8G8R8A8_UNORM;auditable=transferSrc;
+        RECOMP_DIRECT_LOG("RENDER_IOS_FBONLY on=%u extent=%ux%u",unsigned(fbOnly),e.width,e.height);
         paceRefresh(dev->device,swapchain); // pace-caps (lane A): the panel's refresh length, the vsync estimate's first guess (a read-only query)
         currentTransform=caps.currentTransform;
         // (from here a failure leaves a swapchain without its per-image objects: the presenter stops)
@@ -1605,7 +1748,6 @@ private:
         if(!(fg.switches()&recomp::fg::SwModes)) {
             if(fgEver && (fgPlan.mode!=recomp::fg::Off || fgPrevValid)){fgPlan=recomp::fg::Plan{};fgPrevValid=false;}
             if(fgEver && fgTimed){fgTimed=false;recomp::pace::pairsTimed(false);} // pace-fg-tuning: the pacer plans untimed frames again
-            if(fgEver && fgPairsLow){fgPairsLow=false;recomp::pace::pairsLow(false);} // pace-auto-pairs: the automatic ladder has its 24 fps rung again
             if(fgEver)fgGenOff(); // framegen-1b: nothing of the generator stays planned or kept
             return;
         }
@@ -1617,14 +1759,8 @@ private:
         if(const auto f=recomp::fg::slotSource.load(std::memory_order_relaxed))f(tag,&s);
         // framegen-1b: fgGenAllows() is true without diag-fg-between (a load and a test); with it, false while the slot keeper has fallen back to real frames only,
         // and (check c2) false for a frame whose inputs the generator refuses: such a frame is never planned as a timed pair (skip=failed, pairsTimed(false) below)
-        fgKeeper.lateRelative((fg.switches()&recomp::fg::SwLateRelative)!=0); // fg-late-relative: the slot keeper's rule for this frame's verdict (fgGenAllows)
-        fgKeeper.lagBaseline(recomp::fg::is60(recomp::fg::gridFor(s.period))); // fg-60hz-late (v571): lateness against the observed latency on a 60 Hz panel
-        static_assert(recomp::fgg::K::GpuApart==recomp::fg::K::Apart,"the keeper's GPU-time limit is stated for the 30 fps cap's pair spacing");
-        fgKeeper.apart(recomp::fg::apartFor(s.refreshes,fg.switches(),recomp::fg::gridFor(s.period))); // fg-gpu-limit: the spacing this frame's pair would have (2 without diag-fg-low; fg-60hz: 1 on a 60 Hz panel, counted as 2 = the same 3.0 ms of a 33.3 ms frame)
         fgPlan=fg.real(tag,recomp::fg::monotonicNs(),s,pastTiming!=nullptr && lagOn,presentThread.joinable() && !stopPresenter,fgGenAllows(tag) && tag!=0 && !fgFailed);
         if(fgPlan.timed!=fgTimed){fgTimed=fgPlan.timed;recomp::pace::pairsTimed(fgTimed);} // pace-fg-tuning: lane A's lead and trim follow (one rule for both lanes)
-        // pace-auto-pairs: pairs are wanted under the low caps (diag-fg-low, and the generator has not fallen back for good): the automatic ladder then leaves out 24
-        if(const bool low=(fg.switches()&recomp::fg::SwLow)!=0 && !fgKeeper.final();low!=fgPairsLow){fgPairsLow=low;recomp::pace::pairsLow(low);}
         if(!(++fgFrames%256) || fgFrames==1)fgLog();
         if(fgPlan.mode==recomp::fg::Off){fgPrevValid=false;return;}
         if(!fgEnsure()){fg.secondLost(tag);fgPlan=recomp::fg::Plan{};fgPrevValid=false;return;}
@@ -1643,7 +1779,11 @@ private:
         // between: the made picture first, on the frame's slot and with the frame's tag; the real frame follows as the second
         if(!fgPresentMade(queue,image,true)){fg.secondLost(tag);fgPlan=recomp::fg::Plan{};fgPrevValid=false;return;}
         ++gpuPresents; // (the made picture is a present: the real frame's pass then sees its own count, RENDER_DIRECT_PRESENT logs once)
+#if defined(__APPLE__)
+        iosAwaitPresented(); // ios-fg-one-acquire: the made picture's present call before the real frame's image is acquired
+#else
         fgStash();
+#endif
         fgMadeFirst=true;
         currentTag=fgPlan.secondId; // (the pair's second picture: its own id)
     }
@@ -1654,7 +1794,11 @@ private:
             fgUnstash();
             if(!ok){fg.secondLost(tag);fgGenRealLost();} // (the made picture stands alone on the slot; framegen-1b: the slot keeper counts it as a lost picture)
         } else if(ok) { // ahead: the made picture follows the real one
+#if defined(__APPLE__)
+            iosAwaitPresented(); // ios-fg-one-acquire: the real picture's present call before the made picture's image is acquired
+#else
             fgStash();
+#endif
             ++gpuPresents; // (as above; taken back when the made picture is not presented)
             currentTag=fgPlan.secondId; // (ahead: the made picture is the pair's second and carries the id)
             const bool made=fgPresentMade(queue,image,false);
@@ -1674,7 +1818,7 @@ private:
         fgHolding=true;fgSuperseded=false;
         // (ends early when a newer real frame arrives, when anything else is queued behind the held picture, or at shutdown)
         const bool released=presentCv.wait_for(l,std::chrono::nanoseconds(until-now),[&]{return stopPresenter || fgSuperseded || !pendingPresents.empty();});
-        fgHolding=false;
+        fgHolding=false;IOS_PRESENTED_NOTIFY;
         fg.holdEnded(tag,recomp::fg::monotonicNs(),released && !stopPresenter);
         if(!(i<imageSlot.size() && slot>=0 && imageSlot[i]==slot))i=~0u;
     }
@@ -1695,34 +1839,40 @@ private:
     }
     [[gnu::noinline]] void fgDisplayed(std::uint32_t id,std::uint64_t actual) noexcept {
         recomp::fgb::displayed(id,actual); // fg-burst: the display time (one load unless diag-fg-burst is armed)
-        if(fgEver) { // (framegen-1b: did a made picture keep its slot; fg-late-relative: and its place in its own pair, when the pair's second picture is shown)
-            const recomp::fg::PairShown pair=fg.displayed(id,std::int64_t(actual));fgKeeper.shown(id,std::int64_t(actual));
-            if(pair.second)fgKeeper.pairShown(pair.first,pair.spacing,pair.apart);
-        }
+        if(fgEver){fg.displayed(id,std::int64_t(actual));fgKeeper.shown(id,std::int64_t(actual));} // (framegen-1b: did a made picture keep its slot)
     }
     [[gnu::noinline]] void fgLog() noexcept {
         const recomp::fg::Snapshot s=fg.take();
         const auto ms=[](std::uint64_t ns,std::uint64_t n){return n?double(ns)/1e6/double(n):0.0;};
-        RECOMP_DIRECT_LOG("RENDER_DIRECT_FG frames=%llu sw=%u real=%llu pairs=%llu between=%llu ahead=%llu skip=off:%llu,cap:%llu,rate:%llu,failed:%llu,second:%llu "
+        RECOMP_DIRECT_LOG("RENDER_DIRECT_FG frames=%llu sw=%u real=%llu pairs=%llu between=%llu ahead=%llu skip=off:%llu,cap:%llu,rate:%llu,failed:%llu,second:%llu,drain:%llu "
             "spacing=0:%llu,1:%llu,2:%llu,3:%llu,4:%llu,5:%llu first_gap=3:%llu,4:%llu,5:%llu,6:%llu,7:%llu held=%llu hold_ms=%.2f overrun=%llu dpt_late=%llu "
             "lag_first_ms=%.2f lag_second_ms=%.2f made=%llu made_call_ms=%.3f made_acquire_ms=%.3f set_allocs=%llu pool_resets=%llu inline_presents=%llu "
-            "stash_dropped=%llu id_clash=%llu gate_run=%u cap=%u grid=%u period_us=%.2f mean_phase=%.3f failed=%u "
-            "apart=%u gate_lo=%.1f gate_hi=%.1f spacing_long=5:%llu,6:%llu,7:%llu,8:%llu first_gap_long=7:%llu,8:%llu,9:%llu,10:%llu,11:%llu,12:%llu,13:%llu,14:%llu grid60=%u", // fg-low: at the end (the pair spacing and gate of the cap in force; the last bins of spacing= and first_gap= by length)
+            "stash_dropped=%llu id_clash=%llu gate_run=%u cap=%u grid=%u period_us=%.2f mean_phase=%.3f failed=%u lag_ref=%.2f",
             (unsigned long long)fgFrames,s.switches,(unsigned long long)s.real,(unsigned long long)s.pairs,(unsigned long long)s.between,(unsigned long long)s.ahead,
             (unsigned long long)s.skip[recomp::fg::NotWanted],(unsigned long long)s.skip[recomp::fg::NoCap],(unsigned long long)s.skip[recomp::fg::Rate],
-            (unsigned long long)s.skip[recomp::fg::Failed],(unsigned long long)s.skip[recomp::fg::SecondLost],
+            (unsigned long long)s.skip[recomp::fg::Failed],(unsigned long long)s.skip[recomp::fg::SecondLost],(unsigned long long)s.skip[recomp::fg::Drain],
             (unsigned long long)s.spacing[0],(unsigned long long)s.spacing[1],(unsigned long long)s.spacing[2],(unsigned long long)s.spacing[3],
             (unsigned long long)s.spacing[4],(unsigned long long)s.spacing[5],(unsigned long long)s.realGap[3],(unsigned long long)s.realGap[4],
             (unsigned long long)s.realGap[5],(unsigned long long)s.realGap[6],(unsigned long long)s.realGap[7],(unsigned long long)s.held,ms(s.holdNs,s.held),
             (unsigned long long)s.overrun,(unsigned long long)s.dptLate,ms(s.lagFirstNs,s.lagFirstN),ms(s.lagSecondNs,s.lagSecondN),
             (unsigned long long)fgMade,ms(fgMadeNs,fgMade),ms(fgAcquireNs,fgMade),(unsigned long long)fgSetAllocs,(unsigned long long)fgPoolResets,
             (unsigned long long)fgInline,(unsigned long long)fgStashDropped,(unsigned long long)s.idClash,s.gateRun,s.cap,unsigned(s.grid),s.periodNs/1e3,
-            s.pairs?s.phaseSum/double(s.pairs):0.0,unsigned(fgFailed),
-            s.apart,s.grid60?recomp::fg::Grid60.gateLo:recomp::fg::gateLoFor(s.apart),s.grid60?recomp::fg::Grid60.gateHi:recomp::fg::gateHiFor(s.apart),(unsigned long long)s.spacingLong[0],(unsigned long long)s.spacingLong[1],
-            (unsigned long long)s.spacingLong[2],(unsigned long long)s.spacingLong[3],(unsigned long long)s.realGapLong[0],(unsigned long long)s.realGapLong[1],
-            (unsigned long long)s.realGapLong[2],(unsigned long long)s.realGapLong[3],(unsigned long long)s.realGapLong[4],(unsigned long long)s.realGapLong[5],
-            (unsigned long long)s.realGapLong[6],(unsigned long long)s.realGapLong[7],unsigned(s.grid60));
+            s.pairs?s.phaseSum/double(s.pairs):0.0,unsigned(fgFailed),s.lagRefresh);
+        { // ios-fg-trace: the pictures recorded in the degraded mode (role:call:desired:actual, us from the pair's target)
+            std::array<recomp::fg::TracePic,recomp::fg::Pairs::Trace> t;const unsigned n=fg.takeTrace(t);
+            if(n) {
+                char line[2048];int at=std::snprintf(line,sizeof line,"RENDER_IOS_FG_TRACE n=%u pics=",n);
+                for(unsigned i=0;i<n && at<int(sizeof line)-48;++i)
+                    at+=std::snprintf(line+at,sizeof line-at,"%s%c:%d:%d:%d",i?",":"",char('1'+t[i].second),t[i].callUs,t[i].desiredUs,t[i].actualUs); // (roles 1 first, 2 second, 3 lost second, 4 late second)
+                RECOMP_DIRECT_LOG("%s",line);
+            }
+        }
         fgMade=0;fgMadeNs=0;fgAcquireNs=0;fgSetAllocs=0;fgPoolResets=0;fgInline=0;fgStashDropped=0;
+#if defined(__APPLE__)
+        RECOMP_DIRECT_LOG("RENDER_IOS_FG_ACQUIRE waits=%llu wait_ms=%.2f timeouts=%llu",(unsigned long long)iosWaits,
+            iosWaits?double(iosWaitNs)/1e6/double(iosWaits):0.0,(unsigned long long)iosWaitTimeouts);
+        iosWaits=0;iosWaitNs=0;iosWaitTimeouts=0;
+#endif
         fgGenLog(); // framegen-1b: RENDER_DIRECT_FG_GEN (no line unless diag-fg-between was seen since the last one)
     }
     VkDescriptorSet setFor(VkImageView view) {
@@ -1760,7 +1910,10 @@ private:
         std::uint32_t i=0;
         const auto t0=std::chrono::steady_clock::now();
         const auto r=acquireImage(dev->device,swapchain,AcquireTimeout,a.sem,VK_NULL_HANDLE,&i);
-        acquireNs+=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());
+        const auto acquiredNs=std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());
+        acquireNs+=acquiredNs;
+        if(acquiredNs>100'000'000ull) // ios-gpu-hang: an acquire that waited on the drawable pool (c291: a 993 ms frame before the GPU timeouts)
+            RECOMP_DIRECT_LOG("RENDER_IOS_SLOW_ACQUIRE ms=%.1f result=%d image=%u pending=%zu",double(acquiredNs)/1e6,int(r),i,pendingPresents.size());
         if(r==VK_ERROR_OUT_OF_DATE_KHR){recreate=true;++outOfDate;return false;}
         if(r==VK_ERROR_SURFACE_LOST_KHR){lost=true;++surfaceLost;return false;}
         if(r==VK_TIMEOUT || r==VK_NOT_READY){++timeouts;return false;}
@@ -1776,7 +1929,12 @@ private:
         pollFilter(); // v409
         const bool audit=auditable && !auditBlocked && wantAudit(identity); // (lane fsr-stage-b: auditBlocked, see auditRoom; false without a scale)
         if(audit)auditFilter=filter;
-        const bool timed=timePool && !audit && k<MaxTimed;
+#if defined(__APPLE__)
+        if(audit)recompIosAuditLayoutGen=recomp_ios_layout_gen.load(std::memory_order_acquire); // (build 192, see checkAudit)
+#endif
+        // (Claude 2026-10-17, ios-gpu-ts) GPU timestamps on one present in 16: in MoltenVK any timestamp in a command buffer adds a
+        // stage-counter fence wait (c133/c134: the renderer's per-frame timestamps cost 1-5 ms of display)
+        static unsigned timedTick=0;const bool timed=timePool && !audit && k<MaxTimed && (timedTick++&15u)==0;
         // latency-path motion probe: armed, tagged, not an audit frame (the audit owns those transitions), a TRANSFER_SRC swapchain
         const bool band=motionOn && auditable && !audit && currentTag && recomp::diag::timeline::armed.load(std::memory_order_relaxed) &&
             extent.height>=BandRows && ensureBand(k);
@@ -1857,6 +2015,52 @@ private:
             if(timed){vkCmdResetQueryPool(cb,timePool,2*k,2);vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timePool,2*k);}
             if(mid)vkCmdResetQueryPool(cb,midPool,k,1); // v42x
             if(fsrMid)vkCmdResetQueryPool(cb,fsrMidPool,k,1); // v450
+            { // ios-gpu-burden-present (Claude 2026-10-21; MEASUREMENT ONLY): files/private-trace/diag-gpu-burden-present (access(), so the
+              // iOS A/B switches drive it) records 6 copies of an 8 MB scratch buffer into every present's command buffer. Question: is
+              // the presenter's / frame generator's GPU time (~3 ms per real frame) on the frame's critical path, as the game's own
+              // chunks are (c419), or off it like the system compositor's (c429/c430)? Both buffers are ours: the picture is unchanged.
+                static unsigned polls=0;static bool on=false;
+                if(!(polls++%60))on=recomp_ios_switches_access((std::string(Switches)+"diag-gpu-burden-present").c_str(),F_OK)==0;
+                static Buffer bsrc,bdst;static bool failed=false;
+                if(on && !failed && !bsrc.buffer && !(makeBuffer(8u<<20,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,bsrc) &&
+                   makeBuffer(8u<<20,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,bdst)))failed=true;
+                if(on && !failed && bsrc.buffer && bdst.buffer){const VkBufferCopy rg{0,0,8u<<20};for(int k=0;k<6;++k)vkCmdCopyBuffer(cb,bsrc.buffer,bdst.buffer,1,&rg);}
+                static unsigned long long logged=0;if(on && !(logged++%600))RECOMP_DIRECT_LOG("RENDER_DIRECT_GPU_BURDEN_PRESENT on=1 failed=%u",unsigned(failed));
+            }
+            { // ios-gpu-burden-side (Claude 2026-10-21; MEASUREMENT ONLY): with RECOMP_IOS_SIDE_QUEUE and files/private-trace/
+              // diag-gpu-burden-side, the same 6 x 8 MB copies per present as diag-gpu-burden-present, but submitted to the side queue
+              // (another Metal command queue) with no dependency on the frame. Overlaps the game (frames unchanged, like the system
+              // compositor) or not (late rises, as c437)? Decides whether moving the generator/presenter to a second queue can pay.
+                static unsigned polls=0;static bool on=false;
+                if(!(polls++%60))on=recomp_ios_switches_access((std::string(Switches)+"diag-gpu-burden-side").c_str(),F_OK)==0;
+                static const auto side=probeSideQueue(dev->device);
+                static VkCommandPool pool=VK_NULL_HANDLE;static VkCommandBuffer cbs[3]{};static VkFence fences[3]{};static Buffer s0,s1;static bool ready=false,failed=false;
+                static unsigned long long submitted=0,skipped=0;
+                if(on && side.first && !ready && !failed) {
+                    VkCommandPoolCreateInfo pi{};pi.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;pi.queueFamilyIndex=side.second;
+                    bool ok=vkCreateCommandPool(dev->device,&pi,nullptr,&pool)==VK_SUCCESS;
+                    VkCommandBufferAllocateInfo ai{};ai.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;ai.commandPool=pool;ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ai.commandBufferCount=3;
+                    ok=ok && vkAllocateCommandBuffers(dev->device,&ai,cbs)==VK_SUCCESS;
+                    ok=ok && makeBuffer(8u<<20,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,s0) && makeBuffer(8u<<20,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,s1);
+                    for(int k=0;ok && k<3;++k) {
+                        VkFenceCreateInfo fi{};fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+                        ok=vkCreateFence(dev->device,&fi,nullptr,&fences[k])==VK_SUCCESS;
+                        VkCommandBufferBeginInfo bi{};bi.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                        ok=ok && vkBeginCommandBuffer(cbs[k],&bi)==VK_SUCCESS;
+                        const VkBufferCopy rg{0,0,8u<<20};for(int j=0;ok && j<6;++j)vkCmdCopyBuffer(cbs[k],s0.buffer,s1.buffer,1,&rg);
+                        ok=ok && vkEndCommandBuffer(cbs[k])==VK_SUCCESS;
+                    }
+                    ready=ok;failed=!ok;
+                    RECOMP_DIRECT_LOG("RENDER_DIRECT_GPU_BURDEN_SIDE ready=%u family=%u",unsigned(ok),side.second);
+                }
+                if(on && ready) {
+                    int k=-1;for(int j=0;j<3;++j)if(vkGetFenceStatus(dev->device,fences[j])==VK_SUCCESS){k=j;break;}
+                    if(k<0)++skipped;
+                    else {vkResetFences(dev->device,1,&fences[k]);VkSubmitInfo si{};si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;si.commandBufferCount=1;si.pCommandBuffers=&cbs[k];
+                          if(vkQueueSubmit(side.first,1,&si,fences[k])==VK_SUCCESS)++submitted;}
+                    if(!((submitted+skipped)%600))RECOMP_DIRECT_LOG("RENDER_DIRECT_GPU_BURDEN_SIDE on=1 submitted=%llu skipped=%llu",submitted,skipped);
+                }
+            }
             if(down)recordDown(cb,nativeImage,src); // lane fsr-stage-b: the render-size picture into the 1280x720 copy (inside the timed span)
             if(useCompute) { // v411: the source (written by earlier commands, any stage) -> the picture -> the swapchain pass
                 VkMemoryBarrier g{};g.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;g.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;g.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
@@ -1966,7 +2170,15 @@ private:
         VkResult sr;
         {GenericSubmissionScope generic;sr=lockedQueueSubmit(queue,1,&si,a.fence);} // (not a native ticket, see vulkan_queue_lock.h)
 #ifdef RECOMP_THOR_EDITION
+#if defined(RECOMP_DUO_EDITION)
+        // ios-duo (2026-10-24, run claude-duo-01: SIGSEGV in MVKPresentableSwapchainImage::getCAMetalDrawable while encoding a render
+        // pass, after ~1,000 lower-screen presents): MoltenVK encodes each VkQueue's submissions on its own dispatch thread, so a lower-
+        // screen present on presentQueue could release an image's drawable while `queue`'s thread still encoded a pass on that image
+        // (Android encodes in vkQueueSubmit). The lower screen presents on the queue that draws it (sharedQueueMutex). Runs 02-05: no crash.
+        if(hud.on)hud2::screen().submitted(hud,sr==VK_SUCCESS,queue,queue,nullptr);
+#else
         if(hud.on)hud2::screen().submitted(hud,sr==VK_SUCCESS,queue,presentQueue?presentQueue:queue,presentQueue?&presentQueueMutex:nullptr); // hud2 (v575)
+#endif
 #endif /* RECOMP_THOR_EDITION */
         if(sr!=VK_SUCCESS){broken=true;RECOMP_DIRECT_LOG("RENDER_DIRECT_PRESENT broken=submit %d",int(sr));return false;}
         a.submitted=true;imageSlot[i]=int(k);if(slotOut)*slotOut=int(k);
@@ -2015,39 +2227,36 @@ private:
     }
     double passMean(unsigned m) const noexcept {return passN[m]?passNs[m]/1e3/double(passN[m]):0.0;} // v411 (us)
     double mapMean(unsigned m) const noexcept {return mapN[m]?mapNs[m]/1e3/double(mapN[m]):0.0;} // v42x (us)
-    // display-rate vote (v522). Found on the Fold (runs 21 and 22): when the game's frame rate falls, Android lowers the rate at
-    // which this window's pictures are shown (the display's render rate: 60 or 24 a second), while the pacer and the pair planner
-    // go on planning on the 120 Hz grid the swapchain reported when it was made. With files/private-trace/diag-fr-120 the window
-    // tells Android that its content wants 120 pictures a second (ANativeWindow_setFrameRate, compatibility "default": a
-    // preference, the system decides); diag-fr-60 asks for 60 (v515's measuring aid; 120 wins when both are present); without
-    // either the vote is withdrawn (0 = no preference, the state of every build before). Asked with the presenter's other
-    // switches (every 120 presents) and again when the app's window was replaced. The refresh length the swapchain reports now
-    // goes into the log line only (refreshNow). Changes no picture. Out of line and noexcept: pollFilter keeps its control flow.
-    [[gnu::noinline]] void pollFrameRate() noexcept {
-        using SetFrameRate=std::int32_t(*)(ANativeWindow*,float,std::int8_t);
-        static const SetFrameRate set=[]()->SetFrameRate {
-            void* lib=dlopen("libnativewindow.so",RTLD_NOW);
-            return lib?reinterpret_cast<SetFrameRate>(dlsym(lib,"ANativeWindow_setFrameRate")):nullptr;
-        }();
-        const unsigned want=recomp::frv::want(access(RECOMP_APP_PATH("/private-trace/diag-fr-120"),F_OK)==0,access(RECOMP_APP_PATH("/private-trace/diag-fr-60"),F_OK)==0);
-        int result=-1;
-        if(set && nw && frVote.due(want,gen)) {
-            result=set(nw,float(want),0);
-            frVote.told(want,gen,result);
-        }
-        const std::uint64_t refresh=dev && swapchain?refreshNow(dev->device,swapchain):0;
-        RECOMP_DIRECT_LOG("RENDER_GENERIC_V210Z fr_120=%u fr_60=%u fr_api=%u fr_result=%d refresh_now_us=%.2f",frVote.rate==120u?1u:0u,frVote.rate==60u?1u:0u,set?1u:0u,result,double(refresh)/1e3);
-    }
     void pollFilter() { // v409
         if(filterPolls++%120)return;
-        pollFrameRate(); // display-rate vote (v522)
         const std::string sw(Switches);
         // lane fsr-sharpness: the decision is settings::poll (scaler_settings.h, host-tested). With no files/settings/scaler.txt and
         // no files/settings/fsr-sharpness.txt it asks the same switch files in the same order as v458 did here and returns v458's
         // want / wantCompute / fast / fsr / stops; scaler.txt (fsr1 | cubic | nearest | gsr1) replaces the three scaler-choosing
         // switches, fsr-sharpness.txt (0 .. 4 stops) replaces diag-v450-fsr1-stops.
         const settings::Poll sp=settings::poll(settings::State{filterFailed,fsrFailed},
-            [&](const char* name){return access((sw+name).c_str(),F_OK)==0;},
+            [&](const char* name){
+#if defined(__APPLE__)
+                // ios-scale-1to1 (Claude, 2026-10-16): the swapchain is the game's own 1280x720 on iOS, so an upscaler only sharpens
+                // (RCAS) and costs GPU time (~1-2 ms/frame of FSR1 passes): at 1:1 the scaler switch files count as absent, i.e.
+                // the plain copy (the game's exact pixels). A files/settings/scaler.txt word still decides (settings::poll reads it
+                // first); files/private-trace/ios-scale-keep restores the switch files' choice (A/B).
+                { // ios-screen-native (Claude 2026-10-21; MEASUREMENT ONLY, RECOMP_IOS_SCREEN_FIT=native): the plain bilinear scale into the
+                  // native-size swapchain (c426: FSR cost ~4.9 ms per present there); the scaler switch files count as absent, linear present.
+                    static const bool native=[]{const char* e=std::getenv("RECOMP_IOS_SCREEN_FIT");return e && (!std::strcmp(e,"native") || !std::strcmp(e,"native1"));}();
+                    if(native) {
+                        if(!std::strcmp(name,"diag-v409-scale-linear"))return true;
+                        if(!std::strcmp(name,"diag-v450-scale-fsr1") || !std::strcmp(name,"diag-v409-scale-cubic") ||
+                           !std::strcmp(name,"diag-v411-scale-compute") || !std::strcmp(name,"diag-v460-scale-gsr1"))return false;
+                    }
+                }
+                // (Claude 2026-10-21, ios-drawable-half: a swapchain of the render-scaled frame's own size is 1:1 as well)
+                const unsigned rsk=unsigned(std::clamp(recomp_ios_render_sixteenths.load(std::memory_order_relaxed),1,16));
+                if(((extent.width==1280 && extent.height==720) || (extent.width*16u==1280u*rsk && extent.height*16u==720u*rsk)) && (!std::strcmp(name,"diag-v450-scale-fsr1") || !std::strcmp(name,"diag-v409-scale-cubic") ||
+                   !std::strcmp(name,"diag-v409-scale-linear") || !std::strcmp(name,"diag-v411-scale-compute")) &&
+                   recomp_ios_switches_access((sw+"ios-scale-keep").c_str(),F_OK)!=0)return false;
+#endif
+                return recomp_ios_switches_access((sw+name).c_str(),F_OK)==0;},
             [&](settings::Text which,char* buf,std::size_t cap)->int {
                 const std::string path=std::string(settings::SettingsDir)+(which==settings::Text::SettingsScaler?settings::ScalerFile:settings::SharpnessFile);
                 FILE* f=std::fopen(path.c_str(),"r");
@@ -2062,13 +2271,12 @@ private:
                 }
                 return ok;
             });
-        // v566 (driving goal, 2026-10-21; MEASUREMENT ONLY): diag-measure-no-fsr = FSR 1 read as off while the file stands (the
-        // filter the settings ask for otherwise - the cubic fallback under fsr1 - runs instead; the owner's setting files are not
-        // touched). Question: what FSR 1 (~6 ms of GPU per frame at 2176x1224, rd1-1 RENDER_DIRECT_FSR) costs the real frame.
-        const bool measureNoFsr=access((sw+"diag-measure-no-fsr").c_str(),F_OK)==0;
-        RECOMP_DIRECT_LOG("RENDER_DIRECT_MEASURE_NOFSR on=%u",unsigned(measureNoFsr));
-        const Filter want=sp.want;const bool wantCompute=sp.wantCompute;const unsigned fast=sp.fast,fsr=measureNoFsr?0u:sp.fsr;const float stops=sp.stops;
+        const Filter want=sp.want;const bool wantCompute=sp.wantCompute;const unsigned fast=sp.fast,fsr=sp.fsr;const float stops=sp.stops;
         const unsigned ignored=(sp.scalerIgnored?1u:0u)|(sp.stopsIgnored?2u:0u); // a setting file is present but not valid
+#if defined(__APPLE__)
+        // (2026-10-21) the drawable-half default stands aside while the player's scaler.txt picks an upscaler (Main.mm)
+        recomp_ios_settings_upscaler.store((sp.scaler==settings::Scaler::Cubic || sp.scaler==settings::Scaler::Fsr1 || sp.scaler==settings::Scaler::Gsr1)?1:0,std::memory_order_relaxed);
+#endif
         if(sp.scaler!=settingsScaler || sp.stopsFromSettings!=settingsStops || ignored!=settingsIgnored) { // (never true while both files stay absent)
             settingsScaler=sp.scaler;settingsStops=sp.stopsFromSettings;settingsIgnored=ignored;
             RECOMP_DIRECT_LOG("RENDER_DIRECT_SETTINGS scaler=%s sharpness_file=%u stops=%.3f gsr1_asked=%u gsr1_built=1 scaler_ignored=%u sharpness_ignored=%u",
@@ -2090,8 +2298,8 @@ private:
         // edge-direction shader), its edge threshold (1/255 units) and sharpness from their text files (absent, unreadable or
         // out of range: Qualcomm's defaults); diag-v460-gsr1-keep: a failed audit is logged but GSR stays on
         // (merged with lane fsr-sharpness: files/settings/scaler.txt decides when it holds a valid word; the diagnostic switch otherwise)
-        const bool gsr=!gsrFailed && (sp.scaler!=settings::Scaler::Unset?sp.gsr1:access((sw+"diag-v460-scale-gsr1").c_str(),F_OK)==0);
-        const bool gsrEdgeWant=gsr && access((sw+"diag-v460-gsr1-edge-direction").c_str(),F_OK)==0;
+        const bool gsr=!gsrFailed && (sp.scaler!=settings::Scaler::Unset?sp.gsr1:recomp_ios_switches_access((sw+"diag-v460-scale-gsr1").c_str(),F_OK)==0);
+        const bool gsrEdgeWant=gsr && recomp_ios_switches_access((sw+"diag-v460-gsr1-edge-direction").c_str(),F_OK)==0;
         float gsrT=gsr1::DefaultThreshold255,gsrS=gsr1::DefaultSharpness;
         if(gsr) {
             const auto tuning=[&](const char* name,float lo,float hi,float fallback) {
@@ -2101,7 +2309,7 @@ private:
             };
             gsrT=tuning("diag-v460-gsr1-threshold",gsr1::MinThreshold255,gsr1::MaxThreshold255,gsr1::DefaultThreshold255);
             gsrS=tuning("diag-v460-gsr1-sharpness",gsr1::MinSharpness,gsr1::MaxSharpness,gsr1::DefaultSharpness);
-            gsrKeep=access((sw+"diag-v460-gsr1-keep").c_str(),F_OK)==0;
+            gsrKeep=recomp_ios_switches_access((sw+"diag-v460-gsr1-keep").c_str(),F_OK)==0;
         }
         // (a tuning change audits again; gsrThreshold / gsrSharpness are those of the last poll WITH the switch, kept while it is
         // absent, so switching GSR on again with the same tuning files is not a change)
@@ -2232,6 +2440,15 @@ private:
     }
     void checkAudit(unsigned k,bool identity) {
         if(!waitAcquireSlot(k))return;
+#if defined(__APPLE__)
+        // (build 192) a drawable-size change between the audit's record and now: the frame may have been drawn into a drawable of
+        // the other size (MoltenVK follows the layer at once), so the comparison says nothing about the pass. Not a failure:
+        // the audit is discarded and another one is armed (c449: one such frame turned the GPU presenter off for the run).
+        if(recomp_ios_layout_gen.load(std::memory_order_acquire)!=recompIosAuditLayoutGen) {
+            RECOMP_DIRECT_LOG("RENDER_DIRECT_AUDIT kind=%s discarded=1 why=layout-changed",identity?"cpu":"gpu");
+            ++(identity?cpuAuditsLeft:gpuAuditsLeft);return;
+        }
+#endif
         ++audits;
         if(auditOne){checkOneAudit(identity);return;} // lane fsr-stage-b
         if(auditFsr==gsr1::Mode){checkGsrAudit(identity);return;} // v460
@@ -2296,7 +2513,6 @@ private:
     bool fgEver=false,fgFailed=false,fgGeneral=false,fgPrevValid=false,fgKept=false,fgRecBetween=false,fgMadeFirst=false;
     bool fgHolding=false,fgSuperseded=false; // (the present thread's hold; under m)
     bool fgTimed=false; // pace-fg-tuning: the pacer was told that the pairs' first pictures carry a desired present time
-    bool fgPairsLow=false; // pace-auto-pairs: the pacer was told that pairs are wanted under the low caps
     std::deque<std::uint32_t> fgHeldPresents,fgHeldTags;std::vector<int> fgHeldSlots;
     unsigned fgSetsSeen=0;std::uint64_t fgFrames=0,fgSetAllocs=0,fgPoolResets=0,fgMade=0,fgMadeNs=0,fgAcquireNs=0,fgStashDropped=0,fgInline=0;
 #include "fg_gen_presenter.inc" // framegen-1b: the generator (last: the members above keep v465's offsets)
@@ -2321,7 +2537,7 @@ public:
     void fgSwitches(unsigned) noexcept {} // frame-gen (lane B)
     unsigned fgSwitchWord() const noexcept {return 0;} // framegen-1b
     void fgGenFrame(const recomp::fgg::FrameIn&) noexcept {} // framegen-1b
-    void fgGenTune(float,unsigned,unsigned,float) noexcept {} // framegen-1b (fg-gpu-max: the fourth)
+    void fgGenTune(float,unsigned,unsigned) noexcept {} // framegen-1b
     void shutdown(){}
 };
 #endif

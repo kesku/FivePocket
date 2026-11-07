@@ -1,0 +1,60 @@
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -418,6 +418,31 @@
+         indent();
+         out += "}\n";
+     }
++}
++
++// fold-fixer2 (2026-10-22, F7): a Xenos ALU instruction reads the sources of its vector and its scalar operation before
++// either writes. This translator emits the vector assignment first and the scalar expression after it, so a scalar operation
++// whose temp-register source component the paired vector operation writes read the NEW value (GTA V water#20p: the far-ocean
++// fill's fog amount came from a reflection vector component, F7's unfogged dark-blue band). In that case only, the scalar
++// computation (p0 / ps / a0) is emitted before the vector assignment; its register write stays after it. Every other
++// instruction is emitted exactly as before. Same rule as local-analysis/fold-glitch-1022/coissue/scan_coissue.py.
++static bool coIssueHazard(const AluInstruction& instr)
++{
++    if (instr.exportData || instr.vectorDestRelative || instr.vectorWriteMask == 0)
++        return false;
++    const uint32_t vop = uint32_t(instr.vectorOpcode), sop = uint32_t(instr.scalarOpcode);
++    if (vop >= 24 && vop <= 27) // vector kills write no register
++        return false;
++    auto reads = [&](uint32_t reg, uint32_t comp) { return reg == instr.vectorDest && ((instr.vectorWriteMask >> comp) & 1) != 0; };
++    if (sop == 33 || sop == 50) // setp_clr, retain_prev
++        return false;
++    if (sop >= 42 && sop <= 47) // mulsc/addsc/subsc: the temp operand
++        return reads((sop & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C), instr.src3Swizzle & 3);
++    if (!instr.src3Select || (instr.src3Register & 64))
++        return false;
++    const uint32_t reg = instr.src3Register & 63, a = ((instr.src3Swizzle >> 6) + 3) & 3, b = instr.src3Swizzle & 3;
++    const bool two = sop == 0 || sop == 2 || sop == 5 || sop == 6 || sop == 23 || sop == 24 || sop == 25;
++    return reads(reg, a) || (two && reads(reg, b));
+ }
+ 
+ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -754,6 +779,7 @@
+         println("a0 = (int)clamp(floor(({}).w + 0.5), -256.0, 255.0);", op(VECTOR_0).expression);
+     }
+ 
++    const size_t coIssueVectorStart = out.size(); // fold-fixer2 (coIssueHazard)
+     uint32_t vectorWriteMask = instr.vectorWriteMask;
+     if (instr.exportData)
+         vectorWriteMask &= ~instr.scalarWriteMask;
+@@ -1033,6 +1059,7 @@
+         out += ";\n";
+     }
+ 
++    const size_t coIssueScalarStart = out.size(); // fold-fixer2 (coIssueHazard)
+     if (instr.scalarOpcode != AluScalarOpcode::RetainPrev)
+     {
+         if (instr.scalarOpcode >= AluScalarOpcode::SetpEq && instr.scalarOpcode <= AluScalarOpcode::SetpRstr)
+@@ -1257,6 +1284,9 @@
+             break;
+         }
+     }
++
++    if (coIssueHazard(instr)) // fold-fixer2: the scalar computation reads its sources before the vector write
++        out = out.substr(0, coIssueVectorStart) + out.substr(coIssueScalarStart) + out.substr(coIssueVectorStart, coIssueScalarStart - coIssueVectorStart);
+ 
+     uint32_t scalarWriteMask = instr.scalarWriteMask;
+     if (instr.exportData)

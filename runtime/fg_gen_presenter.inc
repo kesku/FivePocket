@@ -37,32 +37,18 @@
     //     pipeline, one more fixed set. EXACT: the block map has the bytes it had. A device that cannot draw into or
     //     sample that format gets no generator: "RENDER_DIRECT_FG_GEN failed=terms-format", then the cap alone;
     //   - a split picture carries seven stamps (one more, behind TERMS); the pass line has the field terms:.
-    // fg-scaled (2026-10-10), only while diag-fg-between is on (every edit is marked fg-scaled): the generator's pictures
-    // have the sizes fg_gen.h's Geometry gives for the run's source picture (the size of stage 1a's two pictures, fgW x
-    // fgH), not 1280x720's: 640x360 .. 1280x720 are taken (fg_gen.h sizeOk), larger ones refused as before (why=source).
-    //   - every picture, framebuffer, viewport, the push block and the audit follow fgGeo; for a 1280x720 source every
-    //     Vulkan call and argument is v513's (tests: the generator-on call log against v513's, fg-scaled/tests);
-    //   - a picture that is not a whole number of 8 x 8 blocks (fgGeo.edge(): 960x540) draws TERMS and CLASSIFY with the
-    //     modules Termsedge and Classifyedge (fg_gen_core.glsl: a block at the edge is judged from its pixels inside the
-    //     picture); a picture of whole blocks draws v513's seven modules;
-    //   - one more log line when the objects are made for another size than 1280x720: "RENDER_DIRECT_FG_GEN scaled=1 ...";
-    //   - the source size of a run is written once (present_source.h). Should it change all the same (a second start of
-    //     the renderer with another render scale), everything made for the old size, stage 1a's two pictures included, is
-    //     destroyed and made again for the new one (fgGenResize; the presenter's own rule for its render-size pictures,
-    //     ensureBig). Without diag-fg-between stage 1a keeps its guard (refused=source-size), as in v513.
 public:
     // The renderer, just before presentGpu of the same frame (the render thread; read by fgBefore on that thread, under m).
     void fgGenFrame(const recomp::fgg::FrameIn& in) noexcept {fgIn=in;}
     // The presenter's switch word as stage 1a's poll left it (the renderer adds the generator's bits to it at the same poll).
     unsigned fgSwitchWord() const noexcept {return fg.switches();}
     // The renderer's 60-present window: the tuning files and the audit request (plain values of the render thread).
-    void fgGenTune(float fail,unsigned lateMaxPct,unsigned auditToken,float gpuMaxUs) noexcept {fgTuneFail=fail;fgTuneLate=lateMaxPct;fgTuneAudit=auditToken;fgTuneGpu=gpuMaxUs;}
+    void fgGenTune(float fail,unsigned lateMaxPct,unsigned auditToken) noexcept {fgTuneFail=fail;fgTuneLate=lateMaxPct;fgTuneAudit=auditToken;}
 private:
     static_assert(recomp::fgg::PairBetween==recomp::fg::SwBetween,"the pair's in-between bit");
     struct FgTarget {Img img;VkFramebuffer framebuffer=VK_NULL_HANDLE;};
     recomp::fgg::SlotKeeper fgKeeper;recomp::fgg::Kept fgKeptFrame;recomp::fgg::Decision fgDecision;
     recomp::fgg::FrameIn fgIn;
-    float fgTuneGpu=float(recomp::fgg::K::GpuMaxUs); // fg-gpu-max
     float fgTuneFail=recomp::fgg::K::Fail;unsigned fgTuneLate=recomp::fgg::K::LateMaxPct,fgTuneAudit=0,fgAuditSeen=0;
     recomp::fgg::Act fgGenAct=recomp::fgg::Act::Dry;
     std::array<FgTarget,2> fgLow,fgBlocks;FgTarget fgGain;VkFramebuffer fgOutFramebuffer=VK_NULL_HANDLE;
@@ -85,7 +71,6 @@ private:
         namespace fgg=recomp::fgg;
         if(fgGenBuilt)return !fgGenFailed;
         fgGenBuilt=true;
-        fgGeo=fgg::geometry(fgW,fgH); // fg-scaled: the made picture is fgOut, so the generator's sizes follow stage 1a's two pictures (the run's source size: fgBefore's guard)
         const auto fail=[&](const char* what){fgGenFailed=true;RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN failed=%s",what);return false;};
         const auto t0=std::chrono::steady_clock::now();
         if(!vertex || !sampler || !fgOut.view || images.size()>FgMaxImages)return fail("presenter-objects");
@@ -135,16 +120,16 @@ private:
             f.width=w;f.height=h;f.layers=1;
             return vkCreateFramebuffer(dev->device,&f,nullptr,&t.framebuffer)==VK_SUCCESS;
         };
-        for(auto& t:fgLow)if(!target(t,fgGeo.w,fgGeo.h,0))return fail("low-picture"); // (fg-scaled: fgGeo's sizes, here and below)
-        for(auto& t:fgBlocks)if(!target(t,fgGeo.blocksW,fgGeo.blocksH,VK_IMAGE_USAGE_TRANSFER_SRC_BIT))return fail("block-map");
+        for(auto& t:fgLow)if(!target(t,fgW,fgH,0))return fail("low-picture");
+        for(auto& t:fgBlocks)if(!target(t,(fgW/fgg::Block),(fgH/fgg::Block),VK_IMAGE_USAGE_TRANSFER_SRC_BIT))return fail("block-map");
         if(!target(fgGain,1,1,VK_IMAGE_USAGE_TRANSFER_SRC_BIT))return fail("gain-picture");
         // framegen-cost: the gain's column sums. RGBA8 like every other picture here (the one format the presenter already
         // renders into and samples; a column sum fits three of its bytes exactly, fg_gen_core.glsl)
-        if(!target(fgGainCols,fgGeo.blocksW,fgg::GainColsRows,0))return fail("gain-columns");
+        if(!target(fgGainCols,(fgW/fgg::Block),fgg::GainColsRows,0))return fail("gain-columns");
         // framegen-cost-b: CLASSIFY's per-pixel terms (the format asked for above; drawn with its own render pass)
-        if(!target(fgTerms,fgGeo.termsW,fgGeo.termsH,0,FgTermsFormat,fgPassTerms))return fail("terms-picture");
+        if(!target(fgTerms,fgW,fgH,0,FgTermsFormat,fgPassTerms))return fail("terms-picture");
         {VkFramebufferCreateInfo f{};f.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;f.renderPass=fgPassOut;f.attachmentCount=1;f.pAttachments=&fgOut.view;
-         f.width=fgGeo.w;f.height=fgGeo.h;f.layers=1;
+         f.width=fgW;f.height=fgH;f.layers=1;
          if(vkCreateFramebuffer(dev->device,&f,nullptr,&fgOutFramebuffer)!=VK_SUCCESS){fgOutFramebuffer=VK_NULL_HANDLE;return fail("made-framebuffer");}}
         // one set layout (four pictures), one pipeline layout (the 96-byte push block), one pool
         std::array<VkDescriptorSetLayoutBinding,4> b{};
@@ -171,12 +156,10 @@ private:
         fgGenWrite(fgGainSet,fgg::PassGain); // framegen-cost: the column sums (fixed)
         fgGenWrite(fgTermsSet,fgg::PassClassify); // framegen-cost-b: the terms (fixed)
         // seven pipelines (framegen-cost: v467's five and GAIN COLUMNS; framegen-cost-b: and TERMS): makePassAndPipeline's fixed state, the presenter's one-triangle vertex shader
-        std::array<std::pair<const std::uint32_t*,std::size_t>,FgShaders+2> code{{{fgg::spirv::Low,sizeof fgg::spirv::Low},{fgg::spirv::Gain,sizeof fgg::spirv::Gain},
+        const std::array<std::pair<const std::uint32_t*,std::size_t>,FgShaders+2> code{{{fgg::spirv::Low,sizeof fgg::spirv::Low},{fgg::spirv::Gain,sizeof fgg::spirv::Gain},
             {fgg::spirv::Classify,sizeof fgg::spirv::Classify},{fgg::spirv::Resolve,sizeof fgg::spirv::Resolve},{fgg::spirv::Synth,sizeof fgg::spirv::Synth},
             {fgg::spirv::Gaincols,sizeof fgg::spirv::Gaincols}, // framegen-cost: + gain columns
             {fgg::spirv::Terms,sizeof fgg::spirv::Terms}}};     // framegen-cost-b: + terms
-        // fg-scaled: a picture that is not whole blocks draws the two steps of CLASSIFY with their edge modules (fg_gen_core.glsl, behind pass 3)
-        if(fgGeo.edge()){code[2]={fgg::spirv::Classifyedge,sizeof fgg::spirv::Classifyedge};code[FgTerms]={fgg::spirv::Termsedge,sizeof fgg::spirv::Termsedge};}
         std::array<VkPipelineShaderStageCreateInfo,2> st{};
         st[0].sType=st[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         st[0].stage=VK_SHADER_STAGE_VERTEX_BIT;st[0].module=vertex;st[0].pName="main";st[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;st[1].pName="main";
@@ -208,61 +191,9 @@ private:
         }
         // (framegen-cost: bytes counts the column sums' picture too; pass_timed / every: one timed made picture in `every` is split by pass)
         // (framegen-cost-b: bytes counts the terms' picture too; terms=: its size and format, the last field)
-        RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN objects=1 pictures=%ux%u blocks=%ux%u bytes=%u timed=%u ms=%.1f pass_timed=%u every=%u terms=%ux%u:rgba32f",fgGeo.w,fgGeo.h,fgGeo.blocksW,fgGeo.blocksH,
-            fgGeo.bytes(),unsigned(fgGenTime!=VK_NULL_HANDLE),
-            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),unsigned(fgGenPassTime!=VK_NULL_HANDLE),fgg::PassEvery,fgGeo.termsW,fgGeo.termsH);
-        // fg-scaled: one more line for a picture of another size than 1280x720 (none at 100 %: v513's log). edge=1: the last
-        // block row has edge_rows of its 8 pixel rows inside the picture (the last column edge_cols of its 8): the modules
-        // termsedge and classifyedge are the ones in the pipelines; gain_blocks: the whole blocks the GAIN pass counts
-        if(fgGeo!=fgg::Geometry{})
-            RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN scaled=1 source=%ux%u blocks=%ux%u terms=%ux%u edge=%u edge_rows=%u edge_cols=%u gain_blocks=%u",fgGeo.w,fgGeo.h,fgGeo.blocksW,fgGeo.blocksH,
-                fgGeo.termsW,fgGeo.termsH,unsigned(fgGeo.edge()),fgGeo.h%fgg::Block,fgGeo.w%fgg::Block,fgg::gainBlocks(fgGeo.w,fgGeo.h));
-        return true;
-    }
-    // fg-scaled: the run's source pictures have another size (w x h) than the one stage 1a's two pictures and the
-    // generator's objects were made for. Everything made for the old size is destroyed, once every pass that may still
-    // use it has finished; fgEnsure() and fgGenEnsure() then make it again for the new size at the next planned pair, by
-    // their own unchanged code. Reached only with diag-fg-between and only when rsb::gpuSource() changed after a pair
-    // was shown (it is written once, at the renderer's start). False: the passes could not be waited for.
-    [[gnu::noinline]] bool fgGenResize(unsigned w,unsigned h) noexcept {
-        if(!waitAllMine())return false;
-        const VkDevice d=dev->device;
-        const auto drop=[&](FgTarget& t) {
-            if(t.framebuffer)vkDestroyFramebuffer(d,t.framebuffer,nullptr);
-            if(t.img.view)vkDestroyImageView(d,t.img.view,nullptr);
-            if(t.img.image)vkDestroyImage(d,t.img.image,nullptr);
-            if(t.img.memory)vkFreeMemory(d,t.img.memory,nullptr);
-            t=FgTarget{};
-        };
-        // the generator's objects, all of them (the fixed sets name the pictures; two pipelines hold the modules chosen for the size)
-        for(auto& t:fgLow)drop(t);
-        for(auto& t:fgBlocks)drop(t);
-        drop(fgGain);drop(fgGainCols);drop(fgTerms);
-        if(fgOutFramebuffer){vkDestroyFramebuffer(d,fgOutFramebuffer,nullptr);fgOutFramebuffer=VK_NULL_HANDLE;}
-        for(VkPipeline* q:{&fgGenPipeline[0],&fgGenPipeline[1],&fgGenPipeline[2],&fgGenPipeline[3],&fgGenPipeline[4],&fgGainColsPipeline,&fgTermsPipeline})
-            if(*q){vkDestroyPipeline(d,*q,nullptr);*q=VK_NULL_HANDLE;}
-        for(VkShaderModule* q:{&fgGenModule[0],&fgGenModule[1],&fgGenModule[2],&fgGenModule[3],&fgGenModule[4],&fgGainColsModule,&fgTermsModule})
-            if(*q){vkDestroyShaderModule(d,*q,nullptr);*q=VK_NULL_HANDLE;}
-        if(fgGenPool){vkDestroyDescriptorPool(d,fgGenPool,nullptr);fgGenPool=VK_NULL_HANDLE;} // (its sets go with it)
-        fgResolveSet={};fgGenSet={};fgGainSet=VK_NULL_HANDLE;fgTermsSet=VK_NULL_HANDLE;
-        if(fgGenLayout){vkDestroyPipelineLayout(d,fgGenLayout,nullptr);fgGenLayout=VK_NULL_HANDLE;}
-        if(fgGenSetLayout){vkDestroyDescriptorSetLayout(d,fgGenSetLayout,nullptr);fgGenSetLayout=VK_NULL_HANDLE;}
-        for(VkRenderPass* q:{&fgPassRead,&fgPassOut,&fgPassTerms})if(*q){vkDestroyRenderPass(d,*q,nullptr);*q=VK_NULL_HANDLE;}
-        if(fgLinear){vkDestroySampler(d,fgLinear,nullptr);fgLinear=VK_NULL_HANDLE;}
-        for(VkQueryPool* q:{&fgGenTime,&fgGenPassTime})if(*q){vkDestroyQueryPool(d,*q,nullptr);*q=VK_NULL_HANDLE;}
-        if(fgAuditBuffer.buffer || fgAuditBuffer.memory)freeBuffer(fgAuditBuffer); // (its size is the block map's)
-        fgGenBuilt=false;fgGenTimedSlot=~0u;fgGenSplitSlot=false;fgGenImageIndex=~0u;fgAuditThis=false;
-        fgKeptFrame.valid=false;fgLowValid=false;
-        // stage 1a's two pictures and the made picture's set (fgEnsure makes them when fgSet is null)
-        for(Img* m:{&fgPrev,&fgOut}) {
-            if(m->view)vkDestroyImageView(d,m->view,nullptr);
-            if(m->image)vkDestroyImage(d,m->image,nullptr);
-            if(m->memory)vkFreeMemory(d,m->memory,nullptr);
-            *m=Img{};
-        }
-        if(fgSetPool){vkDestroyDescriptorPool(d,fgSetPool,nullptr);fgSetPool=VK_NULL_HANDLE;}
-        fgSet=VK_NULL_HANDLE;fgGeneral=false;fgPrevValid=false;fgSizeLogged=false;
-        RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN resized=1 from=%ux%u to=%ux%u (the pair's two pictures and the generator's objects are made again for the new size)",unsigned(fgW),unsigned(fgH),w,h);
+        RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN objects=1 pictures=%ux%u blocks=%ux%u bytes=%u timed=%u ms=%.1f pass_timed=%u every=%u terms=%ux%u:rgba32f",fgW,fgH,(fgW/fgg::Block),(fgH/fgg::Block),
+            unsigned(2u*fgW*fgH*4u+2u*(fgW/fgg::Block)*(fgH/fgg::Block)*4u+4u+(fgW/fgg::Block)*fgg::GainColsRows*4u+fgW*fgH*fgg::TermsTexelBytes),unsigned(fgGenTime!=VK_NULL_HANDLE),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count(),unsigned(fgGenPassTime!=VK_NULL_HANDLE),fgg::PassEvery,fgW,fgH);
         return true;
     }
     // What a role's picture is in this frame, and the layout it is read in.
@@ -319,21 +250,15 @@ private:
             fgGenAnnounced=true;
             RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN generator=1 order=between needs=diag-pace-30 fail=%.1f late_max=%u cap=" RECOMP_FGG_CAPABILITY,
                 double(fgTuneFail),fgTuneLate);
-            // pace-auto-pairs (v524): the generator also makes its picture under the automatic pace, down to its 20 and 15 fps rungs
-            // (pairs half a frame apart; needs diag-fg-low and diag-pace-auto-low). The format ends with its own capability marker.
-            RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN generator=1 order=between also=diag-pace-auto paces=30,20,15 needs=diag-fg-low,diag-pace-auto-low cap=" RECOMP_FGG_AUTO_CAPABILITY);
         }
         fgKeeper.lateMax(fgTuneLate);
-        if(fgKeeper.gpuMax()!=double(fgTuneGpu)){fgKeeper.gpuMax(fgTuneGpu);RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN gpu_max_us=%.0f (diag-fg-gpu-max)",fgKeeper.gpuMax());} // fg-gpu-max
         if(fgKeeper.frame())RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN fallback=ended retry=%u (pairs may be planned again)",fgKeeper.trips());
         // this frame's inputs (the size of the presented pictures is the run's: known without stage 1a's objects; the
         // generator's own objects are assumed until fgGenBefore has tried to make them)
         const rsb::Size fs=rsb::gpuSource();
-        // fg-scaled: the pictures were made for another size than the run's source now has (never, in a run that started
-        // once: see fgGenResize). They are made again for a size the generator takes; a failed wait leaves them (stage 1a's guard then refuses the frame)
-        if(fgSet && (fs.w!=fgW || fs.h!=fgH) && !fgGenFailed && fgg::sizeOk(fs.w,fs.h))fgGenResize(fs.w,fs.h);
+        const bool sourceOk=fgg::sizeOk(fs.w,fs.h) && (!fgSet || (fs.w==fgW && fs.h==fgH)); // (ios-fg-native, Claude 2026-10-19: any size the block grid divides, up to 1280x720; the objects' size once made)
         fgg::Kept kept=fgKeptFrame;kept.valid=kept.valid && fgPrevValid && fgLowValid;
-        fgDecision=fgg::decide(fg.switches(),&fgIn,tag,kept,!fgGenFailed,fs.w,fs.h); // (fg-scaled: the size, not "is it 1280x720")
+        fgDecision=fgg::decide(fg.switches(),&fgIn,tag,kept,!fgGenFailed,sourceOk,fs.w,fs.h);
         const bool usable=fgDecision.act!=fgg::Act::NoPair;
         fgKeeper.inputs(usable,madeBefore);
         fgg::SlotKeeper::Window seen;
@@ -418,23 +343,23 @@ private:
         std::uint32_t stamp=fgg::PassStamps*nextAcquire;
         const auto mark=[&]{if(split)vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,fgGenPassTime,stamp++);};
         if(split){vkCmdResetQueryPool(cb,fgGenPassTime,stamp,fgg::PassStamps);mark();} // (behind v467's first stamp: everything before has finished)
-        const fgg::Push push=fgg::push(make?fgDecision.m:std::array<float,16>{},fgPlan.phase,fgTuneFail,(fg.switches()&fgg::SwShow)!=0,fgGeo.w,fgGeo.h); // (fg-scaled: the picture's size, here and in every pass below)
+        const fgg::Push push=fgg::push(make?fgDecision.m:std::array<float,16>{},fgPlan.phase,fgTuneFail,(fg.switches()&fgg::SwShow)!=0,fgW,fgH);
         vkCmdPushConstants(cb,fgGenLayout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof push,&push);
-        fgGenDraw(cb,0,fgLow[fgLowAt].framebuffer,fgGeo.w,fgGeo.h,sets[0]);
+        fgGenDraw(cb,0,fgLow[fgLowAt].framebuffer,fgW,fgH,sets[0]);
         mark(); // framegen-cost: behind LOW
         if(make) {
-            fgGenDraw(cb,FgGainCols,fgGainCols.framebuffer,fgGeo.blocksW,fgg::GainColsRows,sets[1]); // framegen-cost: the column sums of the two low-passed pictures
+            fgGenDraw(cb,FgGainCols,fgGainCols.framebuffer,(fgW/fgg::Block),fgg::GainColsRows,sets[1]); // framegen-cost: the column sums of the two low-passed pictures
             mark();
             fgGenDraw(cb,1,fgGain.framebuffer,1,1,fgGainSet); // (framegen-cost: from the column sums; until v467 from the two pictures, with sets[1])
             mark();
-            fgGenDraw(cb,FgTerms,fgTerms.framebuffer,fgGeo.termsW,fgGeo.termsH,sets[2]); // framegen-cost-b: per pixel what a turn of v468's CLASSIFY loop computed
+            fgGenDraw(cb,FgTerms,fgTerms.framebuffer,fgW,fgH,sets[2]); // framegen-cost-b: per pixel what a turn of v468's CLASSIFY loop computed
             mark();
-            fgGenDraw(cb,2,fgBlocks[0].framebuffer,fgGeo.blocksW,fgGeo.blocksH,fgTermsSet); // (framegen-cost-b: from the terms; until v468 from the two low-passed pictures, the depth and the gain, with sets[2])
+            fgGenDraw(cb,2,fgBlocks[0].framebuffer,(fgW/fgg::Block),(fgH/fgg::Block),fgTermsSet); // (framegen-cost-b: from the terms; until v468 from the two low-passed pictures, the depth and the gain, with sets[2])
             mark();
             for(const fgg::Pass round:fgg::ResolveRounds)
-                fgGenDraw(cb,3,fgBlocks[round==fgg::PassResolve01?1:0].framebuffer,fgGeo.blocksW,fgGeo.blocksH,fgResolveSet[round==fgg::PassResolve01?0:1]);
+                fgGenDraw(cb,3,fgBlocks[round==fgg::PassResolve01?1:0].framebuffer,(fgW/fgg::Block),(fgH/fgg::Block),fgResolveSet[round==fgg::PassResolve01?0:1]);
             mark(); // (behind the third round; SYNTHESIS ends at v467's second stamp)
-            fgGenDraw(cb,4,fgOutFramebuffer,fgGeo.w,fgGeo.h,sets[3]);
+            fgGenDraw(cb,4,fgOutFramebuffer,fgW,fgH,sets[3]);
             if(timed){vkCmdWriteTimestamp(cb,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,fgGenTime,2*nextAcquire+1);fgGenTimedSlot=nextAcquire;fgGenSplitSlot=split;}
             if(fgAuditThis && !(fgAuditThis=fgGenAuditCopy(cb)))fgAuditSeen=fgTuneAudit; // (no buffer: this request is given up, not tried every frame)
             ++fgGenMadeN;
@@ -458,10 +383,9 @@ private:
     // picture; without the generator's switch a compare and a return).
     [[gnu::noinline]] void fgGenRealLost() noexcept {if(fgGenAct==recomp::fgg::Act::Generate)fgKeeper.realLost();}
     // diag-fg-audit: the resolved block map and the gain texel of this made frame into a host buffer (57.6 KB + 4 bytes).
-    // (fg-scaled: 57.6 KB for 1280x720; the block map is fgGeo's.)
     bool fgGenAuditCopy(VkCommandBuffer cb) noexcept {
         namespace fgg=recomp::fgg;
-        const VkDeviceSize mapBytes=VkDeviceSize(fgGeo.blocksW)*fgGeo.blocksH*4;
+        const VkDeviceSize mapBytes=VkDeviceSize((fgW/fgg::Block))*(fgH/fgg::Block)*4;
         if(!fgAuditBuffer.buffer && !makeBuffer(mapBytes+4,VK_BUFFER_USAGE_TRANSFER_DST_BIT,fgAuditBuffer,true)){freeBuffer(fgAuditBuffer);return false;}
         std::array<VkImageMemoryBarrier,2> b{};
         for(unsigned k=0;k<2;++k){b[k].sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;b[k].image=k?fgGain.img.image:fgBlocks[1].img.image;
@@ -469,7 +393,7 @@ private:
             b[k].dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;b[k].srcQueueFamilyIndex=b[k].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b[k].subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};}
         // (after the synthesis pass, which read both; the next frame's passes start from UNDEFINED, so nothing is put back)
         vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,2,b.data());
-        VkBufferImageCopy c{};c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};c.imageExtent={fgGeo.blocksW,fgGeo.blocksH,1};
+        VkBufferImageCopy c{};c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};c.imageExtent={(fgW/fgg::Block),(fgH/fgg::Block),1};
         vkCmdCopyImageToBuffer(cb,fgBlocks[1].img.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,fgAuditBuffer.buffer,1,&c);
         c.bufferOffset=mapBytes;c.imageExtent={1,1,1};
         vkCmdCopyImageToBuffer(cb,fgGain.img.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,fgAuditBuffer.buffer,1,&c);
@@ -484,7 +408,7 @@ private:
         const unsigned i=fgGenImageIndex;
         if(i>=imageSlot.size() || imageSlot[i]<0 || !fgAuditBuffer.mapped || !waitAcquireSlot(unsigned(imageSlot[i])))return;
         const auto* p=static_cast<const std::uint8_t*>(fgAuditBuffer.mapped);
-        const fgg::Shares s=fgg::shares(p,fgGeo.blocks());const std::uint8_t* g=p+std::size_t(fgGeo.blocks())*4; // (fg-scaled: fgGeo's block map)
+        const fgg::Shares s=fgg::shares(p,(fgW/fgg::Block)*(fgH/fgg::Block));const std::uint8_t* g=p+std::size_t((fgW/fgg::Block))*(fgH/fgg::Block)*4;
         ++fgGenAudits;
         RECOMP_DIRECT_LOG("RENDER_DIRECT_FG_GEN audit=%llu blocks=%u camera_pct=%.1f zero_pct=%.1f none_pct=%.1f other=%u open=%u mean_cost=%.2f gain=%.4f phase=%.3f "
             "step_m=%.3f step_deg=%.3f fail=%.1f",(unsigned long long)fgGenAudits,s.blocks,s.pct(s.camera),s.pct(s.zero),s.pct(s.none),s.other,s.open,s.meanCost(),
@@ -542,5 +466,3 @@ private:
     // (framegen-cost-b: this lane's members, behind everything above, so that every member of v468 keeps its offset)
     FgTarget fgTerms;VkDescriptorSet fgTermsSet=VK_NULL_HANDLE;VkRenderPass fgPassTerms=VK_NULL_HANDLE;
     VkShaderModule fgTermsModule=VK_NULL_HANDLE;VkPipeline fgTermsPipeline=VK_NULL_HANDLE;
-    // (fg-scaled: this lane's member, behind everything above, so that every member of v513 keeps its offset)
-    recomp::fgg::Geometry fgGeo; // the sizes the generator's objects were made for (fgGenEnsure); a 1280x720 picture's until then

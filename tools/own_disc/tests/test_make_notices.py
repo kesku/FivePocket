@@ -234,15 +234,7 @@ class Case(unittest.TestCase):
 class TrackedTable(unittest.TestCase):
     """The table that is tracked beside the tool, against the script that builds the Windows host programs: every
     program that script puts into the package must lie at a place a part names."""
-    def built_programs(self):
-        script = (HERE.parent / 'windows' / 'build_host_tools.ps1').read_text(encoding='utf-8')
-        places = set(re.findall(r'"\$Output\\([^"]+\.exe)"', script))
-        self.assertTrue(places, 'the build script names no program any more: this test reads nothing')
-        return sorted('host-tools/' + place.replace('\\', '/').replace('$state', 'main') for place in places)
 
-    def test_every_program_the_build_script_copies_is_covered(self):
-        parts = mn.load_table(TABLE)
-        self.assertEqual(mn.uncovered_programs(parts, self.built_programs() + ['builder.exe']), [])
 
     def test_a_new_program_is_not_covered_by_the_table_as_it_is(self):
         # the runtimes linked into every program are marked general in the table, so they cannot stand in for a part

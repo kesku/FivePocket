@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -33,7 +34,21 @@ inline bool sampled(std::atomic<unsigned long long>& count, unsigned long long e
     return k <= 64 || k % every == 0 || logAll.load(std::memory_order_relaxed);
 }
 
-inline std::atomic<bool> quiet{RECOMP_PLAY_QUIET_AT_START}; // quiet-log: files/private-trace/diag-quiet-log (quietLogWindow); play-config-2: true from the start in the play build (play_log.h)
+inline bool verboseDiagnosticsEnabled() noexcept {
+    static const bool enabled=[] {
+        const char* verbose=std::getenv("RECOMP_VERBOSE_DIAGNOSTICS");
+        return verbose && verbose[0]=='1' && verbose[1]=='\0';
+    }();
+    return enabled;
+}
+#if defined(__APPLE__)
+inline bool appleQuietDefault() noexcept { return !verboseDiagnosticsEnabled(); }
+// Apple forwards diagnostics through synchronous stdio; opt in to verbose
+// diagnostics before launch rather than putting that I/O on every frame.
+inline std::atomic<bool> quiet{RECOMP_PLAY_QUIET_AT_START || appleQuietDefault()};
+#else
+inline std::atomic<bool> quiet{RECOMP_PLAY_QUIET_AT_START};
+#endif
 inline bool quietSkip() noexcept { return quiet.load(std::memory_order_relaxed); }
 #include "play_log.h" // play-config-2 (v527): the play build's diag-play-loud switch and its counted quietSkip (nothing without -DRECOMP_PLAY_BUILD=1)
 #if defined(RECOMP_QUIET_LOG_TEST_SINK) // host test: every line that would reach liblog
@@ -111,12 +126,19 @@ inline bool quietSiteDue(const char* format) noexcept {
 bool RECOMP_QUIET_LOG_TEST_FILE() noexcept;
 #endif
 [[gnu::noinline]] inline void quietLogWindow() noexcept {
+#if defined(__APPLE__)
+    static bool file = RECOMP_PLAY_QUIET_AT_START || appleQuietDefault();
+#else
     static bool file = false;
+#endif
     const bool window = file;
 #if defined(RECOMP_QUIET_LOG_TEST_FILE)
     file = RECOMP_QUIET_LOG_TEST_FILE(); RECOMP_PLAY_ONLY(file |= playWindowQuiet();)
 #else
     file = ::access(RECOMP_APP_PATH("/private-trace/diag-quiet-log"), F_OK) == 0; RECOMP_PLAY_ONLY(file |= playWindowQuiet();) // play-config-2: quiet unless diag-play-loud (play_log.h)
+#endif
+#if defined(__APPLE__)
+    file |= appleQuietDefault();
 #endif
     quiet.store(file, std::memory_order_relaxed);
     quietLogAlways(4 /* ANDROID_LOG_INFO */, "RecompRenderer", "RENDER_GENERIC_V210Z quiet_log=%u", unsigned(window & file));

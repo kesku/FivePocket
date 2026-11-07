@@ -1,5 +1,6 @@
 """Host-only portability primitives. No game data, shell, device or download code."""
 from __future__ import annotations
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -7,6 +8,14 @@ import shutil
 import subprocess
 import sys
 import threading
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for data in iter(lambda: source.read(1 << 20), b''):
+            digest.update(data)
+    return digest.hexdigest()
 
 
 def package_root(source: str) -> Path:

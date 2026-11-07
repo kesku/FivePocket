@@ -1,67 +1,31 @@
-# Building FivePocket from source
+# Building iPhone Duo from source
 
-Nothing here needs the game. You need your own discs only to *run* the builder.
+Prerequisites: an Apple-silicon Mac, Xcode with the iOS 27.1 SDK or later, CMake 3.24+, Ninja, Git and Python 3.12+. Supply your own Install and Play disc images. No recovered kit, generated game source or signing key is required in the checkout.
 
-## Layout
+## Build
 
-| Folder | What |
-|---|---|
-| `android/` | the Android app (Java + C++ loader), its Gradle project and host tests (`android/tests`) |
-| `tools/own_disc/` | the builder: `builder.py` (player front end: check, fetch, build, verify), `disc_builder.py` (the stages), packaging, notices, tests |
-| `runtime/` | the game library's runtime and shader sources, compiled by the builder with the code translated from your discs (see `runtime/README.md`) |
-| `tools/host_guest_trace/`, `tools/vulkan_probe/`, `tools/rpf7_inventory/` | runtime and archive sources the builder compiles or runs |
-| `tools/xex_image/`, `tools/xmem_lzx/`, `tools/xex_info/` | small host programs: executable image decoder, LZX decompressor, header reader |
-| `patches/xenonrecomp/`, `patches/xenosrecomp/` and `tools/*recomp_patches/` | our patch queues for the two upstream translators, with their managers and tests |
-| `third_party/` | vendored FSR 1, GSR 1 and Nunito Sans with their licences |
-| `tools/release/` | release checks and packaging |
+Select your Xcode installation and build the pinned host tools and audio decoder. The NDK flag accepts Google's terms for the shader tools; read those terms before using it.
 
-## Toolchains
-
-- Python 3.12 (the Windows builder download carries its own).
-- CMake 3.24+ and Ninja; a C++20 compiler (Apple clang on macOS, llvm-mingw on Windows).
-- JDK 17 and the Android SDK (API 35) for the app; the builder fetches Android NDK r27c itself.
-- Windows only: Microsoft's DirectX Shader Compiler v1.9.2607 (fetched by the builder).
-
-## Upstream sources
-
-The builder compiles two upstream translators with our changes:
-
-| Project | Upstream | Our changes |
-|---|---|---|
-| XenonRecomp (PowerPC to C++) | https://github.com/hedge-dev/XenonRecomp | `patches/xenonrecomp/` |
-| XenosRecomp (Xbox 360 shaders) | https://github.com/hedge-dev/XenosRecomp | `patches/xenosrecomp/` |
-| FFmpeg (XMA decoder) | https://github.com/xenia-project/FFmpeg at 15ece0882e8d | configuration in `tools/own_disc/xma_decoder/` |
-
-The exact revisions a release was built from, and the complete changed source, are in that release's source archive
-(`FivePocket-<version>-source.tar.xz`, file `SOURCES.txt`) and in each builder download's `builder/sources/` folder.
-
-## The app
-
-```
-cd android
-./gradlew assemblePublic        # unsigned public APK: loader and menus only, no game code
-python3 ../android/scripts/validate_project.py
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+python3 tools/own_disc/bootstrap.py all --work "$PWD/build/dependencies" --accept-ndk-license
+python3 tools/own_disc/generate.py --tools "$PWD/build/dependencies" \
+  --play-disc /path/to/Play.iso --install-disc /path/to/Install.iso \
+  --out "$PWD/local-analysis/builder/duo-source"
+cmake -S . -B build/duo -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/iOS.cmake -DCMAKE_BUILD_TYPE=Release \
+  -DFIVEPOCKET_GAME_DIR="$PWD/local-analysis/builder/duo-source" \
+  -DFIVEPOCKET_BUNDLE_IDENTIFIER=com.example.fivepocket.duo
+cmake --build build/duo --parallel 6
+cmake --build build/duo --target ipa
 ```
 
-The public build refuses any asset other than its two text records (`prePublicBuild`). Sign it with your own key.
+The output is `build/duo/FivePocketDuo.app` and `build/duo/FivePocketDuo.ipa`. Signing is disabled by default. Sign locally with your own Apple identity; always use the existing bundle identifier when updating an installed app. Uninstalling removes its data.
 
-## The builder
+Host compilers and FFmpeg are built from pinned source. CMake fetches pinned SIMDe headers and the official MoltenVK iOS SDK. The small vendored Xenon compiler snapshot preserves the matching public source whose original Git revision is no longer fetchable; its provenance and hashes are in `third_party/xenonrecomp/SOURCE.json`.
 
-Run the builder's own tests first:
+Generated PowerPC code, shader data and payloads stay under the ignored `local-analysis/builder` directory. Build outputs and dependency caches stay under `build`. Never commit or share those outputs, game files, saves, or signing material.
 
-```
-python3 -m unittest discover -s tools/own_disc/tests
-```
+## Checks
 
-A builder download is a folder with the tools, the host programs, a profile and an inventory (`release.json`) that
-`builder.py check` verifies before it runs. `tools/own_disc/make_release.py` writes that inventory;
-`tools/own_disc/make_notices.py` and `make_sources.py` write its notices and corresponding source.
-
-## Release checks
-
-```
-python3 tools/release/run_checks.py
-```
-
-Before a release the maintainer also runs `tools/release/taint_scan.py` against their own discs and builder outputs,
-and `tools/release/package_release.py` to make the downloads; see [RELEASING.md](RELEASING.md).
+The host tests in the root README require no game files. `python3 tools/release/run_checks.py` checks source names, secrets and personal details. Before publishing source changes, also run `tools/release/taint_scan.py` against your local discs and generated inputs.

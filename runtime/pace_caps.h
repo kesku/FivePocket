@@ -8,21 +8,6 @@
 //                     desiredPresentTime = the slot's vsync - half a refresh)
 //   diag-pace-lowlat  (modifier) a second hold after the present, so the next frame is kicked later (less input latency)
 //   diag-pace-nolend  (modifier) the hold does not lend the prime core to main (see PrimeLend below); for the A/B
-// pace-low (2026-10-10; a phone whose heat policy has cut its clocks runs the street at 16-20 fps, below the ladder's last rung):
-//   diag-pace-20 / diag-pace-15   two more fixed caps: 6 / 8 refreshes per frame at ~120 Hz, 3 / 4 at 60 Hz. The same rule as the
-//                     other fixed caps in every respect (several present: the lowest rate wins; diag-pace-auto wins over them)
-//   diag-pace-auto-low  (modifier of diag-pace-auto, inert without it) the automatic cap's ladder goes on below 24 to 20 and 15,
-//                     by the rules it has between 40, 30 and 24. Without this file the ladder ends at 24 as before; when the file
-//                     goes away while the cap is at 20 or 15 the automatic cap starts over (as when it is switched on)
-//   With none of these three files every decision is the one of the build before pace-low, for every input (the lane's
-//   differential test runs both headers side by side).
-// pace-delay (2026-10-11; a phone whose way from the present call to the screen is one or two refreshes longer than the Thor's
-// shows every paced picture that many refreshes after its planned vsync: every frame counted tail-late, the trim at its ceiling):
-//   diag-pace-delay   (modifier) the display feedback is judged against the LEARNED whole-refresh display delay: the commonest
-//                     offset (in refreshes, 0 .. 3) of the last 64 displayed paced frames from their planned vsync, learned
-//                     separately for timed and untimed frames (as the two trims are). A frame shown at that offset is on its
-//                     slot; the trim moves only for frames off it, and starts from 0 when the delay changes. What is planned
-//                     (slots, releases, desired present times) does not read the delay. Without this file: as before.
 // No cap file present = no wait anywhere, no desired present time, every decision exactly as before (the display-time samples
 // below are still folded into the vsync estimate so a cap switched on mid-run is aligned at once; nothing reads it meanwhile).
 //
@@ -60,10 +45,7 @@
 
 namespace recomp::pace {
 
-constexpr unsigned SwCap40=1u,SwCap30=2u,SwCap24=4u,SwAuto=8u,SwDpt=16u,SwLowLat=32u,SwNoLend=64u,
-    SwCap20=128u,SwCap15=256u,SwAutoLow=512u, // pace-low: two more fixed caps; the automatic ladder's lower range (a modifier)
-    SwDelay=1024u,                            // pace-delay: diag-pace-delay (a modifier)
-    SwCaps=SwCap40|SwCap30|SwCap24|SwAuto|SwCap20|SwCap15;
+constexpr unsigned SwCap40=1u,SwCap30=2u,SwCap24=4u,SwAuto=8u,SwDpt=16u,SwLowLat=32u,SwNoLend=64u,SwShortBacklog=128u,SwCaps=SwCap40|SwCap30|SwCap24|SwAuto;
 
 // Constants (ns unless noted). DESIGN.md section 7 lists the measurement each one comes from.
 struct K {
@@ -96,9 +78,7 @@ struct K {
         AutoTrial=10'000'000'000,AutoHoldoffMin=4'000'000'000,AutoHoldoffMax=128'000'000'000,AutoRelax=30'000'000'000,
         AutoBusyGap=1'000'000'000,AutoFirstMax=200'000'000;
     static constexpr unsigned Ring=32,DispBins=8;
-    static constexpr unsigned DispLongBins=8;                  // pace-low: the last bin of disp (7 refreshes or more) by length: 7 .. 13, 14 or more
     static constexpr unsigned FrameRecs=64;                    // per-frame records kept per window (RENDER_DIAG_PACE_FR)
-    static constexpr unsigned DelayWindow=64,DelayMax=3;       // pace-delay: displayed paced frames per estimate; the largest delay learned (refreshes)
 };
 // pace-fg-tuning (v460's first device run): the desired present time that puts a picture on the vsync `vsync`. The Thor's
 // compositor shows a timed picture at the first vsync LATER THAN desired - one refresh: v460 asked for vsync - half a refresh
@@ -107,18 +87,23 @@ struct K {
 // The middle of the window that selects `vsync` is vsync + half a refresh.
 // One formula for both lanes (fg_pair.h repeats it; tests/tuning_test.cpp compares the two).
 inline std::int64_t desiredFor(std::int64_t vsync,double period) noexcept {return vsync+std::int64_t(period/2);}
-// The caps, highest first: nominal frame lengths of 60 / 40 / 30 / 24 fps, and (pace-low) 20 / 15. The automatic mode's ladder
-// is the first four (it ends at 24); with diag-pace-auto-low it is all six.
-constexpr std::array<std::int64_t,6> CapLength{16'666'667,25'000'000,33'333'333,41'666'667,50'000'000,66'666'667};
-constexpr std::array<unsigned,6> CapFps{60,40,30,24,20,15};
-constexpr unsigned autoLast(unsigned switches) noexcept {return (switches&SwAutoLow)?5u:3u;} // the automatic ladder's last rung
+// The automatic mode's caps, highest first: nominal frame lengths of 60 / 40 / 30 / 24 fps.
+constexpr std::array<std::int64_t,4> CapLength{16'666'667,25'000'000,33'333'333,41'666'667};
+constexpr std::array<unsigned,4> CapFps{60,40,30,24};
 // Refreshes per frame of a cap on a grid of `period`: the fewest whole refreshes that are not shorter than the cap's frame
-// (120 Hz: 2 / 3 / 4 / 5 / 6 / 8; the 0.1 allows for a panel slightly slower than nominal, e.g. 119.09 Hz).
+// (120 Hz: 2 / 3 / 4 / 5; the 0.1 allows for a panel slightly slower than nominal, e.g. 119.09 Hz).
 inline unsigned refreshesFor(std::int64_t length,double period) noexcept {
     const double r=std::ceil(double(length)/period-0.1);
     return r<1.0?1u:unsigned(r);
 }
+// ios-direct-present (Claude, 2026-10-16): on Darwin CLOCK_MONOTONIC counts sleep, while MoltenVK's actualPresentTime /
+// desiredPresentTime (MTLDrawable presentedTime / presentAtTime) and libc++'s steady_clock (the executor's park) are
+// mach_absolute_time, i.e. CLOCK_UPTIME_RAW. One clock for the pacer, the display times and the park, as on Android.
+#if defined(__APPLE__)
+inline std::int64_t monotonicNs() noexcept {return std::int64_t(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));}
+#else
 inline std::int64_t monotonicNs() noexcept {timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return std::int64_t(t.tv_sec)*1000000000ll+t.tv_nsec;}
+#endif
 
 // One 60-present window's counters and the state at its end (RENDER_DIAG_PACE).
 struct Snapshot {
@@ -129,7 +114,6 @@ struct Snapshot {
     unsigned lends=0,mainLeft=0,cancels=0,lends2=0,mainLeft2=0;            // the prime core lent for a hold / main left it by itself / ...
     std::uint64_t waitNs=0,waitMaxNs=0,overshootNs=0,overshootMaxNs=0,wait2Ns=0;
     std::array<unsigned,K::DispBins> disp{};                               // refreshes between consecutive displayed frames
-    std::array<unsigned,K::DispLongBins> dispLong{};                       // pace-low: disp's last bin by length ([0] = exactly 7, .. [7] = 14 or more)
     std::int64_t leadNs=0,pathNs=0,trimNs=0,kickNs=0,kickDevNs=0,demandNs=0,holdoffNs=0,firstNs=0,refreshNs=0;
     double periodNs=0;bool grid=false;
     // pace-fg-tuning: the lead trim of frames whose first picture carries a desired present time (trimNs: the other frames'),
@@ -138,7 +122,6 @@ struct Snapshot {
     std::int64_t trimTimedNs=0;unsigned timedFrames=0;
     struct Rec {std::int8_t off=0;bool timed=false;std::int32_t beginUs=0,endUs=0;};
     std::array<Rec,K::FrameRecs> recs{};unsigned recN=0;
-    unsigned delay=0,delayTimed=0; // pace-delay: the learned display delay of untimed / timed frames (refreshes; 0 without diag-pace-delay)
 };
 
 class Pacer {
@@ -170,7 +153,6 @@ public:
         std::lock_guard l(m);
         if(lastArrive && now-lastArrive>K::IdleReset)resetPlan();
         if(const unsigned g=gen.load(std::memory_order_relaxed);g!=seenGen){seenGen=g;resetAuto();}
-        autoFits(s); // pace-low
         if(ackAt && now>ackAt) { // the previous hand-back -> this arrival: main's kick + the render thread's frame
             const std::int64_t g=std::min<std::int64_t>(now-ackAt,100'000'000);
             if(!kickSamples){kickMean=g;kickDev=g/4;}
@@ -191,7 +173,7 @@ public:
         if(s&SwAuto) {
             if(au.started){n=refreshesFor(CapLength[au.index],P);fps=CapFps[au.index];}
         } else {
-            const unsigned i=(s&SwCap15)?5u:(s&SwCap20)?4u:(s&SwCap24)?3u:(s&SwCap30)?2u:1u; // (the lowest rate wins; pace-low: 15, 20)
+            const unsigned i=(s&SwCap24)?3u:(s&SwCap30)?2u:1u;
             n=refreshesFor(CapLength[i],P);fps=CapFps[i];
         }
         curFps=fps;curN=n;
@@ -204,7 +186,9 @@ public:
         const bool grid=gridOk(now);
         std::int64_t target=0,release=now;bool late=false;
         if(grid) {
-            const std::int64_t earliest=now+lead+K::Backlog;
+            // (Claude 2026-10-18, ios-pace-backlog2: 2 ms instead of the Thor-measured 7 ms; c204: lone 3-refresh frames on iOS)
+            const std::int64_t backlog=(s&SwShortBacklog)?2'000'000:K::Backlog;
+            const std::int64_t earliest=now+lead+backlog;
             const std::int64_t next=lastTarget?lastTarget+span:0;
             target=vsyncAtOrAfter(std::max(next,earliest)-K::SnapTol);
             late=next && target-vsyncNearest(next)>std::int64_t(P/2);
@@ -295,7 +279,7 @@ public:
             const double d=K::AutoKappa*perFrame;
             au.demand=au.samples?au.demand+(d-au.demand)*K::AutoAlpha:d;
             ++au.samples;
-            if(const unsigned s=sw.load(std::memory_order_relaxed);s&SwAuto){autoFits(s);decide(now,autoLast(s),skips24(s));} // (pace-low: the ladder's last rung; pace-auto-pairs: without 24)
+            if(sw.load(std::memory_order_relaxed)&SwAuto)decide(now);
         }
         au.busy=busyNs;au.busyAt=now;au.busyFrames=frames;
     }
@@ -324,13 +308,6 @@ public:
     // it does, the pacer plans frames as under diag-pace-dpt (the extra lead, the timed trim): one lead rule for both lanes, and
     // a pairs phase leaves the trim of untimed frames alone. Presenter::fgBefore, only once a diag-fg-pair-* file was seen.
     void pairsTimed(bool on) noexcept {extTimed.store(on,std::memory_order_relaxed);}
-    // pace-auto-pairs (v524): the pair path says whether frame generation's pairs are wanted under the low caps (a pair mode is
-    // on, diag-fg-low is present and the generator has not fallen back for good). While they are, and the automatic ladder has
-    // its lower range (diag-pace-auto-low), the ladder leaves out its 24 fps rung: pairs exist under 30 (two refreshes apart),
-    // 20 (three) and 15 (four), not under 24 (five refreshes have no middle), so with 24 in the ladder a scene that no longer
-    // holds 30 would show 24 pictures a second where 20 shows 40. Without diag-pace-auto-low nothing changes: 24 is then the
-    // ladder's last rung and stays. A fixed cap is never touched.
-    void pairsLow(bool on) noexcept {extPairsLow.store(on,std::memory_order_relaxed);}
     // ---- present thread: vkQueuePresentKHR of `tag` returned at `now`.
     void presented(std::uint32_t tag,std::int64_t now) noexcept {
         std::lock_guard l(m);
@@ -351,7 +328,6 @@ public:
         if(lastDisplayed && actual>lastDisplayed) {
             const auto k=std::llround(double(actual-lastDisplayed)/period);
             ++c.disp[std::size_t(std::clamp<long long>(k,0,K::DispBins-1))];
-            if(k>=K::DispBins-1)++c.dispLong[std::size_t(std::min<long long>(k-(K::DispBins-1),K::DispLongBins-1))]; // pace-low (a counter only)
         }
         lastDisplayed=actual;
         Bound* r=find(tag);
@@ -360,9 +336,8 @@ public:
         if(!r->target)return;
         const auto e=std::llround(double(actual-r->target)/period);
         std::int64_t& trim=r->timed?trimTimedNs:trimNs; // pace-fg-tuning: timed and untimed frames learn separately
-        const long long j=e-delayFor(r->timed,e,trim);  // pace-delay: the offset from the slot the display really gives (j = e without diag-pace-delay)
-        if(j==0){++c.onSlot;trim-=trim/K::TrimLeak;}
-        else if(j<0){++c.early;if(r->waited)trim=std::max(trim-K::TrimStep,K::TrimMin);}
+        if(e==0){++c.onSlot;trim-=trim/K::TrimLeak;}
+        else if(e<0){++c.early;if(r->waited)trim=std::max(trim-K::TrimStep,K::TrimMin);}
         else {++c.tailLate;if(r->waited)trim=std::min(trim+K::TrimStep,K::TrimMax);}
         if(c.recN<K::FrameRecs) { // pace-fg-tuning: the per-frame record (what the window counters cannot say)
             const auto us=[&](std::int64_t t){return t?std::int32_t(std::clamp<std::int64_t>((r->target-t)/1000,-999'999,999'999)):0;};
@@ -378,7 +353,6 @@ public:
         s.leadNs=leadNs(timed);s.pathNs=pathNs;s.trimNs=trimNs;s.trimTimedNs=trimTimedNs;s.kickNs=kickMean;s.kickDevNs=kickDev;
         s.demandNs=std::int64_t(au.demand);s.holdoffNs=au.holdoff;s.firstNs=std::int64_t(au.firstNeed);s.refreshNs=refreshNs;
         s.periodNs=period;s.grid=gridSamples>=K::GridMinSamples;
-        s.delay=delays[0].refreshes;s.delayTimed=delays[1].refreshes; // pace-delay
         return s;
     }
 
@@ -395,9 +369,6 @@ private:
 
     std::atomic<unsigned> sw{0},gen{0};
     std::atomic<bool> extTimed{false}; // pace-fg-tuning: the pair path times the frames' first pictures
-    std::atomic<bool> extPairsLow{false}; // pace-auto-pairs: pairs are wanted under the low caps
-    static constexpr unsigned Rung24=3;   // (CapFps[3])
-    bool skips24(unsigned s) const noexcept {return (s&SwAuto) && (s&SwAutoLow) && extPairsLow.load(std::memory_order_relaxed);}
     std::mutex m;
     // the vsync grid: `phase` is the estimated time of one vsync, `period` the refresh length, `nominal` its first guess
     double nominal=double(K::NominalPeriod),period=double(K::NominalPeriod);
@@ -428,28 +399,6 @@ private:
     }
     void resetPlan() noexcept {lastTarget=0;lastRelease=0;lastBound=false;ackAt=0;lateBits=0;cur=Plan{};}
     void resetAuto() noexcept {au=Auto{};}
-    // pace-delay: the display delay of one kind of frame ([0] untimed, [1] timed): the estimate, and the offsets seen since it was made.
-    struct Delay {unsigned refreshes=0,n=0;std::array<unsigned,K::DelayMax+1> hist{};};
-    std::array<Delay,2> delays{};
-    // A paced frame of that kind was shown `e` refreshes after its planned vsync. Returns the delay to judge it against: 0 without
-    // diag-pace-delay (and whatever was learned is forgotten). With it: every K::DelayWindow such frames the commonest offset
-    // among 0 .. K::DelayMax becomes the delay (a tie with the current delay keeps it; among others the smallest wins); when it
-    // changes, that kind's trim starts from 0 (it was learned against another slot).
-    long long delayFor(bool timed,long long e,std::int64_t& trim) noexcept {
-        Delay& d=delays[timed?1:0];
-        if(!(sw.load(std::memory_order_relaxed)&SwDelay)){for(auto& x:delays)if(x.refreshes || x.n)x=Delay{};return 0;} // (both kinds forgotten)
-        if(e>=0 && e<=K::DelayMax)++d.hist[std::size_t(e)];
-        if(++d.n>=K::DelayWindow) {
-            unsigned best=d.refreshes;
-            for(unsigned k=0;k<=K::DelayMax;++k)if(d.hist[k]>d.hist[best])best=k;
-            if(best!=d.refreshes){d.refreshes=best;trim=0;}
-            d.n=0;d.hist={};
-        }
-        return d.refreshes;
-    }
-    // pace-low: an automatic cap below the ladder's last rung (diag-pace-auto-low went away while the cap was at 20 or 15)
-    // starts over, as when the automatic mode is switched on; the ladder then ends at 24 again. Never true without that file.
-    void autoFits(unsigned s) noexcept {if((s&SwAuto) && au.index>autoLast(s))resetAuto();}
     // An alpha-beta tracker: the first samples are trusted (gains 1/n), later ones move the phase by 1/4 and the period by 2 %
     // of their error. A sample far off the grid is ignored; three in a row (the display changed) restart the phase.
     void gridSample(std::int64_t d) noexcept {
@@ -470,10 +419,9 @@ private:
     }
     // The automatic cap (under m, at every demand sample). Whether a cap HOLDS is decided by the slots alone (late frames): the
     // demand estimate may be off by several per cent under a cap (DESIGN.md section 5), so it never steps the cap down; it only
-    // says when a step up is worth a trial. `last`: the ladder's last rung (3 = 24 fps; pace-low: 5 = 15 fps with diag-pace-auto-low).
-    void decide(std::int64_t now,unsigned last,bool skip24=false) noexcept {
+    // says when a step up is worth a trial.
+    void decide(std::int64_t now) noexcept {
         const auto length=[&](unsigned i){return double(refreshesFor(CapLength[i],period))*period;};
-        const auto usable=[&](unsigned i){return !(skip24 && i==Rung24);}; // pace-auto-pairs: the rungs the ladder has now
         if(!au.started) {
             if(au.samples<2)return;
             double need=au.demand;
@@ -481,36 +429,31 @@ private:
                 auto v=au.first;const auto mid=v.begin()+au.firstN/2;
                 std::nth_element(v.begin(),mid,v.begin()+au.firstN);need=double(*mid)*1e3;
             }
-            au.firstNeed=need;au.index=last;
-            for(unsigned i=0;i<=last;++i)if(usable(i) && need<=K::AutoUpFrac*length(i)){au.index=i;break;}
+            au.firstNeed=need;au.index=3;
+            for(unsigned i=0;i<4;++i)if(need<=K::AutoUpFrac*length(i)){au.index=i;break;}
             au.started=true;au.switchedAt=now;return;
         }
-        // pace-auto-pairs: 24 was in force when pairs became wanted: the next rung down, at once (nothing is undone: no hold-off)
-        if(!usable(au.index)){au.index=std::min(au.index+1,last);++c.autoDown;au.switchedAt=now;au.upSince=0;au.probeSince=0;au.upAt=0;lateBits=0;return;}
         if(now-au.switchedAt<K::AutoSettle)return;
         const auto count=[](std::uint64_t b){unsigned n=0;for(;b;b&=b-1)++n;return n;};
         // Step down: 7 of the last 64 frames were late for their slot (one frame in nine, however they are spread), or 3 of the
         // last 32 while a step up is on trial (its first 10 s). The next step up waits for the hold-off, which doubles when this
         // step down undoes a step up that had not yet held for 30 s.
         const bool trial=au.upAt && now-au.upAt<K::AutoTrial;
-        if(au.index<last && (count(lateBits)>=K::AutoLateLimit || (trial && count(lateBits&0xffffffffu)>=K::AutoTrialLates))) {
+        if(au.index<3 && (count(lateBits)>=K::AutoLateLimit || (trial && count(lateBits&0xffffffffu)>=K::AutoTrialLates))) {
             if(au.upAt && now-au.upAt<K::AutoRelax)au.holdoff=std::min(au.holdoff*2,K::AutoHoldoffMax);
             au.holdoffUntil=now+au.holdoff;
-            ++au.index;++c.autoDown;au.switchedAt=now;au.upSince=0;au.probeSince=0;au.upAt=0;lateBits=0;
-            if(!usable(au.index) && au.index<last)++au.index; // pace-auto-pairs (one step down past the rung the ladder leaves out)
-            return;
+            ++au.index;++c.autoDown;au.switchedAt=now;au.upSince=0;au.probeSince=0;au.upAt=0;lateBits=0;return;
         }
         // Step up, on trial: to the highest cap the estimate fits with the full margin for 4 s; or by one cap when the estimate
         // has been under that cap's slot by the small margin for 20 s (the estimate may read high). Both wait for the hold-off.
         if(au.index>0) {
             unsigned best=au.index;
-            for(unsigned i=0;i<au.index;++i)if(usable(i) && au.demand<K::AutoUpFrac*length(i)){best=i;break;}
-            const unsigned above=usable(au.index-1)?au.index-1:au.index-2; // pace-auto-pairs: the next rung up that the ladder has (from 20: 30)
+            for(unsigned i=0;i<au.index;++i)if(au.demand<K::AutoUpFrac*length(i)){best=i;break;}
             au.upSince=best<au.index?(au.upSince?au.upSince:now):0;
-            au.probeSince=au.demand<K::AutoProbeFrac*length(above)?(au.probeSince?au.probeSince:now):0;
+            au.probeSince=au.demand<K::AutoProbeFrac*length(au.index-1)?(au.probeSince?au.probeSince:now):0;
             unsigned to=au.index;
             if(au.upSince && now-au.upSince>=K::AutoUpDwell)to=best;
-            else if(au.probeSince && now-au.probeSince>=K::AutoProbeDwell)to=above;
+            else if(au.probeSince && now-au.probeSince>=K::AutoProbeDwell)to=au.index-1;
             if(to<au.index && now>=au.holdoffUntil) {
                 au.index=to;++c.autoUp;au.switchedAt=now;au.upSince=0;au.probeSince=0;au.upAt=now;au.relaxAt=now;lateBits=0;return;
             }
@@ -604,7 +547,6 @@ inline Pacer& pacer() noexcept {static Pacer p;return p;}
 [[gnu::noinline]] inline void queued(std::uint32_t tag) noexcept {pacer().queued(tag);}
 [[gnu::noinline]] inline std::uint64_t desiredPresentNs(std::uint32_t tag) noexcept {return tag && pacer().on()?pacer().desired(tag,monotonicNs()):0;}
 [[gnu::noinline]] inline void pairsTimed(bool on) noexcept {pacer().pairsTimed(on);} // pace-fg-tuning (Presenter::fgBefore)
-[[gnu::noinline]] inline void pairsLow(bool on) noexcept {pacer().pairsLow(on);}     // pace-auto-pairs (Presenter::fgBefore)
 [[gnu::noinline]] inline void presentCalled(std::uint32_t tag) noexcept {if(tag && pacer().on())pacer().presented(tag,monotonicNs());}
 [[gnu::noinline]] inline void displayedAt(std::uint32_t tag,std::uint64_t actualNs) noexcept {pacer().displayed(tag,actualNs,monotonicNs());}
 [[gnu::noinline]] inline void refreshIs(std::uint64_t ns) noexcept {pacer().setRefresh(ns);}

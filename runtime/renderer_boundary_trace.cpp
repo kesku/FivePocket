@@ -5,7 +5,6 @@
 // from the GTA IV/Sonic hooks in SanRecomp/gpu/video.cpp. Original CPU behavior
 // and return registers are retained until native presentation takes ownership.
 // Inline draw inputs are copied only inside the executor's exclusive gate.
-#include "index_view.h" // v571
 #include "prime_swap_v245.h" // v245
 #include "pace_caps.h" // pace-caps (lane A): diag-pace-* (paceHold)
 #include "fast_tls_v362.h" // v362: the render thread's thread_locals without a TLS resolver call
@@ -172,7 +171,7 @@ namespace recomp::bootstrap { std::uint32_t currentGuestThreadToken() noexcept; 
 #if __has_include("native_stencil_only_shader_pack.h")
 #include "native_stencil_only_shader_pack.h"
 #include "native_stencil_only_plan.h"
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 #include "native_stencil_pipeline_options.h"
 #endif
 #endif
@@ -236,7 +235,7 @@ namespace recomp::bootstrap { std::uint32_t currentGuestThreadToken() noexcept; 
 #include "gta5_driver_textures.h"
 #include "xenos_shader_texture_slots.h"
 #include "gta5_submitted_texture_pages.h"
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 #include <android/log.h>
 #include <dlfcn.h>
 #include <unwind.h>
@@ -302,10 +301,21 @@ std::array<std::uint64_t,ShaderPatchHistoryLimit> shaderPatchSequences{};
 std::uint64_t shaderPatchAttempts=0;
 std::atomic<unsigned> shaderPatchCaptureFailures{0};
 recomp::bootstrap::GuestImportRegistry* inlineRegistry=nullptr;
-// v571 (index_view.h): the graphics-data view of an index range at any 2-byte-aligned address (out of line: each caller keeps
-// one call where it had the view's, its CFG and PGO record unchanged).
+// (Claude 2026-10-21, ported from the Fold's v571 index_view.h, CROSS-PORT-LOG 22:25): the registry's graphics-data view refuses
+// an address that is not a multiple of 4. A draw of 16-bit indices with an ODD start index begins 2 bytes past such a boundary, so
+// every such draw was skipped whole ("index-data"; on the Fold 22 vfx_decal draws a frame outdoors). The view is taken from the
+// 4-byte boundary at or below the address (the same allocation) and the pointer advanced by the difference; an aligned address
+// reads exactly as before.
 [[gnu::noinline]] const std::uint8_t* graphicsIndexView(std::uint32_t address,std::uint32_t bytes) noexcept {
-    return recomp::gpu::index_view::at([](std::uint32_t a,std::uint32_t n){return inlineRegistry->viewSerializedGraphicsData(a,n);},address,bytes);
+    const std::uint32_t pad=address&3u;
+    if(!pad)return inlineRegistry->viewSerializedGraphicsData(address,bytes);
+    if(bytes>0xFFFFFFFFu-pad)return nullptr;
+    const std::uint8_t* p=inlineRegistry->viewSerializedGraphicsData(address-pad,bytes+pad);
+    if(p) { // (evidence on the device: the odd-start index ranges now served; first 3, then every 1000th)
+        static std::atomic<std::uint64_t> served{0};const auto n=++served;
+        if(n<=3 || !(n%1000))__android_log_print(ANDROID_LOG_INFO,"RecompRenderer","RENDER_INDEX_VIEW_ODD n=%llu address=%08x bytes=%u pad=%u\n",(unsigned long long)n,address,bytes,pad); // (the iOS console takes the log shim, not stderr)
+    }
+    return p?p+pad:nullptr;
 }
 const recomp::gpu::NativeColorChainProgram* inlinePrograms=nullptr;
 std::function<bool(const std::function<void()>&)> inlineGate;
@@ -519,7 +529,7 @@ struct RecordedTileResolve {
     bool originalReturned=false;
 };
 std::vector<RecordedTileResolve> recordedTileResolves;
-#if defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
 // Prepared from this live recording at EndTiling, never loaded from saved test
 // files. Preparation is distinct from rendering and guest completion.
 std::optional<recomp::gpu::Gta5NativeSceneInputs> pendingNativeSceneInputs;
@@ -545,7 +555,7 @@ std::mutex inlineConstantsMutex;
 std::atomic<bool> inlineConstantsPending{false};
 void noteInlineConstantsPendingLocked(){inlineConstantsPending.store(inlineConstants.pending(),std::memory_order_release);}
 std::map<std::uint32_t,std::optional<std::array<std::uint32_t,3>>> driverScissors;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 recomp::gpu::VulkanEngine* inlineGraphics=nullptr;
 std::unique_ptr<recomp::gpu::NativeLogicalTileTarget> pendingNativeSceneTarget;
 recomp::gpu::NativeCompletedSceneTarget<recomp::gpu::NativeLogicalTileTarget,recomp::gpu::VulkanEngine> completedNativeSceneTarget;
@@ -673,7 +683,7 @@ bool copyGuestHeapInto(std::uint32_t address,std::uint32_t bytes,std::vector<std
 
 template<class... Args>
 void rendererLog(const char* format, Args... args) noexcept {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     __android_log_print(ANDROID_LOG_INFO, "RecompRenderer", format, args...);
 #else
     std::fprintf(stderr, format, args...);
@@ -684,7 +694,7 @@ void rendererLog(const char* format, Args... args) noexcept {
 // __android_log_print) in place of __android_log_print: the call sites keep their CFG (and IR-PGO records).
 template<class... Args>
 void rendererLogQuiet(const char* format, Args... args) noexcept {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     ::recomp::diag::quietLog(ANDROID_LOG_INFO, "RecompRenderer", format, args...);
 #else
     if(!recomp::diag::quietSkip())std::fprintf(stderr, format, args...);
@@ -693,7 +703,7 @@ void rendererLogQuiet(const char* format, Args... args) noexcept {
 // quiet-log: rendererLog at a v218-sampled site (recomp::diag::quietLogSampled: while quiet every 16th, `keep` always).
 template<class... Args>
 void rendererLogSampled(int keep, const char* format, Args... args) noexcept {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     ::recomp::diag::quietLogSampled(keep, ANDROID_LOG_INFO, "RecompRenderer", format, args...);
 #else
     if(keep || !recomp::diag::quietSkip())std::fprintf(stderr, format, args...);
@@ -723,7 +733,7 @@ void record(const char* name, unsigned call, const char* phase,
         ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
         ctx.r9.u32, ctx.r10.u32, ctx.f1.f64);
 }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 // Caller holds inlineGate: every other guest writer is parked and this caller
 // performs no guest writes while inspecting the allocation's current owner.
 std::optional<std::uint32_t> textureStorageAddress(
@@ -750,7 +760,7 @@ void recordCompletedTextures(LiveTarget& live,const recomp::gpu::Gta5InlineDraw&
 }
 #endif
 #include "renderer_fixed16.inc"
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 #include "renderer_fixed16_resolve.inc"
 #include "renderer_raw10_resolve.inc"
 #include "renderer_rgb7e3_float_resolve.inc"
@@ -765,7 +775,7 @@ void recordCompletedTextures(LiveTarget& live,const recomp::gpu::Gta5InlineDraw&
 #endif
 #endif
 
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 void invalidatePhysicalNativeViews(std::uint32_t device,unsigned base,unsigned tiles) {
     for(auto& [key,owner]:offscreenTargets)if(key.first==device && owner.image &&
         surfacePlanIntersects(owner.image->plan(),base,tiles))owner.valid=false;
@@ -831,7 +841,7 @@ void recordDiagnosticSkippedResolve(const PPCContext& ctx) {
     static std::map<std::string,unsigned> seen;
     ++diagnosticCounts[DiagResolves];
     unsigned width=0,height=0,format=0,address=0;std::uint32_t source=0;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(inlineRegistry && inlineGate)gateRef([&] {
         if(const auto header=inlineRegistry->copySerializedGuestHeap(ctx.r6.u32,52))
             if(const auto d=recomp::gpu::describeGta5TextureHeader(*header))
@@ -851,7 +861,7 @@ void recordDiagnosticSkippedClear(std::uint32_t device,std::uint32_t flags,std::
     static std::map<std::string,unsigned> seen;
     ++diagnosticCounts[DiagClears];
     std::uint32_t object=0,depth=0;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(inlineRegistry && inlineGate)gateRef([&] {
         const auto w=[&](std::uint32_t a) {
             const auto s=inlineRegistry->copySerializedGuestHeap(a,4);
@@ -1030,7 +1040,7 @@ std::atomic<bool> genericTakeover{false};
 recomp::gpu::generic::WriteStatus genericWriteBack(std::uint32_t physical,std::uint32_t bytes,
         const std::function<bool(std::vector<std::uint8_t>&)>& edit) {
     using S=recomp::gpu::generic::WriteStatus;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     recomp::gpu::XenosTextureDescription d;d.baseAddress=physical;
     const auto address=textureStorageAddress(d,bytes);
     if(!address)return S::NoOwner;
@@ -1286,7 +1296,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
     std::optional<recomp::gpu::Gta5InlineDraw> captured;
     int vsRole=-1,psRole=-1;bool additionalDraw=false,nativeDrawCompleted=false;
     const auto gate=gateRef([&] {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         recomp::gpu::NativeEdram32Mutation physicalMutation(liveEdram32[device]);
         recomp::gpu::NativePreservedSampleToken preservedSamples;
         LiveTarget* live=nullptr;
@@ -1425,7 +1435,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
                     const unsigned size=pending.indexFormat==1?2:4;
                     const auto address=word(device+13852);
                     // v43: the copy's validation in place; converted straight from the guest bytes.
-                    const auto* raw=address?graphicsIndexView(*address,pending.indexCount*size):nullptr; // (v571: index_view.h)
+                    const auto* raw=address?graphicsIndexView(*address,pending.indexCount*size):nullptr; // (index view, odd 16-bit start)
                     if(raw) {
                         in.indices.resize(pending.indexCount);
                         recomp::gpu::hot::bigEndianIndicesRebased(raw,pending.indexCount,size==4,pending.minVertex,in.indices.data());
@@ -1508,7 +1518,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
                     const unsigned size=pending.indexFormat==1?2:4;
                     const auto address=word(device+13852);
                     // v43: the copy's validation in place; converted straight from the guest bytes.
-                    const auto* raw=address?graphicsIndexView(*address,pending.indexCount*size):nullptr; // (v571: index_view.h)
+                    const auto* raw=address?graphicsIndexView(*address,pending.indexCount*size):nullptr; // (index view, odd 16-bit start)
                     if(raw) {
                         in.indices.resize(pending.indexCount);
                         recomp::gpu::hot::bigEndianIndicesRebased(raw,pending.indexCount,size==4,pending.minVertex,in.indices.data());
@@ -1555,7 +1565,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             if(auto b=heap(*vs,1024))stopped.vertexResource=std::move(*b);
             if(auto b=heap(*ps,1024))stopped.pixelResource=std::move(*b);
             if(auto b=heap(device,13860))stopped.deviceState=std::move(*b);
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             stopped.physicalAtStop=recomp::gpu::captureNativeStoppedPhysical32(
                 physicalMutation.candidate(),stopped.deviceState);
 #endif
@@ -1571,7 +1581,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             }
             stopped.surfaces=recomp::gpu::captureGta5BoundSurfaces(stopped.deviceState,heap,
                 [&](auto a,auto n){return inlineRegistry->copySerializedGraphicsData(a,n);},40);
-#if defined(__ANDROID__) && __has_include("native_gamma_snapshot_module.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_gamma_snapshot_module.h")
             if(stopped.surfaces)stopped.colorSamples=captureCompletedColorSamples(device,stopped.surfaces->surfaces[0].object,preservedSamples);
 #endif
             if(pending.indexCount) {
@@ -1663,7 +1673,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             recordDiagnosticSkippedDraw(line,reason,vertexCode,pixelCode,pending.primitive,pending.count,pending.stride,
                 pending.indexCount,word(device+12816).value_or(0),word(device+10460).value_or(0),word(device+10548).value_or(0));
             nativeDrawCompleted=true;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             if(live)live->valid=true;
 #endif
         };
@@ -1672,7 +1682,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             preserveStoppedDraw();stopPendingTileRecording("inline-draw");
         }
 #endif
-#if defined(__ANDROID__) && __has_include("native_fixed16_rectangle_shader_pack.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_fixed16_rectangle_shader_pack.h")
         if(!pending.indexCount && vertexCode && pixelCode &&
            nativeFixed16RectangleProgram.vertexIdentity==*vertexCode && nativeFixed16RectangleProgram.pixelIdentity==*pixelCode) {
             additionalDraw=true;
@@ -1690,7 +1700,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             ++liveDraws;return;
         }
 #endif
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         #if __has_include("native_query_neutral_fan_shader_pack.h")
         if(!pending.indexCount && vertexCode && pixelCode &&
            queryNeutralFanProgram.vertexIdentity==*vertexCode && queryNeutralFanProgram.pixelIdentity==*pixelCode) {
@@ -3021,8 +3031,12 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
             nativeDrawCompleted=completed;
             if(completed){live->valid=true;++liveDraws;++live->contentSerial;latestLiveDevice=device;recordCompletedTextures(*live,*captured);nativeUiDevice.store(device);
                 ++completedTranslatedTextures.at(captured->textures.size());}
-            rendererLog("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
-                pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
+            if(completed)
+                rendererLogQuiet("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
+                    pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
+            else
+                rendererLog("RENDER_API_TRANSLATED_DRAW vertices=%u stride=%u indices=%u captured=%u state=%u completed=%u\n",
+                    pending.count,pending.stride,pending.indexCount,unsigned(captured.has_value()),unsigned(state),unsigned(completed));
             if(!completed) {
                 if(textured) {
                 const auto fetch=submittedFetch(additional->textureSlot);
@@ -3064,7 +3078,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
                         word(device+10460).value_or(0),word(device+10548).value_or(0),reported.size());
                 }
                 nativeDrawCompleted=true;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
                 if(live)live->valid=true;
 #endif
                 return;
@@ -3086,7 +3100,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
                 captured->scissorRegisters=driverScissors[device];
             }
         }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         if(live) {
             const unsigned pair=psRole==2?0:1;
             const auto packed=captured?recomp::gpu::packGta5StartupDraw(*captured,pair):std::nullopt;
@@ -3145,7 +3159,7 @@ bool captureInline(std::uint32_t device,std::uint32_t stack,std::uint32_t link,
 bool clearLiveTarget(std::uint32_t device,std::uint32_t flags,std::uint32_t rect,std::uint32_t color,
                      const recomp::gpu::Gta5ClearCall* terminalCall=nullptr) {
     stopPendingTileRecording("executed-clear");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlinePrograms || !inlineGraphics || !inlineGate)return false;
     bool completed=false;
     const bool gated=gateRef([&] {
@@ -3334,7 +3348,7 @@ bool clearLiveTarget(std::uint32_t device,std::uint32_t flags,std::uint32_t rect
 }
 
 void capturePendingTileResolve(const PPCContext& ctx) {
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__)
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__))
     if(tileRecordingDevice.load() && inlineRegistry && inlineGate)gateRef([&] {
         if(stoppedTileResolve || !tileRecordingDiagnostic.pending())return;
         stoppedTileResolve=recomp::gpu::captureGta5TileResolveBoundary(ctx.r1.u32,
@@ -3354,7 +3368,7 @@ void capturePendingTileResolve(const PPCContext& ctx) {
 }
 
 void capturePendingTileEnd(const PPCContext& ctx) {
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__)
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__))
     if(tileRecordingDevice.load() && inlineRegistry && inlineGate)gateRef([&] {
         if(stoppedTileEnd || !tileRecordingDiagnostic.pending() ||
            ctx.r3.u32!=tileRecordingDevice.load())return;
@@ -3432,7 +3446,7 @@ void capturePendingTileEnd(const PPCContext& ctx) {
 #include "renderer_native_scene.inc"
 
 bool recordPendingTileResolve(PPCContext& ctx,const std::function<void()>& original) {
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__)
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__))
     if(!tileRecordingDevice.load() || !originalRecordingGate)return false;
     if(!inlineRegistry || !original || originalResolveRecordingDevice ||
        recordedTileResolves.size()>=recomp::gpu::Gta5TileRecordingDiagnostic::MaxResolves)
@@ -3484,7 +3498,7 @@ bool recordPendingTileResolve(PPCContext& ctx,const std::function<void()>& origi
 // Caller already holds inlineGate. Keep this independent of live display
 // validity and tiled-recording state so early rejection retains its actual ABI.
 void captureNativeResolveFailure(const PPCContext& ctx,recomp::gpu::NativeResolveFailureStage stage) noexcept {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(firstNativeResolveFailure || !inlineRegistry)return;
     // Before native presentation takeover a false resolve permits the original
     // driver fallback. That is not a terminal failure and must not consume the
@@ -3526,7 +3540,7 @@ void captureNativeResolveFailure(const PPCContext& ctx,recomp::gpu::NativeResolv
 bool resolveLiveTarget(const PPCContext& ctx) {
     capturePendingTileResolve(ctx);
     stopPendingTileRecording("resolve");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlineGate)return false;
     bool resolved=false;
     const bool gated=gateRef([&] {
@@ -3882,7 +3896,7 @@ bool genericPresentHook(const PPCContext& ctx) {
     if(!genericReady() || !ownsNativeRendering(ctx.r3.u32) || !inlinePresent || !inlineGate)return false;
     finishDrawVerticesFrame(); // v56
     finishInlineConstantsFrame(); // v80
-    bool presented=false;const char* why="gate";
+    bool presented=false,handledQueued=false;const char* why="gate";
     gateRef([&] {
         const auto header=inlineRegistry->copySerializedGuestHeap(ctx.r4.u32,52);
         const auto d=header?recomp::gpu::describeGta5TextureHeader(*header):std::nullopt;
@@ -3913,7 +3927,11 @@ bool genericPresentHook(const PPCContext& ctx) {
         if(censusFrame)genericExposureState("census-after-present");
         // v177: a queued present without an image yet (the first one after it engages) handled this frame: its image
         // is shown by the next present, so the native present path must not run for it.
-        if(!rgba){if(why && !std::strcmp(why,"present-queued"))presented=true;return;}
+        if(!rgba){
+            if(why && !std::strcmp(why,"ios-shared-queued"))handledQueued=true; // handled, not Accepted or displayed
+            else if(why && !std::strcmp(why,"present-queued"))presented=true;
+            return;
+        }
         auto& target=liveTargets[ctx.r3.u32];
         // v43: queued for the presenter thread when it takes the frame (the scan-out mapping and the app's
         // display then run there, outside this gate); otherwise displayed here as before. A queued frame is
@@ -3965,7 +3983,7 @@ bool genericPresentHook(const PPCContext& ctx) {
         }
     });
     genericNote("present",why);
-    return presented;
+    return presented || handledQueued; // suppress native fallback without a display-success count
 #else
     (void)ctx;return false;
 #endif
@@ -3995,8 +4013,10 @@ bool genericResolveHook(const PPCContext& ctx) {
         // slice, f1 the depth clear value, caller stack words +92 (stencil clear value, 836ADD90 ORs it
         // into RB_DEPTH_CLEAR) and +100 (a parameter pointer, logged).
         in.mip=ctx.r8.u32;in.slice=ctx.r9.u32;in.clearDepth=float(ctx.f1.f64);
-        in.caller=static_cast<std::uint32_t>(ctx.lr); // v580 (census only): who resolves (G7: the G-buffer tile resolves)
+#ifdef RECOMP_THOR_EDITION
+        in.caller=static_cast<std::uint32_t>(ctx.lr); // v580 (census only): who resolves (G7: the G-buffer tile resolves) (ios-duo: from v687)
         if(const auto bc=argument(ctx.r1.u32,4);bc && bc->size()==4)if(const auto lr=argument(genericBe32(*bc,0)-8,4);lr && lr->size()==4)in.caller2=genericBe32(*lr,0);
+#endif /* RECOMP_THOR_EDITION */
         if(const auto s=argument(ctx.r1.u32+92,4);s && s->size()==4)in.clearStencil=genericBe32(*s,0);
         if(const auto s=argument(ctx.r1.u32+100,4);s && s->size()==4)in.parameters=genericBe32(*s,0);
         recomp::gpu::generic::resolve(in,&why);
@@ -4030,7 +4050,7 @@ void genericClear(std::uint32_t device,std::uint32_t flags,std::uint32_t rect,st
 
 bool presentLiveTexture(std::uint32_t device,std::uint32_t object) {
     stopPendingTileRecording("present");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlineGate || !inlinePresent)return false;
     bool completed=false;
     const bool gated=gateRef([&] {
@@ -4102,7 +4122,7 @@ bool presentLiveTexture(std::uint32_t device,std::uint32_t object) {
 void deliverNativePresentationCallback(PPCContext& ctx,std::uint8_t* base) {
     paceHold(1); // pace-caps (lane A): diag-pace-lowlat's hold after the present (no cap file: a load and a return)
     stopPendingTileRecording("presentation-callback");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     std::uint32_t callback=0;
     std::array<std::uint32_t,3> notification{};
     const auto device=ctx.r3.u32;
@@ -4147,7 +4167,7 @@ void deliverNativePresentationCallback(PPCContext& ctx,std::uint8_t* base) {
 
 bool completeNativePresentDrain(std::uint32_t device) {
     stopPendingTileRecording("present-drain");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineGate || !ragePresentDepth)return false;
     bool completed=false;
     const bool gated=gateRef([&] {
@@ -4173,7 +4193,7 @@ bool completeNativePresentDrain(std::uint32_t device) {
 
 bool nativePresentStatistics(PPCContext& ctx,std::uint8_t* base) {
     stopPendingTileRecording("present-statistics");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlineGate)return false;
     bool completed=false;
     const bool gated=gateRef([&] {
@@ -4197,7 +4217,7 @@ bool nativePresentStatistics(PPCContext& ctx,std::uint8_t* base) {
 
 bool completeNativeResourceWait(std::uint32_t object) {
     stopPendingTileRecording("resource-wait");
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlineGate)return false;
     bool completed=false;
     const bool gated=gateRef([&] {
@@ -4286,7 +4306,7 @@ bool captureDriverScissor(std::uint32_t device,const std::array<std::uint32_t,4>
             if(copyGuestHeapInto(device,13860,fullBytes))bytes=&fullBytes;
             plan=recomp::gpu::planGta5DriverScissor(*bytes,rectangle);
         }
-#if defined(__ANDROID__) && defined(RECOMP_CAPTURE_TILED_RECORDING)
+#if (defined(__ANDROID__) || defined(__APPLE__)) && defined(RECOMP_CAPTURE_TILED_RECORDING)
         if(plan && plan->binned && bytes) {
             // v366e (exact; diag-v366-render-trims2): the bound-surface capture and the 13860-byte state copy below are used only by
             // begin() / recordScissor(). With no recording pending, begin() can run only for caller 823ABBC8 without
@@ -4389,22 +4409,8 @@ bool captureDriverScissor(std::uint32_t device,const std::array<std::uint32_t,4>
 
 // Capture the actual two constant-loading APIs. This preserves ordering between
 // shader literals and application uploads, without interpreting PM4 packets.
-// v599 (thor-fixer, minimap see-through, census only): the radar composite im.fxc #41p reads GeneralParams0 at pixel c230 (and
-// TexelSize at c228); the census showed c230 = 0.5 there. During a census frame every upload or literal load that changes or covers
-// pixel c228-c231 (words 1936-1951) is noted in draw order (RENDER_CENSUS K site=const-c228) with the guest caller and the values,
-// to tell which game function writes them. Outside a census: one range test per upload, one 16-word compare per literal load.
-static void v599NoteRadarConstants(const recomp::gpu::Gta5DriverConstants& c,const std::array<std::uint32_t,16>& before,bool covered,
-                                   bool literals,std::uint32_t caller,std::uint64_t mask,std::uint32_t firstOrHeader,std::uint32_t source) {
-    bool changed=false;for(unsigned k=0;k<16;++k)changed|=c.wordAt(1936+k)!=before[k];
-    if(!(covered || changed) || !recomp::gpu::generic::censusActive())return;
-    char d[400];int at=std::snprintf(d,sizeof d,"caller=%08x kind=%s mask=%016llx first=%08x source=%08x changed=%u",caller,literals?"literals":"upload",
-        (unsigned long long)mask,firstOrHeader,source,unsigned(changed));
-    for(unsigned r=0;r<4 && at>0 && at<int(sizeof d)-60;++r){float f[4];for(unsigned k=0;k<4;++k){const std::uint32_t w=c.wordAt(1936+4*r+k);std::memcpy(&f[k],&w,4);}
-        at+=std::snprintf(d+at,sizeof d-std::size_t(at)," c%u=%g,%g,%g,%g",228+r,f[0],f[1],f[2],f[3]);}
-    recomp::gpu::generic::censusNote("const-c228",d);
-}
 bool captureDriverConstants(std::uint32_t device,std::uint64_t mask,
-        std::uint32_t firstOrHeader,std::uint32_t source,bool literals,std::uint32_t caller=0) {
+        std::uint32_t firstOrHeader,std::uint32_t source,bool literals) {
     if(!inlineRegistry || !inlineGate)return false;
     bool captured=false;
     const bool gated=gateRef([&] {
@@ -4416,13 +4422,8 @@ bool captureDriverConstants(std::uint32_t device,std::uint64_t mask,
         flushInlineConstants(device); // v80: a pending skinning packet precedes this upload / literal load
         auto& constants=driverConstants[device];
         ++(literals?hot.literalLoads:hot.constantUploads);
-        std::array<std::uint32_t,16> v599Before;for(unsigned k=0;k<16;++k)v599Before[k]=constants.wordAt(1936+k); // v599
-        // (an upload's mask bit b, most significant first, is the 16 words at firstRegister - 0x4000 + 16 b: block 1936 is pixel c228-c231)
-        const bool v599Covered=!literals && firstOrHeader>=0x4000 && firstOrHeader-0x4000<=1936 && (1936-(firstOrHeader-0x4000))%16==0 &&
-            (1936-(firstOrHeader-0x4000))/16<64 && ((mask>>(63-(1936-(firstOrHeader-0x4000))/16))&1);
         captured=literals?constants.loadLiteralsViewed(firstOrHeader,source,heapView,dataView):
             constants.uploadViewed(mask,firstOrHeader,source,heapView);
-        if(captured)v599NoteRadarConstants(constants,v599Before,v599Covered,literals,caller,mask,firstOrHeader,source);
         if(!captured && literals) {
             const auto read=[&](std::uint64_t a)->std::optional<std::uint32_t> {
                 if(a>0xFFFFFFFCULL)return std::nullopt;
@@ -4444,7 +4445,7 @@ bool captureDriverConstants(std::uint32_t device,std::uint64_t mask,
 }
 
 bool ownsNativeRendering(std::uint32_t device) {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineGate)return false;
     // v43: nearly every renderer hook asks this before its own gate (about 9 extra lock gates per draw
     // in v35). The answer is the owner mirror; admission is the gate's own refusal check (no live task,
@@ -4477,7 +4478,7 @@ bool ownsNativeRendering(std::uint32_t device) {
 
 void captureReturnedBoundIndexed(std::uint32_t device,std::uint32_t caller,
         const recomp::gpu::Gta5BoundIndexedRequest& request,BoundIndexedCapturePhase phase) noexcept {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(!inlineRegistry || !inlineGate || !inlineGraphics)return;
     // v362 (exact): relaxed RMWs (v349 profiles: this seq_cst fetch_add, which waits for the draw's stores to drain, ~0.4-0.5%
     // of the render thread per bound draw past the 128-record budget). Same counts in the same modification order; every
@@ -4599,7 +4600,7 @@ void captureReturnedBoundIndexed(std::uint32_t device,std::uint32_t caller,
 }
 
 bool capturePreparedRecordedIndexed(PPCContext& ctx) {
-#if defined(__ANDROID__) && defined(RECOMP_CAPTURE_TILED_RECORDING)
+#if (defined(__ANDROID__) || defined(__APPLE__)) && defined(RECOMP_CAPTURE_TILED_RECORDING)
     if(!tileRecordingDevice.load())return false;
     const auto device=ctx.r31.u32;
     if(device!=tileRecordingDevice.load() || preparedTileIndexedSequence || !inlineGate || !inlineRegistry)
@@ -4635,7 +4636,7 @@ bool capturePreparedRecordedIndexed(PPCContext& ctx) {
 #endif
 }
 bool finishPreparedRecordedIndexed(bool returned) {
-#if defined(__ANDROID__) && defined(RECOMP_CAPTURE_TILED_RECORDING)
+#if (defined(__ANDROID__) || defined(__APPLE__)) && defined(RECOMP_CAPTURE_TILED_RECORDING)
     auto& prepared=preparedTileIndexedSequenceRef(); // v362
     const auto sequence=prepared;if(!sequence)return false;
     prepared=0;
@@ -4782,9 +4783,7 @@ void genericBoundIndexed(std::uint32_t device,const recomp::gpu::Gta5BoundIndexe
         const auto start=std::uint64_t{indexBase}+std::uint64_t{request.startIndex}*size;
         if(!request.indexCount || request.indexCount>1'000'000 || start>0xFFFFFFFFull){why="index-range";return;}
         const auto physical=[](std::uint32_t address){return (address&0x1FFFFFFFu)+(((address>>20)+512u)&0x1000u);};
-        // v571 (index_view.h): an odd start of 16-bit indices is 2 bytes past a 4-byte boundary, which the view refuses: such draws
-        // were skipped whole (Prologue census: 22 vfx_decal pieces per frame)
-        const auto* raw=graphicsIndexView(physical(static_cast<std::uint32_t>(start)),request.indexCount*size);
+        const auto* raw=graphicsIndexView(physical(static_cast<std::uint32_t>(start)),request.indexCount*size); // (index view, odd 16-bit start)
         if(!raw){why="index-data";return;}
         recomp::gpu::generic::DrawInput in;
         in.indices.swap(s.indices);
@@ -4939,7 +4938,7 @@ bool finishNativeBoundIndexedChecked(PPCContext& ctx,std::uint8_t* base) {
     (void)base;return false;
 #endif
     (void)base;
-#if defined(__ANDROID__) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
     const auto device=ctx.r31.u32;
     if(!ownsNativeRendering(device))return false;
     const auto reject=[&](const char* stage) {
@@ -5208,12 +5207,12 @@ bool finishNativeBoundIndexedChecked(PPCContext& ctx,std::uint8_t* base) {
     (void)ctx;return false;
 #endif
 }
-#if defined(__ANDROID__) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
 #include "native_prepared_indexed_original.h"
 #endif
 
 bool finishNativeInlineBegin(PPCContext& ctx,std::uint8_t* base) {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     const auto device=ctx.r31.u32;
     if(!ownsNativeRendering(device))return false;
     bool completed=false,fallback=false; // v156: fallback = run the original BeginVertices
@@ -5271,7 +5270,7 @@ bool finishNativeInlineBegin(PPCContext& ctx,std::uint8_t* base) {
 // output pointers and CPU metadata; EndVertices consumes the actual filled
 // buffers and requires a completed native submission before either is reused.
 bool finishNativeInlineIndexedBegin(PPCContext& ctx,std::uint8_t* base) {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     const auto device=ctx.r31.u32;
     if(!ownsNativeRendering(device))return false;
     bool fallback=false; // v26: outputs outside the caller's argument area -> original Begin
@@ -5358,7 +5357,7 @@ void bindRendererInlineCapture(recomp::bootstrap::GuestImportRegistry* registry,
     originalEndRecordingGate=std::move(endRecordingGate);
     nativeSceneInterrupt=std::move(sceneInterrupt);stoppedInitialTileQueue.reset();stoppedInitialRingRetired=false;
     nativeSceneContinuation=std::move(sceneContinuation);nativeSceneScheduler=std::move(sceneScheduler);activeSceneQueue=nullptr;
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
     liveNativeScene.reset();
 #endif
     activeEndQueue=nullptr;stoppedEndQueue.reset();stoppedEndCpuState.reset();stoppedEndCpuReturned=false;endRestoredScissor.reset();
@@ -5376,14 +5375,14 @@ void bindRendererInlineCapture(recomp::bootstrap::GuestImportRegistry* registry,
 #if defined(RECOMP_CAPTURE_TILED_RECORDING)
     tileRecordingDevice.store(0);tileRecordingStop.store(nullptr);tileRecordingDiagnostic={};stoppedTileResolve.reset();stoppedTileEnd.reset();
     recordedTileResolves.clear();originalResolveRecordingDevice=0;
-#if defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
     pendingNativeSceneInputs.reset();
     pendingNativeSceneResolves.reset();pendingNativeSceneStorage.reset();
     pendingNativeSceneCommands.reset();
 #endif
 #endif
     firstUnsupportedQueue.reset();firstUnsupportedScissor.reset();
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     // ABI22/23/24 targets hold Vulkan images too. They must not survive a
     // renderer generation or retain a reference to the previous GPU owner.
     rectangleMrtTargets.clear();offsetSampleTargets.clear();liveEdram32.clear();
@@ -5418,7 +5417,7 @@ void bindRendererDiagnosticV158Pair(std::function<bool(const std::vector<std::ui
 void unbindRendererInlineCapture() {
     // Keep the stopped diagnostic's owned copies for saveStoppedRendererDraw,
     // which runs after this function and worker retirement. Only bind resets it.
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     const auto found=liveTargets.find(latestLiveDevice);
     if(found!=liveTargets.end() && found->second.valid)latestLiveHalf=found->second.image->readHalf();
     preserveStoppedFixed16Targets();
@@ -5440,7 +5439,7 @@ void unbindRendererInlineCapture() {
     latestQueryCommandTrace.reset();
 }
 std::optional<bool> captureRendererTileSubmission(std::uint32_t writeWord) {
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__)
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__))
     auto* queue=activeEndQueue?activeEndQueue:activeSceneQueue;
     if(!queue)return std::nullopt;
     if(!inlineRegistry)return false;
@@ -5456,7 +5455,7 @@ std::optional<bool> captureRendererTileSubmission(std::uint32_t writeWord) {
     (void)writeWord;return std::nullopt;
 #endif
 }
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
 #include "renderer_runtime_maintenance.inc"
 #else
 bool submitRendererRuntimeMaintenance(std::uint32_t writeWord) {(void)writeWord;return false;}
@@ -5499,7 +5498,7 @@ void compareRendererInlineInputs(const recomp::gpu::NativeColorChainCapture& com
             }
         }
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(matched && graphics && program && program->matches(commandCapture.active())) {
         const auto& half=latestLiveHalf;
         bool same=half && half->size()==1280*720*8;
@@ -5527,7 +5526,7 @@ void dumpStoppedRendererTextureDescriptions(
         recomp::gpu::VulkanEngine* graphics,
         const recomp::gpu::NativeColorChainProgram* programs) {
     (void)graphics;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     rendererLog("RENDER_API_TRANSLATED_COUNTS textures0=%u textures1=%u textures2=%u\n",
         completedTranslatedTextures[0],completedTranslatedTextures[1],completedTranslatedTextures[2]);
     for(const auto& [object,resolved]:liveResolvedTextures) {
@@ -5623,7 +5622,7 @@ bool saveStoppedRendererDraw(const std::string& directory) {
         queueOk=recomp::gpu::writeNativeResolveFailureCapture(*firstNativeResolveFailure,meta,save)&&queueOk;
         meta.close();queueOk=bool(meta)&&queueOk;
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     queueOk=saveStoppedFixed16Targets(directory,save) && queueOk;
 #endif
 #if defined(RECOMP_CAPTURE_TILED_RECORDING)
@@ -6397,7 +6396,7 @@ PPC_FUNC(sub_823B9B58) {
     // With it, preparation and the epilogue remain original; a fenced native
     // draw replaces only raw emission. Preserve failed-boundary inputs too.
     try {
-#if defined(__ANDROID__) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
+#if (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_bound_geometry_shader_pack.h") && __has_include("native_prepared_indexed_original.h")
         nativePreparedIndexedOriginal(ctx,base);
 #else
         __imp__sub_823B9B58(ctx,base);
@@ -6574,7 +6573,7 @@ PPC_FUNC(sub_836BE058) {
 }
 PPC_FUNC_IMPL(__imp__sub_8232DFA8);
 PPC_FUNC(sub_8232DFA8) {
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
     if(submitLiveNativeScene(ctx.r3.u32,[&]{__imp__sub_8232DFA8(ctx,base);}))return;
 #endif
     // During original EndTiling, the outer exclusive scope routes real MMIO
@@ -6584,7 +6583,7 @@ PPC_FUNC(sub_8232DFA8) {
     try {__imp__sub_8232DFA8(ctx,base);}
     catch(...) {
         rendererLog("RENDER_SUBMISSION_STOP caller=%08x device=%08x\n",caller,device);
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         // One bounded caller backtrace on failure, not per-frame tracing.
         // Library-relative PCs identify the API that still submitted work.
         unsigned frames=0;
@@ -6605,7 +6604,7 @@ PPC_FUNC(sub_8232DFA8) {
 PPC_FUNC_IMPL(__imp__sub_836B1570);
 PPC_FUNC(sub_836B1570) {
     PPC_FUNC_PROLOGUE();
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__) && __has_include("native_logical_geometry_shader_pack.h")
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__)) && __has_include("native_logical_geometry_shader_pack.h")
     if(beginLiveSceneSelect(ctx.r3.u32,[&]{__imp__sub_836B1570(ctx,base);}))return;
 #endif
     __imp__sub_836B1570(ctx,base);
@@ -6624,7 +6623,7 @@ PPC_FUNC_IMPL(__imp__sub_82476080);
 PPC_FUNC(sub_82476080) {
     PPC_FUNC_PROLOGUE();
     capturePendingTileEnd(ctx);
-#if defined(RECOMP_CAPTURE_TILED_RECORDING) && defined(__ANDROID__)
+#if defined(RECOMP_CAPTURE_TILED_RECORDING) && (defined(__ANDROID__) || defined(__APPLE__))
     if(tileRecordingDevice.load() && ctx.r3.u32==tileRecordingDevice.load() && inlineRegistry && originalEndRecordingGate &&
        stoppedTileEnd && stoppedTileEnd->liveVideoRootMatches==std::optional{true} &&
        pendingNativeSceneInputs && pendingNativeSceneResolves && pendingNativeSceneStorage && pendingNativeSceneCommands &&
@@ -6813,12 +6812,12 @@ PPC_FUNC(sub_823B9FD0) {
     if(ownsNativeRendering(device)) {
         // Ordinary uploads and shader literals share one ordered native cache.
         // Original 823B9FD0 only copies these blocks into command storage.
-        if(!captureDriverConstants(device,mask,first,source,false,static_cast<std::uint32_t>(ctx.lr)))
+        if(!captureDriverConstants(device,mask,first,source,false))
             throw std::runtime_error("Native shader constant upload is unsupported or unowned");
         return;
     }
     __imp__sub_823B9FD0(ctx,base);
-    captureDriverConstants(device,mask,first,source,false,static_cast<std::uint32_t>(ctx.lr));
+    captureDriverConstants(device,mask,first,source,false);
 }
 PPC_FUNC_IMPL(__imp__sub_823BA1A8);
 extern "C" std::atomic<bool> recomp_v274_baseline; std::atomic<bool> recomp_v274_baseline{false}; // v274 (set with the renderer's A/B windows)
@@ -6907,12 +6906,12 @@ PPC_FUNC(sub_823BB448) {
         // Only emits LOAD_ALU_CONSTANT packets and advances the old command
         // cursor. Native constants are applied to each actual draw; there is
         // no guest CPU shadow or semantic return value to replace here.
-        if(!captureDriverConstants(device,0,header,source,true,static_cast<std::uint32_t>(ctx.lr)))
+        if(!captureDriverConstants(device,0,header,source,true))
             throw std::runtime_error("Native shader literal upload is unsupported or unowned");
         return;
     }
     __imp__sub_823BB448(ctx,base);
-    captureDriverConstants(device,0,header,source,true,static_cast<std::uint32_t>(ctx.lr));
+    captureDriverConstants(device,0,header,source,true);
 }
 // v80: 823BDB28 (the skinned draw 823BBBD8's SET_SHADER_CONSTANTS reservation, gta5_inline_constants.h).
 // The original reserves the packet and returns the data pointer; the packet is remembered and its

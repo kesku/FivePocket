@@ -1,0 +1,173 @@
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -390,6 +390,20 @@
+         g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
+ }
+ 
++// dusk-speckle (register LOD): a tfetch whose UseRegisterLOD bit is set samples the mip level a setTexLOD put in the
++// LOD register (the sampler still applies the fetch constant's LOD bias and mip range).
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
++}
++
++float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
++{
++    float3 dir = cubeDir(texCoord);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lod);
++}
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -251,6 +251,47 @@
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    // dusk-speckle (register LOD): setTexLOD (fetch opcode 24) loads the LOD register from the FIRST component of its
++    // source; every later tfetch whose UseRegisterLOD bit is set samples that mip level instead of the level the GPU
++    // computes from screen derivatives. Both were dropped (the setTexLOD without output, the bit unread), so GTA V's
++    // reflection map was blurred from the wrong level and fetched at the wrong level (108 pack pixel shaders).
++    // The local is declared only in shaders that use it: every other shader translates to the same text as before.
++    const bool registerLod = instr.opcode == FetchOpcode::TextureFetch && instr.useRegLod != 0;
++    if (instr.opcode == FetchOpcode::SetTextureLod || registerLod)
++    {
++        if (!texLodDeclared)
++        {
++            out.insert(texLodDeclaration, "\tfloat texLod = 0.0;\n");
++            texLodDeclared = true;
++        }
++    }
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        if (instr.isPredicated)
++        {
++            indent();
++            println("if ({}p0)", instr.predCondition ? "" : "!");
++            indent();
++            out += "{\n";
++            ++indentation;
++        }
++        indent();
++        println("texLod = r{}.{};", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++    if (registerLod && instr.dimension != TextureDimension::Texture2D && instr.dimension != TextureDimension::TextureCube)
++    {
++        // (none in the GTA V corpus: 183 two-dimensional fetches and 1 cube fetch use the register)
++        fmt::println(stderr, "register-LOD fetch of an unsupported dimension {}", uint32_t(instr.dimension));
++        std::exit(3);
++    }
++
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
+         return;
+ 
+@@ -369,6 +410,9 @@
+     if (instr.opcode != FetchOpcode::TextureFetch || instr.dimension != TextureDimension::Texture3D)
+         out += dimension;
+ 
++    if (registerLod)
++        out += "Lod"; // tfetch2DLod / tfetchCubeLod: SampleLevel with the LOD register
++
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+         out += "Bicubic";
+@@ -404,6 +448,9 @@
+             break;
+     }
+ 
++    if (registerLod)
++        out += ", texLod";
++
+     out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+@@ -418,6 +465,31 @@
+         indent();
+         out += "}\n";
+     }
++}
++
++// fold-fixer2 (2026-10-22, F7): a Xenos ALU instruction reads the sources of its vector and its scalar operation before
++// either writes. This translator emits the vector assignment first and the scalar expression after it, so a scalar operation
++// whose temp-register source component the paired vector operation writes read the NEW value (GTA V water#20p: the far-ocean
++// fill's fog amount came from a reflection vector component, F7's unfogged dark-blue band). In that case only, the scalar
++// computation (p0 / ps / a0) is emitted before the vector assignment; its register write stays after it. Every other
++// instruction is emitted exactly as before. Same rule as local-analysis/fold-glitch-1022/coissue/scan_coissue.py.
++static bool coIssueHazard(const AluInstruction& instr)
++{
++    if (instr.exportData || instr.vectorDestRelative || instr.vectorWriteMask == 0)
++        return false;
++    const uint32_t vop = uint32_t(instr.vectorOpcode), sop = uint32_t(instr.scalarOpcode);
++    if (vop >= 24 && vop <= 27) // vector kills write no register
++        return false;
++    auto reads = [&](uint32_t reg, uint32_t comp) { return reg == instr.vectorDest && ((instr.vectorWriteMask >> comp) & 1) != 0; };
++    if (sop == 33 || sop == 50) // setp_clr, retain_prev
++        return false;
++    if (sop >= 42 && sop <= 47) // mulsc/addsc/subsc: the temp operand
++        return reads((sop & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C), instr.src3Swizzle & 3);
++    if (!instr.src3Select || (instr.src3Register & 64))
++        return false;
++    const uint32_t reg = instr.src3Register & 63, a = ((instr.src3Swizzle >> 6) + 3) & 3, b = instr.src3Swizzle & 3;
++    const bool two = sop == 0 || sop == 2 || sop == 5 || sop == 6 || sop == 23 || sop == 24 || sop == 25;
++    return reads(reg, a) || (two && reads(reg, b));
+ }
+ 
+ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -754,6 +826,7 @@
+         println("a0 = (int)clamp(floor(({}).w + 0.5), -256.0, 255.0);", op(VECTOR_0).expression);
+     }
+ 
++    const size_t coIssueVectorStart = out.size(); // fold-fixer2 (coIssueHazard)
+     uint32_t vectorWriteMask = instr.vectorWriteMask;
+     if (instr.exportData)
+         vectorWriteMask &= ~instr.scalarWriteMask;
+@@ -1033,6 +1106,7 @@
+         out += ";\n";
+     }
+ 
++    const size_t coIssueScalarStart = out.size(); // fold-fixer2 (coIssueHazard)
+     if (instr.scalarOpcode != AluScalarOpcode::RetainPrev)
+     {
+         if (instr.scalarOpcode >= AluScalarOpcode::SetpEq && instr.scalarOpcode <= AluScalarOpcode::SetpRstr)
+@@ -1257,6 +1331,9 @@
+             break;
+         }
+     }
++
++    if (coIssueHazard(instr)) // fold-fixer2: the scalar computation reads its sources before the vector write
++        out = out.substr(0, coIssueVectorStart) + out.substr(coIssueScalarStart) + out.substr(coIssueVectorStart, coIssueScalarStart - coIssueVectorStart);
+ 
+     uint32_t scalarWriteMask = instr.scalarWriteMask;
+     if (instr.exportData)
+@@ -1991,6 +2068,8 @@
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
++    texLodDeclaration = out.size(); // dusk-speckle: where "float texLod" goes if the shader turns out to use the LOD register
++    texLodDeclared = false;
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,10 @@
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    // dusk-speckle (register LOD): the offset in `out` right after the register declarations, and whether
++    // "float texLod" was inserted there (recompile(TextureFetchInstruction) does it at the first use).
++    size_t texLodDeclaration = 0;
++    bool texLodDeclared = false;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;

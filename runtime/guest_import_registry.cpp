@@ -2,6 +2,7 @@
 extern "C" __attribute__((weak)) std::atomic<bool> recomp_v248_baseline; // v248 (generic_renderer.cpp switch poll)
 extern "C" __attribute__((weak)) bool recomp_mw_domain_contended() noexcept; // main-wait (guest_cooperative_executor.cpp)
 #include "guest_import_registry.h"
+#include "native_gamepad_delivery.h"
 #include "diag_timeline.h" // v195 DIAGNOSTIC: wait objects and signals on the timeline
 #include "physical_adjacent_cover.h" // v207
 #include "cs_range_query.h" // v217
@@ -22,28 +23,19 @@ namespace recomp_ms {
     }
     ::sched_yield();
 }
-// scene-wait (scene_wait_sw.h): would sleepZeroYield skip the host yield now? (The same decision, without its counter.)
-// scene-wait:yield-skip:begin (host test: tests/extract_glue.py compiles the text between these markers)
-inline bool yieldSkippedNow(std::uint32_t token) noexcept {
-    const auto& sw = recomp_v245::state();
-    return skipYield(state().mode.load(std::memory_order_relaxed), sw.swappedView.load(std::memory_order_relaxed),
-                     sw.extrasEnabled.load(std::memory_order_relaxed), token == recomp_v245::MainToken);
-}
-// scene-wait:yield-skip:end
 } // namespace recomp_ms
 #include "diag_log_sample.h" // quiet-log: quietLog / quietLogThin (diag-quiet-log)
 #include <array>
 #include <atomic>
 #include <mutex>
 #include <unistd.h>
-#include "sens_jobs.h" // sens-jobs (v535 -> v559, measurement only): the spin in the producers' hook
 // v217 A/B (set by the renderer every 60 presents from files/private-trace/diag-v217-baseline): true restores v216's
 // full critical-section scans and thread-return broadcasts.
 extern "C" std::atomic<bool> recomp_v217_baseline;
 std::atomic<bool> recomp_v217_baseline{false};
 #include "recomp_app_dir.h" // data-paths: the app's files directory. imports-fast (agent F, imports_fast.h): the in-run switch (files/private-trace/diag-imports-fast, polled by the renderer).
-extern "C" std::atomic<bool> recomp_imports_fast; std::atomic<bool> recomp_imports_fast{false}; // (two lines joined: the next line is native_imports.h's, and every later line keeps its number)
-#include "native_imports.h" // native-imports (lane native-syscalls): the locked paths' hooks csSlow / csRetire / csRetireAll; definitions in native_imports.inc (last line)
+extern "C" std::atomic<bool> recomp_imports_fast;
+std::atomic<bool> recomp_imports_fast{false};
 namespace {
 struct TimelineWaitObject { // v195: the object the next park waits on (restored after the handler returns)
     std::uint32_t previous;
@@ -73,7 +65,7 @@ public:
 private:
     bool held_=false;
 };
-RECOMP_PLAY_COUNTER(unsigned long long) csFastEnters{0},csFastLeaves{0},csFastTries{0},csFastFallbacks{0}; // play-config-2 (v527; play_build.h): counts only (RENDER_DIAG_REGISTRY_CS_FAST, a host test hook); in the play build fetch_add on them does nothing
+std::atomic<unsigned long long> csFastEnters{0},csFastLeaves{0},csFastTries{0},csFastFallbacks{0};
 // main-wait (mw_cs_spin.h): a domain-mate waits for this task's permit (executor; weak: absent = never).
 inline bool mwDomainContended() noexcept { return &recomp_mw_domain_contended && recomp_mw_domain_contended(); }
 // v197: a recorded critical-section rejection (lastCriticalSectionRejection_, R-protected) is cleared by the next
@@ -102,8 +94,6 @@ inline std::atomic<std::uint32_t>& handleEpoch(const void* registry,std::uint32_
 #define RECOMP_WAIT_EPOCH_SWITCH RECOMP_APP_PATH("/private-trace/diag-registry-wait-epoch")
 #endif
 bool waitEpochEnabled() { static const bool on=::access(RECOMP_WAIT_EPOCH_SWITCH,F_OK)==0; return on; }
-// registry-input (2026-10-15): diag-input-unlocked: the native gamepad reader runs outside the registry lock (see dispatchUnderRegistryLock).
-bool inputUnlockedEnabled() { static const bool on=::access(RECOMP_APP_PATH("/private-trace/diag-input-unlocked"),F_OK)==0; return on; }
 #if defined(RECOMP_DIAG_SWITCH_DIR)
 #define RECOMP_CS_FAST_SWITCH RECOMP_DIAG_SWITCH("diag-registry-cs-fast") // host tests
 #else
@@ -115,8 +105,6 @@ bool csFastEnabled() {
 }
 }
 extern "C" { std::atomic<unsigned> recomp_mw_cs_spin_us{0}; } // main-wait: diag-mw-cs-spin budget (0 = off)
-extern "C" { std::atomic<unsigned> recomp_sw_watch_us{0}; } // scene-wait: diag-sw-watch budget (0 = off)
-extern "C" __attribute__((weak)) bool recomp_sw_quiet() noexcept; // scene-wait (guest_cooperative_executor.cpp; absent = never)
 namespace recomp::bootstrap {
 bool guestExclusiveScopeActive() noexcept;
 // main-wait host test hook: watches, cleared, expired, stopped, acquired, queued, watch ns.
@@ -135,7 +123,6 @@ std::array<unsigned long long,2> waitEpochCounters() noexcept { return {waitEpoc
 #include <unistd.h> // v126: access()
 #include <sched.h> // v168: sched_yield()
 #include "poll_sleep_v266.h" // v266
-#include "scene_wait_sw.h" // scene-wait: diag-sw-watch / diag-sw-watch-500
 #include <deque>
 #include <array>
 #include <chrono>
@@ -204,6 +191,15 @@ void noteNativeSubmissionMayCommitAt(unsigned site) noexcept {
 }
 // Attempt v42: defined before guest_registry_concurrency.h poisons the member name mutex_.
 std::mutex& GuestImportRegistry::registryMutex() const noexcept { return mutex_; }
+// ios-handle-describe (Claude 2026-10-21; DIAGNOSTIC): c412 hung with main waiting on a job-completion queue and every worker
+// idle. The stall watcher (ios_sampler.h) asks, for each waited handle, the registry's kernel object state: a signalled
+// object (count > 0) under a sleeping waiter is a lost wake in the runtime. Installed once from dispatch(); it try-locks the
+// registry mutex for up to 50 ms and reports "registry-busy" otherwise (the hang may hold it).
+namespace { std::function<int(std::uint32_t,char*,std::size_t)> iosHandleDescriber; std::atomic<bool> iosHandleDescriberReady{false}; }
+extern "C" int recomp_ios_describe_handle(std::uint32_t handle,char* out,std::size_t size) noexcept {
+    if(!iosHandleDescriberReady.load(std::memory_order_acquire))return std::snprintf(out,size,"describer-not-installed");
+    try {return iosHandleDescriber(handle,out,size);} catch(...) {return std::snprintf(out,size,"describer-failed");}
+}
 } // namespace recomp::bootstrap
 #include "save_sandbox.h" // save-sandbox: diag-save-sandbox (filesRootFor: the root of the saves and the profile)
 #include "guest_local_profile.h" // v142: local signed-in profile
@@ -724,7 +720,7 @@ namespace {
 // (calls [0], completed [1], failed [2], zero-length [3], in flight [6]); zeroed by initialize() and reset().
 struct FastDelayCounters {
     std::atomic<const GuestImportRegistry*> owner{nullptr};
-    RECOMP_PLAY_COUNTER_UINT64 calls{0}, completed{0}, failed{0}, zeros{0}; std::atomic<std::uint64_t> inflight{0}; // play-config-2 (v527): the lock-free zero delay's four counts feed thread_delays= only and are not counted in the play build (the locked delays still are); inflight stays an atomic: its acquire-release +1 / -1 is an ordering point of that path
+    std::atomic<std::uint64_t> calls{0}, completed{0}, failed{0}, zeros{0}, inflight{0};
     void clear() noexcept { calls = 0; completed = 0; failed = 0; zeros = 0; inflight = 0; }
 };
 std::array<FastDelayCounters, 32> fastDelayCounterTable;
@@ -776,7 +772,7 @@ template<class Bits> void syncTlsSlotMirror(const GuestImportRegistry* registry,
     for(std::size_t w=0;w<32;++w){std::uint64_t v=0;for(std::size_t b=0;b<64;++b)if(w*64+b<slots.size() && slots.test(w*64+b))v|=std::uint64_t{1}<<b;
         m->bits[w].store(v,std::memory_order_release);}
 }
-std::atomic<unsigned long long> v252ArgFast{0};RECOMP_PLAY_COUNTER(unsigned long long) v252TlsFast{0}; // play-config-2: v252TlsFast is a count only (the last field of RENDER_GENERIC_V210)
+std::atomic<unsigned long long> v252ArgFast{0},v252TlsFast{0};
 }
 extern "C" unsigned long long recomp_v252_arg_fast() noexcept { return v252ArgFast.load(std::memory_order_relaxed); }
 extern "C" unsigned long long recomp_v252_tls_fast() noexcept { return v252TlsFast.load(std::memory_order_relaxed); }
@@ -827,7 +823,7 @@ bool GuestImportRegistry::initialize(
     lastMemoryStatistics_.reset();
     imageProtections_ = {};
     { CsAll csAllGuard; // v197
-    ::recomp::native_imports::csRetireAll(this); ::recomp::imports_fast::clearAll(criticalSections_, ::recomp::imports_fast::csGenerations()); // native-imports: no fast entry outlives a record
+    ::recomp::imports_fast::clearAll(criticalSections_, ::recomp::imports_fast::csGenerations());
     nativeCriticalSectionWaitsBound_=false;criticalSectionWaits_.clear();criticalSectionWaitStatistics_={}; }
     nativeHighPriorityTiersBound_=false;nativeHighPriorityTiersRequests_=0;
     lastCriticalSectionRejection_.reset();csRejectionRecorded.store(false,std::memory_order_release); // (v197)
@@ -960,7 +956,7 @@ void GuestImportRegistry::reset() {
     lastMemoryStatistics_.reset();
     imageProtections_ = {};
     { CsAll csAllGuard; // v197
-    ::recomp::native_imports::csRetireAll(this); ::recomp::imports_fast::clearAll(criticalSections_, ::recomp::imports_fast::csGenerations()); // native-imports: no fast entry outlives a record
+    ::recomp::imports_fast::clearAll(criticalSections_, ::recomp::imports_fast::csGenerations());
     nativeCriticalSectionWaitsBound_=false;criticalSectionWaits_.clear();criticalSectionWaitStatistics_={}; }
     nativeHighPriorityTiersBound_=false;nativeHighPriorityTiersRequests_=0;
     lastCriticalSectionRejection_.reset();csRejectionRecorded.store(false,std::memory_order_release); // (v197)
@@ -2656,7 +2652,7 @@ GuestImportDispatchResult GuestImportRegistry::dispatchTitleTerminationRegistrat
 bool GuestImportRegistry::bindNativeEdramTrainingPolicy(std::uint32_t calibrationLock) {
     RECOMP_REGISTRY_LOCK(lock);
     CsAll csAllGuard; // v197
-    const auto section = criticalSections_.find(calibrationLock); ::recomp::native_imports::csSlow(this, calibrationLock); // native-imports
+    const auto section = criticalSections_.find(calibrationLock);
     if (!experimentalInitializationBound_ || graphicsInitialized_ || edramCalibrationLock_ ||
         section == criticalSections_.end() || section->second.ownerToken || section->second.recursionCount ||
         !criticalSectionStorageMatches(calibrationLock,section->second)) return false;
@@ -2689,7 +2685,7 @@ GuestImportDispatchResult GuestImportRegistry::dispatchNativeEdramTraining(std::
     }
     auto* thread = findThreadObject(RECOMP_CURRENT_GUEST_TOKEN);
     CsAll csAllGuard; // v197
-    const auto section = criticalSections_.find(edramCalibrationLock_); ::recomp::native_imports::csSlow(this, edramCalibrationLock_); // native-imports
+    const auto section = criticalSections_.find(edramCalibrationLock_);
     if (!experimentalInitializationBound_ || !completedExperimentalInitialization_ || !graphicsInitialized_ ||
         !graphicsBackend_ || !graphicsBackend_->ready() || !thread || thread->returned || thread->suspendCount ||
         !thread->criticalRegionDepth || !edramCalibrationLock_ || section == criticalSections_.end() ||
@@ -2870,181 +2866,25 @@ void diagnosticDumpImports() {
 }
 
 extern "C" std::atomic<unsigned> recomp_v348_audio_spin_us; // v348 (generic_renderer.cpp's switch poll)
-namespace {
-// scene-wait (scene_wait_sw.h; diag-sw-watch / diag-sw-watch-500): called after the unchanged Sleep(0) fast path. When this
-// is main's Sleep(0) inside the scene-item poll (SleepEx's frame at guest r1 = sp), the guest would call Sleep(0) again and
-// the executor needs nothing from main, the call watches the poll's count and flag words until the loop would proceed,
-// the executor needs main, or the budget is spent; when the loop will proceed already it returns at once. true = this call
-// passed its time here (watched, host yields included, or nothing to wait for: no yield step); false = v474's path follows
-// (not that call site, or the executor needs main now). Reads only: the
-// frame words are main's own saves, the count and flag are the words the loop reads next. Out of line: dispatch keeps its
-// CFG (and PGO record).
-// scene-wait:watch:begin (host test: tests/extract_glue.py compiles the text between these markers)
-[[gnu::noinline]] bool sceneWaitWatch(const GuestAddressSpace& space, std::uint32_t sp, std::uint32_t token,
-                                      unsigned budgetUs, bool idleWait) noexcept {
-    if (token != recomp_v245::MainToken) return false; // the poll runs on main; other stacks are never read
-    const auto load = [](const std::uint8_t* p) noexcept {
-        return __builtin_bswap32(__atomic_load_n(reinterpret_cast<const std::uint32_t*>(p), __ATOMIC_RELAXED));
-    };
-    const auto read32 = [&space, &load](std::uint32_t address, std::uint32_t& value) noexcept {
-        const std::uint8_t* p = (address & 3u) == 0 ? space.translate(address) : nullptr;
-        if (p == nullptr) return false;
-        value = load(p);
-        return true;
-    };
-    recomp_sw::PollFrame frame{};
-    if (!recomp_sw::identify(sp, read32, frame)) return false;
-    auto& c = recomp_sw::counters();
-    c.identified.fetch_add(1, std::memory_order_relaxed);
-    const auto quiet = [] { return &recomp_sw_quiet != nullptr && recomp_sw_quiet(); };
-    const std::uint8_t* const countWord = space.translate(frame.countAddress);
-    const std::uint8_t* const flagWord = space.translate(recomp_sw::FlagAddress);
-    if (countWord == nullptr || flagWord == nullptr) return false;
-    // The two words the loop reads after Sleep(0) returns (both read by the guest itself there, so mapped).
-    std::uint32_t lastCount = 0; // idle-wait: the count the watch last read (compared with the marked read before a WFE)
-    const auto pollRead = [countWord, flagWord, &frame, &load, &lastCount](std::uint32_t address, std::uint32_t& value) noexcept {
-        value = load(address == frame.countAddress ? countWord : flagWord);
-        if (address == frame.countAddress) lastCount = value;
-        return true;
-    };
-    std::uint32_t count = 0, flag = 0;
-    (void)pollRead(frame.countAddress, count);
-    (void)pollRead(recomp_sw::FlagAddress, flag);
-    if (!recomp_sw::sleepsAgain(count, flag, frame.consumed)) { // the loop proceeds: return without the yield step
-        c.ready.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    if (!quiet()) return false; // the executor needs main: v474's path (the next Sleep(0) / entry acts)
-    c.watches.fetch_add(1, std::memory_order_relaxed);
-    bool skip = recomp_ms::yieldSkippedNow(token);
-    std::uint64_t spentNs = 0;
-    const auto end = recomp_sw::watch(frame, std::uint64_t{budgetUs} * 1000u, pollRead, quiet,
-        [] { return registryTicksToNs(registryTicks()); },
-        [&skip, token, idleWait, countWord, &lastCount, &c](unsigned i) noexcept { // between two checks, as the old path between two Sleep(0) checks
-            if ((i & 15u) == 0) skip = recomp_ms::yieldSkippedNow(token);
-            if (!skip) ::sched_yield();
-#if defined(__aarch64__)
-            else if (idleWait) { // idle-wait (scene_wait_sw.h): mark the count word, wait for an event unless it changed already
-                std::uint32_t marked;
-                asm volatile("ldxr %w0, [%1]" : "=&r"(marked) : "r"(countWord) : "memory");
-                if (__builtin_bswap32(marked) == lastCount) {
-                    const auto t0 = registryTicks();
-                    asm volatile("wfe" ::: "memory");
-                    c.wfe.fetch_add(1, std::memory_order_relaxed);
-                    if (registryTicksToNs(registryTicks() - t0) > recomp_sw::WfeSlowNs) c.wfeSlow.fetch_add(1, std::memory_order_relaxed);
-                } // (no CLREX: v511 ran one after every wait and every WFE returned at once, 790,000 per window: clearing the
-                  // mark is itself an event. The mark stays, as in the kernel's own compare-and-wait.)
-            }
-            else asm volatile("yield" ::: "memory");
-#endif
-        }, &spentNs);
-    (end == recomp_sw::End::Changed ? c.changed : end == recomp_sw::End::Expired ? c.expired : c.unquiet)
-        .fetch_add(1, std::memory_order_relaxed);
-    c.watchNs.fetch_add(spentNs, std::memory_order_relaxed);
-    if (spentNs > c.maxNs.load(std::memory_order_relaxed)) c.maxNs.store(spentNs, std::memory_order_relaxed); // (main only)
-    return true;
-}
-// main-wait (scene_wait_main.h; attempt v528: diag-sw-spin-first / -flag-mark / -producer-wake / -no-yield / -late): takes
-// sceneWaitWatch's place when one of those switches stands. The same recognition of the call site, the same two words and
-// the same answers (true = this call passed its time here; false = v474's path follows: not that call site, or the executor
-// needs main now); between two checks the time passes as scene_wait_main.h's watchMain orders it: a spin first, a sleep in
-// the kernel that the producers' hook ends, the idle wait with an event for either word, one host yield per watch. Reads
-// of guest memory only (the marked read of the idle wait included). Out of line, called from sceneWaitOrYield only.
-[[gnu::noinline]] bool sceneWaitMain(const GuestAddressSpace& space, std::uint32_t sp, std::uint32_t token,
-                                     unsigned budgetUs, bool idleWait, unsigned mode) noexcept {
-    if (token != recomp_v245::MainToken) return false; // main only, as sceneWaitWatch: no other thread's stack is read
-    const auto load = [](const std::uint8_t* p) noexcept {
-        return __builtin_bswap32(__atomic_load_n(reinterpret_cast<const std::uint32_t*>(p), __ATOMIC_RELAXED));
-    };
-    const auto read32 = [&space, &load](std::uint32_t address, std::uint32_t& value) noexcept {
-        const std::uint8_t* p = (address & 3u) == 0 ? space.translate(address) : nullptr;
-        if (p == nullptr) return false;
-        value = load(p);
-        return true;
-    };
-    recomp_sw::PollFrame frame{};
-    if (!recomp_sw::identify(sp, read32, frame)) return false;
-    auto& c = recomp_sw::counters();
-    c.identified.fetch_add(1, std::memory_order_relaxed);
-    const auto quiet = [] { return &recomp_sw_quiet != nullptr && recomp_sw_quiet(); };
-    const std::uint8_t* const countWord = space.translate(frame.countAddress);
-    const std::uint8_t* const flagWord = space.translate(recomp_sw::FlagAddress);
-    if (countWord == nullptr || flagWord == nullptr) return false;
-    // The two words the loop reads after Sleep(0) returns: the flag's address gives the flag, the frame's r31 the count.
-    const auto pollRead = [countWord, flagWord, &load](std::uint32_t address, std::uint32_t& value) noexcept {
-        value = load(address == recomp_sw::FlagAddress ? flagWord : countWord);
-        return true;
-    };
-    std::uint32_t count = 0, flag = 0;
-    (void)pollRead(frame.countAddress, count);
-    (void)pollRead(recomp_sw::FlagAddress, flag);
-    if (!recomp_sw::sleepsAgain(count, flag, frame.consumed)) { // the loop proceeds: return without the yield step
-        c.ready.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    if (!quiet()) return false; // the executor needs main: v474's path (the next Sleep(0) / entry acts)
-    struct Ops : recomp_sw::HostOps { // the device's operations, and what only the registry knows
-        std::uint32_t token = 0;
-        const std::uint8_t* countWord = nullptr;
-        bool skipYield() const noexcept { return recomp_ms::yieldSkippedNow(token); }
-        bool idle(std::uint32_t lastCount) const noexcept { return markedIdle(countWord, lastCount); }
-    } ops;
-    ops.token = token;
-    ops.countWord = countWord;
-    auto& w = recomp_sw::mainWait();
-    recomp_sw::MainConfig cfg;
-    cfg.mode = mode;
-    cfg.idleWait = idleWait;
-    cfg.budgetNs = 1000ull * budgetUs; // microseconds to the nanoseconds of the watch's clock
-    cfg.spinNs = std::uint64_t{w.spinUs.load(std::memory_order_relaxed)} * 1000u;
-    cfg.sleepAfterNs = std::uint64_t{w.sleepAfterUs.load(std::memory_order_relaxed)} * 1000u;
-    const bool onPrime = ops.skipYield();
-    const std::uint64_t startTicks = registryTicks(); // the clock the producers' hook stamps with
-    recomp_sw::MainResult result;
-    const auto end = recomp_sw::watchMain(w, ops, frame, cfg, pollRead, quiet,
-                                          [] { return registryTicksToNs(registryTicks()); }, result);
-    recomp_sw::recordWatch(w, end, result, onPrime, (mode & recomp_sw::ModeMeasure) != 0, startTicks, registryTicks(),
-                           [](std::uint64_t ticks) { return registryTicksToNs(ticks); });
-    // RENDER_DIAG_SW's counters go on as under sceneWaitWatch.
-    c.watches.fetch_add(1, std::memory_order_relaxed);
-    (end == recomp_sw::End::Changed ? c.changed : end == recomp_sw::End::Expired ? c.expired : c.unquiet)
-        .fetch_add(1, std::memory_order_relaxed);
-    c.watchNs.fetch_add(result.spentNs, std::memory_order_relaxed);
-    c.wfe.fetch_add(result.idleWaits, std::memory_order_relaxed);
-    if (result.spentNs > c.maxNs.load(std::memory_order_relaxed)) c.maxNs.store(result.spentNs, std::memory_order_relaxed); // (main only)
-    return true;
-}
-// scene-wait: the host yield step of the Sleep(0) fast path (v474: recomp_ms::sleepZeroYield). The switch test lives here,
-// out of line, so dispatch's CFG and PGO record stay v474's (an `else if` inside dispatch changed its hash: the profile
-// was discarded and dispatch shrank from 0x21770 to 0x1b04 bytes; check/RESULT.md MAJOR 1).
-// main-wait (v528): with a watch on, one more load says whether a switch of scene_wait_main.h stands (0 = v524's watch).
-[[gnu::noinline]] void sceneWaitOrYield(const GuestAddressSpace& space, std::uint32_t sp, std::uint32_t token) noexcept {
-    const unsigned swRaw = ::recomp_sw_watch_us.load(std::memory_order_relaxed);
-    const unsigned swUs = swRaw & ~recomp_sw::WfeBit;
-    if (swUs != 0) {
-        const unsigned mode = recomp_sw::mainWait().mode.load(std::memory_order_relaxed);
-        if (mode != 0 ? sceneWaitMain(space, sp, token, swUs, (swRaw & recomp_sw::WfeBit) != 0, mode)
-                      : sceneWaitWatch(space, sp, token, swUs, (swRaw & recomp_sw::WfeBit) != 0)) return;
-    }
-    recomp_ms::sleepZeroYield(token);
-}
-// scene-wait:watch:end
-} // namespace
-// main-wait:hook:begin (host test: tests/extract_main_glue.py compiles the text between these markers)
-// main-wait (scene_wait_main.h, attempt v528): the scene producers' hook. The recipe pass sw-producer-hooks adds one call
-// as the last statement of sub_83483EF8 (chunk 301: after the count's compare-and-swap succeeded, or with nothing to
-// publish) and one as the last statement of sub_825315B8 (chunk 34: after the flag's store), never before a store: the
-// order of the guest's stores is what it was. Host words only; with nobody registered it is a barrier and one relaxed
-// load. Out of line and behind no branch: the generated functions keep their control flow and their profile records.
-extern "C" __attribute__((noinline)) void recomp_sw_producer_stored(std::uint32_t address) noexcept {
-    recomp_sw::HostOps ops;
-    recomp_sw::producerStored(recomp_sw::mainWait(), ops, address, [] { return registryTicks(); });
-    recomp_sens_jobs_spin(); // sens-jobs (v535 -> v559, measurement only): returns at once unless diag-sens-jobs stands
-}
-// main-wait:hook:end
 GuestImportDispatchResult GuestImportRegistry::dispatch(
         std::string_view importName,
         GuestImportCall& call) {
+    if (!iosHandleDescriberReady.load(std::memory_order_relaxed)) { // ios-handle-describe (DIAGNOSTIC), once
+        static std::once_flag once;
+        std::call_once(once, [this] {
+            iosHandleDescriber = [this](std::uint32_t handle, char* out, std::size_t size) -> int {
+                std::unique_lock<std::mutex> l(registryMutex(), std::defer_lock); // (try-lock only: never blocks the watcher)
+                for (int i = 0; i < 50 && !l.try_lock(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (!l.owns_lock()) return std::snprintf(out, size, "registry-busy");
+                const auto it = kernelHandles_.find(handle);
+                if (it == kernelHandles_.end()) return std::snprintf(out, size, "no-kernel-object");
+                const auto& k = it->second;
+                return std::snprintf(out, size, "kind=%d signal=%u max=%u owner=%08x recursion=%u abandoned=%d", int(k.kind),
+                                     k.signalCount, k.maximumCount, k.ownerToken, k.recursion, int(k.abandoned));
+            };
+            iosHandleDescriberReady.store(true, std::memory_order_release);
+        });
+    }
     // v348 (diagnostic causal profiling, diag-v348-audio-spin): a busy wait before each audio frame submission (no lock held),
     // to measure how much the frame follows the audio thread's work.
     if (const unsigned us = recomp_v348_audio_spin_us.load(std::memory_order_relaxed); us && importName == "__imp__XAudioSubmitRenderDriverFrame") {
@@ -3196,7 +3036,7 @@ GuestImportDispatchResult GuestImportRegistry::dispatch(
                                 baselineSink += static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
                                 ::sched_yield();
                                 baselineSink += static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-                            } else sceneWaitOrYield(*addressSpace_, call.stackPointer, token); // scene-wait, else main-sched: diag-ms-prime-noyield (else sched_yield as before)
+                            } else recomp_ms::sleepZeroYield(token); // main-sched: diag-ms-prime-noyield (else sched_yield as before)
                         }
                     }
                     call.returnValue = StatusSuccess;
@@ -3338,15 +3178,6 @@ GuestImportDispatchResult GuestImportRegistry::dispatchUnderRegistryLock(
     if (importsFastHot) lockSectionQuiet.emplace(registryThreadState(), this, importsFastSites[__builtin_ctz(importsFastHot)]);
     else lockSectionAccounted.emplace(this, importName);
     auto& lock = importsFastHot ? lockSectionQuiet->native() : lockSectionAccounted->native();
-    // registry-input (2026-10-15): the gamepad reader outside R when diag-input-unlocked (copied under R; R retaken after the call).
-    const auto readGamepad = [&](std::uint32_t user, recomp::input::GamepadState& state) -> int {
-        if (!inputUnlockedEnabled()) return nativeGamepadReader_(user, state);
-        auto reader = nativeGamepadReader_;
-        RECOMP_REGISTRY_UNLOCK(lock);
-        const int connected = reader ? reader(user, state) : -1;
-        RECOMP_REGISTRY_RELOCK(lock);
-        return connected;
-    };
     if (addressSpace_ == nullptr || !addressSpace_->isReserved()) {
         return {
                 GuestImportDispatchState::RegistryUnavailable,
@@ -3956,13 +3787,13 @@ GuestImportDispatchResult GuestImportRegistry::dispatchUnderRegistryLock(
             auto user=call.argument32(0);
             if((user&0xFFU)==0xFFU || (flags&0x40000000U))user=0;
             recomp::input::GamepadState state;
-            const auto connected=readGamepad(user,state);
+            const auto connected=nativeGamepadReader_(user,state);
             if(connected!=0 && connected!=1)return rejected(importName,"Native input snapshot failed");
             if(!connected) {call.returnValue=0x48F;return handled(importName,"Native controller is disconnected");}
             if(output) {
                 if(!validGuestDataBuffer(output,16,true,4))return memoryFault(importName,"Input state output is not writable guest storage");
                 const auto packet=recomp::input::encodeGamepadState(state);
-                std::memcpy(addressSpace_->translate(output),packet.data(),packet.size());
+                recomp::input::delivery::copyAndObserve(addressSpace_->translate(output),packet,user,output,state);
             }
             call.returnValue=0;return handled(importName,"Read actual native gamepad snapshot");
         }
@@ -4661,7 +4492,7 @@ GuestImportDispatchResult GuestImportRegistry::dispatchUnderRegistryLock(
         if(nativeGamepadReader_) {
             auto user=call.argument32(0);if((user&0xFFU)==0xFFU)user=0;
             recomp::input::GamepadState state;
-            connected=readGamepad(user,state);
+            connected=nativeGamepadReader_(user,state);
             if(connected!=0 && connected!=1)return rejected(importName,"Native device context query failed");
         }
         auto result=handled(importName,"Native controller presence; no separate device context handle");
@@ -4938,6 +4769,11 @@ GuestImportDispatchResult GuestImportRegistry::dispatchUnderRegistryLock(
         // 60.0f is encoded directly as IEEE binary32, not a live display sample.
         std::array<std::uint32_t, 12> Words{
                 1280, 720, 0, 1, 1, 0x42700000, 1, 0, 0, 0, 0, 0};
+        // (ios-duo 2026-11-05; 28s: the Duo's Top Screen 4:3 choice, duo_app.h loadMode sets it before the game starts, or a test
+        // launch's environment) RECOMP_DUO_4X3=1 answers fIsWideScreen = 0 at the same 1280x720: the game stores it at 0x83BFBEDE (sub_83225428) and its
+        // getter sub_824C3F80 picks the 4:3 sets of HUD positions / scales at 53 call sites. The presenter shows the frame as 4:3.
+        {static const bool narrow=[]{const char* e=std::getenv("RECOMP_DUO_4X3");return e && e[0]=='1';}();
+         if(narrow){Words[3]=0;std::fprintf(stderr,"APPLE_IOS_VIDEO_MODE widescreen=0 hidef=1 size=1280x720 source=RECOMP_DUO_4X3\n");}}
         if(nativeScalerTimingBinding_){const auto& binding=*nativeScalerTimingBinding_;
             std::uint32_t pointer=0,clock=0;
             if(nativeScalerTimingQueries_==UINT64_MAX || overlaps(binding[0],4) || overlaps(binding[1],4) ||
@@ -5543,30 +5379,6 @@ GuestImportDispatchResult GuestImportRegistry::dispatchKeDelayExecutionThread(
     // saving the clock reads of the ~62k/s Sleep(0) calls of the main thread.
     const auto deadline = ticks ? std::chrono::steady_clock::now() + std::chrono::nanoseconds(ticks * 100)
                                 : std::chrono::steady_clock::time_point{};
-    if (ticks) { // v557 (driving goal, 2026-10-16; diag-delay-callers, measurement only): who makes the timed sleeps. The Sleep
-        // chain sub_82548DE0 -> sub_824F1418 -> sub_824F1388 (SleepEx: stw r12,-8(r1); stwu r1,-112(r1)) -> this import, so
-        // SleepEx's caller's return address is at back chain - 8. Per (return address, guest token): count and requested ms,
-        // logged every 5 s as DELAY_CALLER lines (cumulative).
-        static const bool callers = ::access(RECOMP_APP_PATH("/private-trace/diag-delay-callers"), F_OK) == 0;
-        if (callers) {
-            struct Row { std::uint32_t lr = 0, token = 0; std::uint64_t count = 0, ticks = 0; };
-            static Row rows[32]; static std::uint64_t nextLogNs = 0;
-            std::uint32_t back = 0, lr = 0;
-            if (readU32(call.stackPointer, back) && back) (void)readU32(back - 8, lr);
-            const std::uint32_t tok = static_cast<std::uint32_t>(token);
-            for (auto& r : rows) {
-                if (r.count == 0) { r.lr = lr; r.token = tok; }
-                if (r.lr == lr && r.token == tok) { ++r.count; r.ticks += ticks; break; }
-            }
-            const auto nowNs = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-            if (nowNs >= nextLogNs) {
-                nextLogNs = nowNs + 5'000'000'000ull;
-                for (const auto& r : rows) if (r.count)
-                    __android_log_print(ANDROID_LOG_INFO, "RecompRenderer", "DELAY_CALLER lr=0x%08X token=0x%08X count=%llu ms=%.1f",
-                        r.lr, r.token, (unsigned long long)r.count, double(r.ticks) / 10000.0);
-            }
-        }
-    }
     const auto threadId = thread->threadId;
     const auto handler = threadDelayHandler_;
     auto success = handled(Name, "Completed a snapshotted non-alertable monotonic delay after a real scheduling boundary");
@@ -7530,7 +7342,7 @@ GuestImportRegistry::dispatchRtlInitializeCriticalSectionAndSpinCount(
         for (auto it = criticalSections_.begin(); it != criticalSections_.end();) {
             if (it->first < std::uint64_t{address} + CriticalSectionSize &&
                     address < std::uint64_t{it->first} + CriticalSectionSize) {
-                ::recomp::native_imports::csRetire(this, it->first); it = ::recomp::imports_fast::eraseIterator(criticalSections_, it, ::recomp::imports_fast::csGenerations()); // native-imports
+                it = ::recomp::imports_fast::eraseIterator(criticalSections_, it, ::recomp::imports_fast::csGenerations());
             } else {
                 ++it;
             }
@@ -7539,7 +7351,7 @@ GuestImportRegistry::dispatchRtlInitializeCriticalSectionAndSpinCount(
         const std::uint32_t from = address >= CriticalSectionSize ? address - (CriticalSectionSize - 1) : 0;
         for (auto it = criticalSections_.lower_bound(from);
              it != criticalSections_.end() && it->first < std::uint64_t{address} + CriticalSectionSize;) {
-            if (address < std::uint64_t{it->first} + CriticalSectionSize) { ::recomp::native_imports::csRetire(this, it->first); it = ::recomp::imports_fast::eraseIterator(criticalSections_, it, ::recomp::imports_fast::csGenerations()); } // native-imports
+            if (address < std::uint64_t{it->first} + CriticalSectionSize) it = ::recomp::imports_fast::eraseIterator(criticalSections_, it, ::recomp::imports_fast::csGenerations());
             else ++it;
         }
     }
@@ -7574,7 +7386,7 @@ bool GuestImportRegistry::hasActiveCriticalSectionInRange(std::uint32_t address,
     if (recomp_v217_baseline.load(std::memory_order_relaxed)) { // v217 A/B: v216's scan of every critical section
         for (const auto& [at,state]:criticalSections_) {
             if (at<std::uint64_t{address}+bytes && address<std::uint64_t{at}+CriticalSectionSize &&
-                (::recomp::native_imports::csSlow(this, at), state.ownerToken || criticalSectionWaits_.count(at))) return true; // native-imports
+                (state.ownerToken || criticalSectionWaits_.count(at))) return true;
         }
         return false;
     }
@@ -7582,12 +7394,12 @@ bool GuestImportRegistry::hasActiveCriticalSectionInRange(std::uint32_t address,
     // address), the same condition on the same entries (the scene-IRQ scope validation ran six full scans of ~1500
     // sections per ISR import: 35% of the IRQ workers' CPU, all of it while every other guest thread is stopped).
     return anyActiveOverlap(criticalSections_,address,bytes,CriticalSectionSize,[&](std::uint32_t at,const auto& state) {
-        ::recomp::native_imports::csSlow(this, at); return state.ownerToken || criticalSectionWaits_.count(at); }); // native-imports
+        return state.ownerToken || criticalSectionWaits_.count(at); });
 }
 
 bool GuestImportRegistry::criticalSectionStorageMatches(
         std::uint32_t address,
-        const CriticalSectionState& state) const noexcept { ::recomp::native_imports::csSlow(this, address); // native-imports: the section leaves the fast path before its record is compared (the caller holds its stripe)
+        const CriticalSectionState& state) const noexcept {
     if (!contains(address, CriticalSectionSize)) {
         return false;
     }
@@ -7655,7 +7467,7 @@ bool GuestImportRegistry::adoptPreinitializedCriticalSection(std::uint32_t addre
 
 bool GuestImportRegistry::writeCriticalSectionState(
         std::uint32_t address,
-        const CriticalSectionState& state) noexcept { RECOMP_NATIVE_SCHEDULE_POINT(); // (native_imports.h) host tests' pause between a locked path's storage match and its stores; nothing in any other build
+        const CriticalSectionState& state) noexcept {
     const auto lockCount = state.recursionCount == 0
             ? 0xFFFFFFFFU
             : state.recursionCount - 1U;
@@ -8846,24 +8658,3 @@ GuestImportDispatchResult GuestImportRegistry::dispatchNtFreeVirtualMemory(
 }
 
 } // namespace recomp::bootstrap
-#include "native_imports.inc" // native-imports (lane native-syscalls): the fast functions and the hooks' definitions
-
-// sens-jobs (sens_jobs.h, attempt v535): measurement only. At global scope, after every namespace of this file.
-namespace recomp::sens_jobs { State& state() noexcept { static State s; return s; } }
-extern "C" __attribute__((noinline)) void recomp_sens_jobs_spin() noexcept {
-    auto& s = recomp::sens_jobs::state();
-    const unsigned us = s.us.load(std::memory_order_relaxed);
-    if (us == 0) return;
-#if defined(__aarch64__)
-    std::uint64_t hz, start, now;
-    asm volatile("mrs %0, cntfrq_el0" : "=r"(hz));
-    asm volatile("mrs %0, cntvct_el0" : "=r"(start));
-    const std::uint64_t span = recomp::sens_jobs::ticksFor(us, hz);
-    do {
-        asm volatile("yield");
-        asm volatile("mrs %0, cntvct_el0" : "=r"(now));
-    } while (now - start < span);
-    s.spunTicks.fetch_add(now - start, std::memory_order_relaxed);
-#endif
-    s.calls.fetch_add(1, std::memory_order_relaxed);
-}

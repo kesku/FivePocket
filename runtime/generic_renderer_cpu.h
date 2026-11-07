@@ -425,10 +425,9 @@ inline std::array<float,4> fastDecode(FastDecode kind,std::uint32_t w0,std::uint
     }
     return feed==0x688?v:applyFeed(v,feed);
 }
-// The 16 bytes the converted stream holds for one vertex (uint inputs: max(0, x) truncated, as v41-v71 wrote them;
-// v545: values at or above 2^32, e.g. 0xFFFFFFFF rounded to float, saturate to 0xFFFFFFFF instead of the undefined cast).
+// The 16 bytes the converted stream holds for one vertex (uint inputs: max(0, x) truncated, as v41-v71 wrote them).
 inline void storeConverted(std::uint8_t* out,const std::array<float,4>& value,bool uintInput) {
-    if(uintInput){std::array<std::uint32_t,4> u{};for(unsigned k=0;k<4;++k){const float x=std::max(0.0f,value[k]);u[k]=x>=4294967296.0f?0xFFFFFFFFu:std::uint32_t(x);}std::memcpy(out,u.data(),16);}
+    if(uintInput){std::array<std::uint32_t,4> u{};for(unsigned k=0;k<4;++k)u[k]=std::uint32_t(std::max(0.0f,value[k]));std::memcpy(out,u.data(),16);}
     else std::memcpy(out,value.data(),16);
 }
 // One converted attribute for `count` vertices of a stream (source bytes src[0,take) of n, endian mode, stride,

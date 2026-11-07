@@ -9,7 +9,11 @@
 #include <cstdint>
 #include <time.h>
 namespace recomp::v337 {
+#if defined(__APPLE__) // ios-direct-present: the clock of MoltenVK's actualPresentTime (see pace_caps.h)
+inline std::uint64_t monotonicNs() noexcept {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);}
+#else
 inline std::uint64_t monotonicNs() noexcept {timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return std::uint64_t(t.tv_sec)*1000000000ull+std::uint64_t(t.tv_nsec);}
+#endif
 constexpr unsigned Bins=128,Ring=64;
 inline std::array<std::atomic<std::uint32_t>,Bins> qd{},cd{};
 inline std::array<std::atomic<std::uint32_t>,Ring> queuedTag{};

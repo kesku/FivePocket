@@ -3,44 +3,116 @@
  "id": "example",
  "flavour": "generic",
  "note": "Template only: no game data. A real profile is private (it holds the expected hashes of game files and paths of game-derived parameters) and lives under the git-ignored local-analysis/. Variables: ${repo} ${data} ${work} ${profile} ${flavour} ${game:FIELD} ${out:STAGE:OUTPUT}. Relative outputs live in the work directory. make_dirs: folders of the work directory made before the command runs (xex_image wants its output folder to exist; a tool that wants a new folder gets none). A tool that can only write at a place of its own needs \"external_outputs\": true and an absolute output path.",
- "paths": {"repo": "../..", "data": "../.."},
+ "paths": {
+  "repo": "../..",
+  "data": "../.."
+ },
  "min_free_bytes": 3000000000,
  "games": [
-  {"id": "example-game", "label": "Example game, disc release", "executable": "default.xex",
+  {
+   "id": "example-game",
+   "label": "Example game, disc release",
+   "executable": "default.xex",
    "executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-   "decoded_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+   "decoded_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
  ],
  "prerequisites": [
-  {"id": "python", "kind": "python", "min": "3.10"},
-  {"id": "compiler", "kind": "command", "argv": ["/path/to/ndk/clang++", "--version"], "match": "clang version 18\\."},
-  {"id": "generator", "kind": "file", "path": "${data}/local-analysis/path/to/XenonRecomp", "executable": true}
+  {
+   "id": "python",
+   "kind": "python",
+   "min": "3.10"
+  },
+  {
+   "id": "compiler",
+   "kind": "command",
+   "argv": [
+    "/path/to/xcode/clang++",
+    "--version"
+   ],
+   "match": "clang version 18\\."
+  },
+  {
+   "id": "generator",
+   "kind": "file",
+   "path": "${data}/local-analysis/path/to/XenonRecomp",
+   "executable": true
+  }
  ],
  "stages": [
-  {"id": "extract-xex", "adapter": "disc-file", "disc": "play", "path": "default.xex",
-   "outputs": {"xex": "input/default.xex"}, "expect": {"xex": "${game:executable_sha256}"}},
-  {"id": "decode-xex", "adapter": "command",
-   "tools": [{"path": "${repo}/out/host-tools/xex-image/xex_image", "executable": true}],
-   "inputs": {"xex": "${out:extract-xex:xex}"},
-   "outputs": {"image": "decode/default.image.bin"}, "expect": {"image": "${game:decoded_image_sha256}"},
-   "make_dirs": ["decode"],
-   "argv": ["${repo}/out/host-tools/xex-image/xex_image", "${out:extract-xex:xex}", "${work}/decode/default.image.bin"]},
-  {"id": "shader-pack", "adapter": "supplied", "source": "${data}/local-analysis/path/to/pack.bin",
-   "outputs": {"pack": "shaders/pack.bin"}},
-  {"id": "compile-link", "adapter": "command", "heavy": true, "clean": ["link"],
-   "tools": ["${repo}/tools/path/to/build_script.py"],
-   "inputs": {"image": "${out:decode-xex:image}"},
-   "outputs": {"library": "link/libgame.so"},
-   "argv": ["python3", "${repo}/tools/path/to/build_script.py", "${work}/link/libgame.so"]}
+  {
+   "id": "extract-xex",
+   "adapter": "disc-file",
+   "disc": "play",
+   "path": "default.xex",
+   "outputs": {
+    "xex": "input/default.xex"
+   },
+   "expect": {
+    "xex": "${game:executable_sha256}"
+   }
+  },
+  {
+   "id": "decode-xex",
+   "adapter": "command",
+   "tools": [
+    {
+     "path": "${repo}/out/host-tools/xex-image/xex_image",
+     "executable": true
+    }
+   ],
+   "inputs": {
+    "xex": "${out:extract-xex:xex}"
+   },
+   "outputs": {
+    "image": "decode/default.image.bin"
+   },
+   "expect": {
+    "image": "${game:decoded_image_sha256}"
+   },
+   "make_dirs": [
+    "decode"
+   ],
+   "argv": [
+    "${repo}/out/host-tools/xex-image/xex_image",
+    "${out:extract-xex:xex}",
+    "${work}/decode/default.image.bin"
+   ]
+  },
+  {
+   "id": "shader-pack",
+   "adapter": "supplied",
+   "source": "${data}/local-analysis/path/to/pack.bin",
+   "outputs": {
+    "pack": "shaders/pack.bin"
+   }
+  },
+  {
+   "id": "compile-link",
+   "adapter": "command",
+   "heavy": true,
+   "clean": [
+    "link"
+   ],
+   "tools": [
+    "${repo}/tools/path/to/build_script.py"
+   ],
+   "inputs": {
+    "image": "${out:decode-xex:image}"
+   },
+   "outputs": {
+    "ipa": "link/FivePocket-Duo.ipa"
+   },
+   "argv": [
+    "python3",
+    "${repo}/tools/path/to/build_script.py",
+    "${work}/link/FivePocket-Duo.ipa"
+   ]
+  }
  ],
- "bundle": {
-  "name": "code-${profile}-${flavour}.bundle",
-  "runtime_abi": "example-abi/1",
-  "versions": {"abi": "arm64-v8a"},
-  "components": [
-   {"name": "lib/arm64-v8a/libgame.so", "role": "game-library", "stage": "compile-link", "output": "library"},
-   {"name": "title.xex", "role": "title-xex", "stage": "extract-xex", "output": "xex"},
-   {"name": "default.image.bin", "role": "decoded-image", "stage": "decode-xex", "output": "image"},
-   {"name": "shaders/pack.bin", "role": "shader-pack", "stage": "shader-pack", "output": "pack"}
-  ]
+ "output": {
+  "name": "FivePocket-Duo.ipa",
+  "stage": "compile-link",
+  "output": "ipa"
  }
 }

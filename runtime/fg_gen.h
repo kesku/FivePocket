@@ -18,13 +18,6 @@
 //     frames' inputs keep coming and going, the generator is switched off and real frames are shown alone, exactly as with
 //     the cap alone; the presenter logs "RENDER_DIRECT_FG_GEN fallback=real-only why=..." (the marker the device plan reads);
 //   - the capability marker the app's Settings screen looks for (lane menu-settings, Capabilities.FRAME_GENERATION_MARKER).
-// fg-scaled (2026-10-10; every edit is marked fg-scaled): the generator works on the run's SOURCE picture, whatever render
-// size it has (present_source.h: 80k x 45k for a scale of k sixteenths), not on 1280x720 alone:
-//   - Geometry / geometry(): every picture's size from the source picture's; sizeOk(): which source pictures are taken;
-//   - decide() and push() are given the source picture's size; FrameIn says which size the renderer handed;
-//   - pictureIsFrame(): the renderer's rule for which present image is a frame's picture at a render scale.
-// For a 1280x720 source every value, decision and byte below is what it was (tests: fg_scaled_diff_test feeds the same
-// inputs to v513's file and to this one).
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -50,67 +43,8 @@ constexpr unsigned switchWord(unsigned stage1a,bool between,bool show) noexcept 
 // The presenter's first RENDER_DIRECT_FG_GEN line ends with it. The predicted-frame order is not built: the name of its
 // switch file is deliberately in no string of this lane, so the app does not offer it.
 #define RECOMP_FGG_CAPABILITY "recomp-cap:framegen1"
-#define RECOMP_FGG_AUTO_CAPABILITY "recomp-cap:framegen-auto1" // pace-auto-pairs (v524): the picture is also made under the automatic pace's 30, 20 and 15 fps rungs
 
-constexpr unsigned Width=1280,Height=720,Block=8,BlocksW=Width/Block,BlocksH=Height/Block; // (fg-scaled: the sizes of a 100 % picture, the game's own frame; a run's sizes are its Geometry)
-
-// ---- fg-scaled (2026-10-10): the sizes of the generator's pictures for a source picture of w x h.
-// THE RULE AT THE PICTURE'S EDGE. A picture need not be a whole number of 8 x 8 blocks (960x540 is 67.5 block rows):
-//   - the block maps have one block for every STARTED block: ceil(w / 8) x ceil(h / 8). The synthesis asks for the
-//     block of every pixel (x / 8, y / 8), so a smaller map would be read outside;
-//   - a block that crosses the picture's right or bottom edge is judged from the pixels it has inside the picture and
-//     from nothing else (their sums divided by their number): the reference's rule (host-model/fg_reference.h);
-//   - the terms' picture is whole blocks (blocksW x 8, blocksH x 8), so that the CLASSIFY pass reads 64 texels of every
-//     block inside it. Its texels outside the source picture hold zero (fg_gen_core.glsl fgTermsEdge) and add nothing;
-//   - the two low-passed pictures and the made picture have the source picture's size; the column sums are blocksW x 2;
-//     the gain is 1x1. The GAIN pass counts whole blocks only (floor), as its text always did.
-// edge(): a block crosses the edge. Then, and only then, the two passes of such a picture are drawn with the modules
-// Termsedge and Classifyedge; a picture of whole blocks is drawn with v513's seven modules alone.
-struct Geometry {
-    unsigned w=Width,h=Height;                // the source picture, the two low-passed pictures, the made picture
-    unsigned blocksW=BlocksW,blocksH=BlocksH; // the two block maps; blocksW is also the width of the column sums
-    unsigned termsW=Width,termsH=Height;      // the terms' picture
-    constexpr unsigned blocks() const noexcept {return blocksW*blocksH;}
-    constexpr bool edge() const noexcept {return termsW!=w || termsH!=h;}
-    // the bytes of the generator's own pictures (the objects line of the log): two low-passed pictures, two block maps,
-    // the gain texel, the column sums (two rows), the terms (16 bytes a texel)
-    constexpr unsigned bytes() const noexcept {return 2u*w*h*4u+2u*blocksW*blocksH*4u+4u+blocksW*2u*4u+termsW*termsH*16u;}
-    friend constexpr bool operator==(const Geometry& a,const Geometry& b) noexcept {
-        return a.w==b.w && a.h==b.h && a.blocksW==b.blocksW && a.blocksH==b.blocksH && a.termsW==b.termsW && a.termsH==b.termsH;
-    }
-    friend constexpr bool operator!=(const Geometry& a,const Geometry& b) noexcept {return !(a==b);}
-};
-constexpr Geometry geometry(unsigned w,unsigned h) noexcept {
-    Geometry g;g.w=w;g.h=h;
-    g.blocksW=(w+Block-1)/Block;g.blocksH=(h+Block-1)/Block;
-    g.termsW=g.blocksW*Block;g.termsH=g.blocksH*Block;
-    return g;
-}
-static_assert(geometry(Width,Height)==Geometry{} && !Geometry{}.edge() && Geometry{}.bytes()==22234884u,"a 1280x720 picture has v513's sizes");
-// Which source pictures the generator takes: the renderer's sizes (present_source.h rsb::valid: 80k x 45k, exactly
-// 16:9) from 640x360 (50 %) to 1280x720 (100 %): k = 8 .. 16.
-// Larger pictures (k = 17 .. 32) stay refused (why=source), for two different reasons:
-//   - from 1600x900 (k = 20) on, the GAIN pass's sums leave the range in which float32 holds every integer
-//     (fg_gen_core.glsl pass 2: at most GainExactBlocks whole blocks; 1600x900 has 22,400), so its two steps would no
-//     longer be exact;
-//   - 1360x765 .. 1520x855 (k = 17 .. 19) are inside that bound and pass every host test of lane fg-scaled, but no
-//     picture above 100 % has been looked at on a phone. MaxWidth is the one constant to raise for them.
-constexpr unsigned MinWidth=640,MaxWidth=Width,GainExactBlocks=21931; // (765 x 21,931 = 16,777,215 = 2^24 - 1)
-constexpr unsigned gainBlocks(unsigned w,unsigned h) noexcept {return (w/Block)*(h/Block);} // the whole blocks the GAIN pass counts
-constexpr bool sizeOk(unsigned w,unsigned h) noexcept {
-    return w>=MinWidth && w<=MaxWidth && w%80u==0 && std::uint64_t{h}*16u==std::uint64_t{w}*9u;
-}
-static_assert(sizeOk(Width,Height) && sizeOk(960,540) && sizeOk(640,360) && !sizeOk(1360,765) && !sizeOk(560,315),"the sizes the generator takes");
-// (the largest picture sizeOk() takes has the most blocks: MaxWidth cannot be raised past the GAIN pass's exact range)
-static_assert(MaxWidth%80u==0 && gainBlocks(MaxWidth,MaxWidth*9u/16u)<=GainExactBlocks,"the GAIN pass's sums must stay exact integers in float32 for every picture the generator takes");
-// The renderer's rule for a frame's picture and depth (fg_gen_renderer.inc): the frame of a run at render scale k
-// (sixteenths) is frameW x frameH = the 1280x720 frame's scaled extent. The present image is handed to the generator
-// only when it has exactly that size, and a depth target only when it is drawn at that scale: then pixel (x, y) of the
-// picture and texel (x, y) of the depth are the same place on the screen, as at 100 %. (Stage A of the render scale
-// presents a 1280x720 blit of a smaller frame: that picture and the smaller depth do not match, and nothing is handed.)
-constexpr bool pictureIsFrame(unsigned presentW,unsigned presentH,unsigned frameW,unsigned frameH) noexcept {
-    return presentW==frameW && presentH==frameH;
-}
+constexpr unsigned Width=1280,Height=720,Block=8,BlocksW=Width/Block,BlocksH=Height/Block;
 enum BlockClass : unsigned {BlockCamera=0,BlockZero=1,BlockNone=3}; // a block's class: static world, did not move on screen, neither (the values the classify pass writes; fg_reference.h's)
 
 struct K {
@@ -123,14 +57,28 @@ struct K {
     static constexpr double CutMetres=5.0,CutDegrees=20.0,CutLens=0.10;
     // the slot keeper (ESTIMATES: no device run has set them; the first one should, DEVICE-PLAN.md step G3)
     static constexpr unsigned Window=64;                    // made pictures per verdict
+#if defined(__APPLE__)
+    // (Claude 2026-10-20, c240 vs c239: on the iPad's 60 Hz panel a fallback halves the display rate exactly when real frames are
+    // slow; at 90 % the generator stayed on through a whole drive: 85.3 % of intervals at 16.7 ms vs 60.8 % with 40)
+    static constexpr unsigned LateMaxPct=90;
+#else
     static constexpr unsigned LateMaxPct=40;                // more than this share shown after their slot: fall back
+#endif
     static constexpr unsigned LateLo=5,LateHi=95;           // diag-fg-late-max (text, percent) may move it within this
     static constexpr unsigned LostMax=4;                    // pictures of pairs (made or real) not presented within one window: fall back
     static constexpr unsigned InterruptMax=4;               // (repair, check c2) this many interruptions of the inputs ...
     static constexpr unsigned InterruptSpan=600;            // ... within this many real frames (20 s at 30 fps): fall back
+#if defined(__APPLE__)
+    // ios-fg-gpu (Claude 2026-10-17; c184: 3.3-3.9 ms on the iPad mini's GPU at 1280x720 pictures): the Fold's 3.0 ms budget recalibrated
+    // for this GPU at a reduced render scale - 75 % real frames need ~25 ms of GPU (c174), so a 5.0 ms generator still leaves the
+    // 33.3 ms slot (25 + 5 = 30 ms); above it the keeper still falls back.
+    // (Claude 2026-10-20, c294: a window at 5.1 ms tripped the fall-back with late=0 and real frames at 33.4 ms; at the 50 %
+    // scale with the exact fan expansion real frames need ~21-22 ms of GPU, so 8.0 ms still leaves the slot: 22 + 8 = 30 ms.
+    // The late / lost trips still guard the real frames.)
+    static constexpr double GpuMaxUs=8000.0;
+#else
     static constexpr double GpuMaxUs=3000.0;                // mean GPU time of the five passes (DESIGN section 12, D6: 3.0 ms)
-    static constexpr double GpuMaxLo=2000.0,GpuMaxHi=6000.0; // fg-gpu-max (v639): diag-fg-gpu-max (text, microseconds) may move it within this
-    static constexpr unsigned GpuApart=2;                   // ... for pairs this many refreshes apart (fg_pair.h K::Apart: the 30 fps cap)
+#endif
     static constexpr double CallMaxUs=4000.0;               // mean CPU time of the made picture's call (its acquire may wait)
     static constexpr unsigned MinSamples=16;                // GPU / call means need this many samples
     static constexpr unsigned Cooldown=600;                 // real frames without pairs after a fall-back (20 s at 30 fps)
@@ -230,9 +178,7 @@ struct FrameIn {
     std::uint32_t depthW=0,depthH=0;
     std::uint64_t frame=0;      // the renderer's frame counter at the tonemap draw (the log)
     std::uint32_t tonemapDraws=0; // tonemap draws of the frame (the renderer's own count)
-    std::uint16_t sourceW=Width,sourceH=Height; // fg-scaled: the size of the picture behind sourceView (the renderer says it; 1280x720 unless a render scale is applied). Two 16-bit fields in what was padding: the struct keeps its size, so every member of the presenter behind its copy keeps its offset
 };
-static_assert(sizeof(FrameIn)==192,"FrameIn keeps v513's size"); // fg-scaled
 
 // ---- the decision for one planned pair (the presenter, under its mutex, before any picture of the frame is recorded).
 enum class Act : unsigned {Dry=0,      // the generator's switch is absent: stage 1a's dry run, unchanged
@@ -243,20 +189,21 @@ enum class Act : unsigned {Dry=0,      // the generator's switch is absent: stag
 struct Kept {bool valid=false;Camera cam;};
 struct Decision {Act act=Act::Dry;Why why=Why::Ok;std::array<float,16> m{};Step step;};
 // in: this frame's inputs or null when the renderer handed none for `tag`; objects: the generator's GPU objects exist;
-// w, h (fg-scaled; until v513 a flag "the presented picture is Width x Height"): the size of the presented pictures
-// of this run, the presenter's own (present_source.h rsb::gpuSource). The generator takes the sizes sizeOk() names;
-// the picture the renderer handed must have exactly that size (else its texels would be read as another picture's:
-// no-frame), and the depth must cover it (every pass clamps its depth reads to the PICTURE: depth-size).
-inline Decision decide(unsigned switches,const FrameIn* in,std::uint32_t tag,const Kept& kept,bool objects,unsigned w,unsigned h) noexcept {
+// sourceOk: the presented picture is Width x Height.
+// (ios-fg-native, Claude 2026-10-19) the picture size the generator works at: 1280x720 (stage A) or the render size (stage B),
+// any size the block grid divides, up to 1280x720 (the objects and the terms picture are sized for at most that)
+inline bool sizeOk(unsigned w,unsigned h) noexcept {return w && h && w<=Width && h<=Height && !(w%Block) && !(h%Block);}
+inline Decision decide(unsigned switches,const FrameIn* in,std::uint32_t tag,const Kept& kept,bool objects,bool sourceOk,
+                       unsigned picW=Width,unsigned picH=Height) noexcept {
     Decision d;
     if(!(switches&SwGenBetween))return d;
     d.act=Act::NoPair;
-    if(!sizeOk(w,h)){d.why=Why::Source;return d;}
+    if(!sourceOk){d.why=Why::Source;return d;}
     if(!objects){d.why=Why::Objects;return d;}
-    if(!in || !tag || in->tag!=tag || !in->sourceView || in->sourceW!=w || in->sourceH!=h){d.why=Why::NoFrame;return d;}
+    if(!in || !tag || in->tag!=tag || !in->sourceView){d.why=Why::NoFrame;return d;}
     if(in->why!=Why::Ok){d.why=in->why;return d;}
     if(!in->depthView){d.why=Why::NoDepth;return d;}
-    if(in->depthW<w || in->depthH<h){d.why=Why::DepthSize;return d;}
+    if(in->depthW<picW || in->depthH<picH){d.why=Why::DepthSize;return d;}
     d.act=Act::Keep;
     if(!kept.valid){d.why=Why::NoPrevious;return d;}
     d.step=poseStep(kept.cam,in->cam);
@@ -272,7 +219,6 @@ struct Push {
     float b[4];         // FAIL, AMBIGUOUS, show (0 / 1), unused
 };
 static_assert(sizeof(Push)==96,"the passes' push block");
-// (fg-scaled: w, h = the source picture's size, Geometry::w and ::h; every pass reads the picture's size from here.)
 inline Push push(const std::array<float,16>& m,float phase,float fail,bool show,unsigned w=Width,unsigned h=Height) noexcept {
     Push p{};
     std::memcpy(p.m,m.data(),sizeof p.m);
@@ -302,14 +248,14 @@ enum class Role : unsigned {Source=0, // the current real picture (the renderer'
 // the pictures CLASSIFY read until v468. CLASSIFY reads the terms alone.
 enum Pass : unsigned {PassLow=0,PassGain,PassClassify,PassResolve01,PassResolve10,PassSynth,PassGainCols,PassTerms,Passes};
 constexpr unsigned GainColsRows=2;
-constexpr unsigned TermsW=Width,TermsH=Height,TermsTexelBytes=16; // framegen-cost-b: one RGBA32F texel per pixel (14,745,600 bytes) (fg-scaled: for a 1280x720 picture; a run's size is Geometry::termsW x termsH)
+constexpr unsigned TermsW=Width,TermsH=Height,TermsTexelBytes=16; // framegen-cost-b: one RGBA32F texel per pixel (14,745,600 bytes)
 inline constexpr Role Bindings[Passes][4]={
     {Role::Source,Role::Source,Role::Source,Role::Source},      // LOW (uA through the LINEAR sampler)
     {Role::GainCols,Role::GainCols,Role::GainCols,Role::GainCols}, // GAIN (framegen-cost: from the column sums; was LowCur, LowPrev)
     {Role::Terms,Role::Terms,Role::Terms,Role::Terms},          // CLASSIFY -> Blocks0 (framegen-cost-b: from the terms; was LowCur, LowPrev, Depth, Gain)
     {Role::Blocks0,Role::Blocks0,Role::Blocks0,Role::Blocks0},  // RESOLVE Blocks0 -> Blocks1 (rounds 1 and 3)
     {Role::Blocks1,Role::Blocks1,Role::Blocks1,Role::Blocks1},  // RESOLVE Blocks1 -> Blocks0 (round 2)
-    {Role::Source,Role::Prev,Role::Terms,Role::Blocks1},        // SYNTHESIS -> the made picture (fg-fixer, v630: the terms, whose A is the near depth TERMS stored; until v629 the depth)
+    {Role::Source,Role::Prev,Role::Terms,Role::Blocks1},        // SYNTHESIS -> the made picture (fg-fixer, v630: the terms, whose A is the near depth TERMS stored; until v629 the depth) (iPad 229, Claude 2026-10-23)
     {Role::LowCur,Role::LowPrev,Role::LowCur,Role::LowCur},     // GAIN COLUMNS -> GainCols (framegen-cost: the pictures GAIN read until v467)
     {Role::LowCur,Role::LowPrev,Role::Depth,Role::Gain},        // TERMS -> Terms (framegen-cost-b: the pictures CLASSIFY read until v468)
 };
@@ -412,7 +358,6 @@ public:
         return unsigned(t)<7?names[unsigned(t)]:"?";
     }
     struct Window {unsigned made=0,shown=0,late=0,lost=0,gpuN=0,callN=0,interrupted=0;double gpuUs=0,callUs=0;
-        unsigned rel=0,relLate=0,relOff=0; // fg-late-relative (pairShown): made pictures judged by their pair; of them: not shown before their real frame; at another distance than planned
         unsigned latePct() const noexcept {return shown?unsigned(100ull*late/shown):0u;}                    // (for the log: rounded down)
         bool lateOver(unsigned pct) const noexcept {return 100ull*late>std::uint64_t(pct)*shown;}           // (the rule: exact)
         double gpuMean() const noexcept {return gpuN?gpuUs/double(gpuN):0.0;}
@@ -423,10 +368,6 @@ public:
     unsigned trips() const noexcept {return tripCount;}
     unsigned cooldownLeft() const noexcept {return state==Cool?cool:0u;}
     void lateMax(unsigned pct) noexcept {latePct=std::clamp(pct,K::LateLo,K::LateHi);}
-    // fg-gpu-max (v639): the GPU-time limit at K::GpuApart (diag-fg-gpu-max; default K::GpuMaxUs = the build before). Thor v638
-    // (run xwfefhcu): three trips at 3154 .. 3183 us with late=0 lost=0 - every made picture on time - left the generator off.
-    void gpuMax(double us) noexcept {gpuBase=std::clamp(us,K::GpuMaxLo,K::GpuMaxHi);}
-    double gpuMax() const noexcept {return gpuBase;}
     unsigned lateMax() const noexcept {return latePct;}
     unsigned blindWindows() const noexcept {return blind;}          // full windows whose lateness could not be judged
     const Window& blindWindow() const noexcept {return blindSeen;}  // the last of them
@@ -450,52 +391,11 @@ public:
         if(oldest && frames-oldest<K::InterruptSpan)inputsTrip=true;
         oldest=frames;
     }
-    // fg-late-relative (diag-fg-late-relative; the presenter says which rule holds before every verdict). On: a made picture
-    // is judged by where it lands RELATIVE TO ITS OWN PAIR - late only when it is not on the screen before its real frame
-    // (pairShown: spacing <= 0) - instead of by lane A's slot, which a display that shows every picture one or two refreshes
-    // after its planned vsync misses for all of them while the pairs are spaced as planned. The lateness verdict, the blind
-    // rule and the windows handed out (verdict's `seen`, window(), blindWindow()) then hold these numbers in shown / late.
-    // Lost pictures, interruptions, GPU time and call time are judged as before. Off: nothing differs from the build before.
-    void lateRelative(bool on) noexcept {relative=on;}
-    // fg-60hz-late (v571; the iPad's ios-fg-late rule, patches/ios-claude/fg_gen.h.patch): on a 60 Hz panel (fg_pair.h gridFor:
-    // the presenter says it before every verdict) a picture reaches the screen a constant refresh after lane A's planned vsync
-    // (v570 on the Thor at 60 Hz: dpt_late for every pair, spacing exactly 1, the keeper fell back "late 100 %" three times and
-    // stayed off). There late = shown at least half a refresh after the observed on-time latency: a running baseline of
-    // (actual - target) that takes every new minimum at once and otherwise follows slowly (5 % per picture); a missed slot
-    // still counts. On ~120 Hz (off): the rule of the build before, unchanged. A change of rule starts the baseline afresh.
-    void lagBaseline(bool on) noexcept {if(on!=lagRule){lagRule=on;lagBase=-1;}}
-    // fg-gpu-limit (v523). The spacing of the pairs being planned now, in refreshes (fg_pair.h apartFor; the presenter says it
-    // before every verdict). The GPU-time limit is K::GpuMaxUs for pairs K::GpuApart refreshes apart - 3.0 ms of the 30 fps
-    // cap's 33.3 ms frame - and the same share of a longer frame for pairs further apart: 4.5 ms at 3 refreshes (the 20 fps
-    // cap), 6.0 ms at 4 (the 15 fps cap). Found on the Fold (run 23): under a held 15 fps cap its graphics chip, clocked down
-    // because it has less to do, takes 3.1 to 3.2 ms for the five passes, and the fixed limit switched the generator off for
-    // good while every made picture was shown on time. A spacing below K::GpuApart counts as K::GpuApart. When the spacing
-    // changes, the window starts afresh (a window's means belong to one pace); a cool-down or a final fall-back stays.
-    // Never called, or always with K::GpuApart (every build without diag-fg-low): nothing differs from the build before.
-    void apart(unsigned refreshes) noexcept {
-        const unsigned a=std::max(refreshes,K::GpuApart);
-        if(a==apartNow)return;
-        apartNow=a;
-        if(state==Run){w=Window{};pending={};awaiting={};}
-    }
-    double gpuMaxUs() const noexcept {return gpuBase*double(apartNow)/double(K::GpuApart);} // (fg-gpu-max: gpuBase = K::GpuMaxUs without the file)
-    // The pair whose FIRST picture is `id` has its second picture on the screen (fg_pair.h PairShown): spacing = refreshes
-    // from the first picture's display time to the second's (-1: the first was not shown before it), apart = as planned.
-    // Counted for made pictures only (planned() knew `id`); under either rule (only lateRelative() says which one decides).
-    void pairShown(std::uint32_t id,int spacing,unsigned apart) noexcept {
-        if(state!=Run || !id)return;
-        for(auto& a:awaiting)if(a==id) {
-            a=0;++w.rel;
-            if(spacing<=0)++w.relLate;else if(unsigned(spacing)!=apart)++w.relOff;
-            break;
-        }
-    }
     // A made picture was handed to the present thread: its id (the frame's tag), the vsync it belongs on, the refresh length.
     // target 0: the pair is spaced without a slot (no display timing): it counts, its lateness cannot be judged.
     void planned(std::uint32_t id,std::int64_t target,double period) noexcept {
         if(state!=Run)return;
         ++w.made;
-        if(id)awaiting[awaitAt++%K::Ring]=id; // fg-late-relative
         if(id && target && period>0)pending[at++%K::Ring]=Pending{id,target,period};
     }
     // A picture reached the screen (VK_GOOGLE_display_timing).
@@ -503,11 +403,17 @@ public:
         if(state!=Run || !id)return;
         for(auto& p:pending)if(p.id==id) {
             ++w.shown;
-            if(lagRule) { // fg-60hz-late
-                const double dl=double(actual-p.target);
-                if(lagBase<0 || dl<lagBase)lagBase=dl;else lagBase+=(dl-lagBase)*0.05;
-                if(std::llround((dl-lagBase)/p.period)>0)++w.late;
-            } else if(std::llround(double(actual-p.target)/p.period)>0)++w.late;
+#if defined(__APPLE__)
+            // ios-fg-late (Claude 2026-10-17; c181-c183: 100 % "late" with evenly spaced pairs and GPU headroom): on iOS a picture
+            // reaches the screen a constant ~1 refresh after lane A's planned vsync, so the plan alone calls every picture late.
+            // Late = shown at least half a refresh after the observed on-time latency: a running baseline of (actual - target)
+            // that takes every new minimum at once and otherwise follows slowly (5 % per picture). A missed slot still counts.
+            {const double dl=double(actual-p.target);
+             if(lagBase<0 || dl<lagBase)lagBase=dl;else lagBase+=(dl-lagBase)*0.05;
+             if(std::llround((dl-lagBase)/p.period)>0)++w.late;}
+#else
+            if(std::llround(double(actual-p.target)/p.period)>0)++w.late;
+#endif
             p=Pending{};
             break;
         }
@@ -526,15 +432,14 @@ public:
         if(w.lost>=K::LostMax)t=Trip::Lost;
         else if(inputsTrip)t=Trip::Inputs;
         else if(w.made>=K::Window) {
-            const Window j=judged(); // fg-late-relative (w itself unless the relative rule is on)
-            if(j.shown<K::Window/2){++blind;blindSeen=j;}
-            if(j.shown>=K::Window/2 && j.lateOver(latePct))t=Trip::Late;
-            else if(w.gpuN>=K::MinSamples && w.gpuMean()>gpuMaxUs())t=Trip::Gpu; // fg-gpu-limit: the limit of the pace in force
+            if(w.shown<K::Window/2){++blind;blindSeen=w;}
+            if(w.shown>=K::Window/2 && w.lateOver(latePct))t=Trip::Late;
+            else if(w.gpuN>=K::MinSamples && w.gpuMean()>K::GpuMaxUs)t=Trip::Gpu;
             else if(w.callN>=K::MinSamples && w.callMean()>K::CallMaxUs)t=Trip::Call;
             else w=Window{}; // (a picture still waiting for its display time counts in the next window)
         }
         if(t==Trip::None)return t;
-        if(seen)*seen=judged();
+        if(seen)*seen=w;
         if(t==Trip::Inputs){state=Cool;cool=K::Cooldown;} // (never final, not one of the MaxTrips tries: see the top)
         else {
             ++tripCount;
@@ -546,24 +451,20 @@ public:
     // The generator cannot run in this run at all (its objects could not be made).
     void disable() noexcept {state=Off;cool=0;w=Window{};pending={};forgetInputs();}
     // The switch went away: when it appears again the keeper starts afresh (the limit set by lateMax() is kept).
-    void reset() noexcept {const unsigned pct=latePct;const double g=gpuBase;*this=SlotKeeper{};latePct=pct;gpuBase=g;} // (fg-gpu-limit: the presenter says the spacing again at the next frame)
-    Window window() const noexcept {return judged();} // (fg-late-relative: by value)
+    void reset() noexcept {const unsigned pct=latePct;*this=SlotKeeper{};latePct=pct;}
+    const Window& window() const noexcept {return w;}
 
 private:
     struct Pending {std::uint32_t id=0;std::int64_t target=0;double period=0;};
     enum State : unsigned {Run=0,Cool,Off};
     State state=Run;unsigned cool=0,tripCount=0,latePct=K::LateMaxPct,at=0,blind=0;
+#if defined(__APPLE__)
+    double lagBase=-1; // ios-fg-late: the observed on-time display latency (ns; -1 = none yet)
+#endif
     Window w,blindSeen;std::array<Pending,K::Ring> pending{};
     // the inputs' interruptions: the real-frame numbers of the last InterruptMax - 1 of them (0: none)
     std::uint64_t frames=0;std::array<std::uint64_t,K::InterruptMax-1> interruptAt{};unsigned interruptN=0;bool inputsTrip=false;
     void forgetInputs() noexcept {interruptAt={};interruptN=0;inputsTrip=false;}
-    // fg-late-relative: the rule in force, the made pictures whose pair has not been seen on the screen yet, and the window as
-    // the rule in force judges it (shown / late: against the slot, or - relative - of the pairs seen)
-    bool relative=false;std::array<std::uint32_t,K::Ring> awaiting{};unsigned awaitAt=0;
-    unsigned apartNow=K::GpuApart; // fg-gpu-limit
-    double gpuBase=K::GpuMaxUs;    // fg-gpu-max
-    bool lagRule=false;double lagBase=-1; // fg-60hz-late: the rule in force; the observed on-time display latency (ns; -1 = none yet)
-    Window judged() const noexcept {Window j=w;if(relative){j.shown=w.rel;j.late=w.relLate;}return j;}
 };
 
 } // namespace recomp::fgg

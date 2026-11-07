@@ -248,17 +248,26 @@ def main(argv=None) -> int:
     ap.add_argument('--ndk', type=Path)
     ap.add_argument('--xcode', type=Path)
     ap.add_argument('--record', action='store_true')
+    ap.add_argument('--development-toolchain', action='store_true',
+                    help='accept a successfully compiled Apple library while reporting release identity differences')
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--plan', type=Path, default=HERE / 'xma_decoder' / 'plan.json')
     ap.add_argument('--configured', type=Path, default=HERE / 'xma_decoder' / 'configured')
     ap.add_argument('--jobs', type=int, default=3)
     a = ap.parse_args(argv)
     plan = check_plan(json.loads(a.plan.read_text(encoding='utf-8')))
+    if a.development_toolchain and (not apple(plan) or a.record):
+        raise ValueError('--development-toolchain requires an Apple plan and cannot be combined with --record')
     if not plan['expect'] and not a.record:
         raise ValueError('the plan expects no hashes yet: run once with --record')
     if (a.ndk is None) == (a.xcode is None):
         raise ValueError('give --ndk (an Android plan) or --xcode (an Apple plan)')
     report = build(plan, a.source_archive, a.configured, a.ndk, a.output.absolute(), a.jobs, xcode=a.xcode)
+    if a.development_toolchain:
+        report['verification'] = 'development'
+        report['release_equivalent'] = report['status'] == 'complete'
+        (a.output / 'report.json').write_text(json.dumps(report, indent=1, sort_keys=True) + '\n', encoding='utf-8', newline='\n')
+        print('DEVELOPMENT BUILD: decoder source verified; release code identity is not certified.', flush=True)
     if a.record:
         if plan['expect']:
             raise ValueError('--record writes into a plan without hashes only')
@@ -274,7 +283,7 @@ def main(argv=None) -> int:
             else 'as expected (the first machine\'s objects; this host\'s compiler name in them)'
         print('XMA_ARCHIVE', path, entry['bytes'], entry['sha256'], verdict, flush=True)
     print('XMA_DECODER', report['status'], f'{report["units"]} units from revision {report["revision"]}', flush=True)
-    return 0 if report['status'] == 'complete' else 1
+    return 0 if report['status'] == 'complete' or a.development_toolchain else 1
 
 
 if __name__ == '__main__':

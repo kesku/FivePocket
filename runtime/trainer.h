@@ -71,7 +71,11 @@ constexpr std::uint32_t PlayerId=joaat("PLAYER_ID"),PlayerPedId=joaat("PLAYER_PE
     // v834 (thor-radio, the Quick Save button without the phone): SET_SAVE_MENU_ACTIVE (sub_82D7F9E8 -> sub_82D7E5E0: with arg 0 it does
     // nothing while the ped is in a vehicle; else the ped's velocities zeroed, then sub_825EBCE0(joaat("FE_MENU_VERSION_SAVEGAME") 809275cc,
     // 1, -1, 0) = the frontend's Save Game menu), GET_MISSION_FLAG, IS_AUTO_SAVE_IN_PROGRESS (refusals).
-    SetSaveMenuActive=joaat("SET_SAVE_MENU_ACTIVE"),GetMissionFlag=joaat("GET_MISSION_FLAG"),IsAutoSaveInProgress=joaat("IS_AUTO_SAVE_IN_PROGRESS");
+    SetSaveMenuActive=joaat("SET_SAVE_MENU_ACTIVE"),GetMissionFlag=joaat("GET_MISSION_FLAG"),IsAutoSaveInProgress=joaat("IS_AUTO_SAVE_IN_PROGRESS"),
+    // v717 (the Fold's phone pad; bug-fix's contract via main, 2026-10-25): a ringing call (handler 0x82D6CA70) and a call ongoing
+    // (handler 0x82D54080), read only while the phone is up (phoneCall).
+    IsPedRingtonePlaying=joaat("IS_PED_RINGTONE_PLAYING"),IsMobilePhoneCallOngoing=joaat("IS_MOBILE_PHONE_CALL_ONGOING");
+static_assert(IsPedRingtonePlaying==0xfe576ee4u && IsMobilePhoneCallOngoing==0x4ed1400au,"the contract's 360 hashes");
 }
 // Every hash the trainer may call: the glue records their handlers when the game registers its natives.
 inline constexpr std::uint32_t UsedNatives[]{
@@ -83,7 +87,8 @@ inline constexpr std::uint32_t UsedNatives[]{
     n::IsPedInAnyVehicle,n::GetVehiclePedIsIn,n::SetVehicleFixed,n::SetVehicleDeformationFixed,n::SetVehicleDirt,n::SetVehicleOnGround,
     n::SetVehicleEngineOn,n::FirstBlipInfoId,n::DoesBlipExist,n::BlipInfoIdCoord,n::GroundZ,n::SetPedCoordsKeepVehicle,
     n::RequestCollisionAtCoord,n::SetClockTime,n::PauseClock,n::SetWeatherNowPersist,n::ClearWeatherPersist,n::SuperJumpThisFrame,
-    n::RunSprintMultiplier,n::SwimMultiplier,n::SetSaveMenuActive,n::GetMissionFlag,n::IsAutoSaveInProgress};
+    n::RunSprintMultiplier,n::SwimMultiplier,n::SetSaveMenuActive,n::GetMissionFlag,n::IsAutoSaveInProgress,
+    n::IsPedRingtonePlaying,n::IsMobilePhoneCallOngoing};
 inline bool used(std::uint32_t hash) noexcept {
     return std::find(std::begin(UsedNatives),std::end(UsedNatives),hash)!=std::end(UsedNatives);
 }
@@ -574,4 +579,14 @@ private:
     std::atomic<int> seq_{0};
 };
 
+// v717 (the Fold's phone pad, recomp_phone_state_v1): bit 1 = ringing (IS_PED_RINGTONE_PLAYING(PLAYER_PED_ID())), bit 2 = a call
+// ongoing (IS_MOBILE_PHONE_CALL_ONGOING()); a native not registered reads as 0.
+inline int phoneCall(Natives& nat) noexcept {
+    std::uint32_t out[3]{};int b=0;
+    if(!nat.call(n::PlayerPedId,nullptr,0,out))return 0;
+    const std::uint32_t ped=out[0];
+    if(ped && nat.call(n::IsPedRingtonePlaying,&ped,1,out) && out[0])b|=2;
+    if(nat.call(n::IsMobilePhoneCallOngoing,nullptr,0,out) && out[0])b|=4;
+    return b;
+}
 } // namespace recomp::trainer

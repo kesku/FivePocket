@@ -11,6 +11,8 @@
 #include "vulkan_queue_lock.h"
 namespace recomp::gpu {
 inline VkResult lockedQueueWaitIdleHeld(VkQueue queue) {
+    auto operation=::recomp::apple::iosGpuLifecycle().acquire(queue);
+    if(!operation)return VK_ERROR_DEVICE_LOST;
     std::lock_guard lock(sharedQueueMutex());
     return vkQueueWaitIdle(queue);
 }

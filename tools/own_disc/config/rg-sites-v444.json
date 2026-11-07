@@ -1,0 +1,34 @@
+{
+ "chunks": [
+  18
+ ],
+ "sites": {
+  "tex-ps": [
+   "__imp__sub_823B8650",
+   "after-stmt",
+   "\t// mr r29,r4",
+   "RECOMP_RG_PARAMS(\"0\", ctx.r3.u32, ctx.r4.u32);"
+  ],
+  "tex-vs": [
+   "__imp__sub_823B8EC8",
+   "after-stmt",
+   "\t// mr r28,r4",
+   "RECOMP_RG_PARAMS(\"4\", ctx.r3.u32, ctx.r4.u32);"
+  ],
+  "geom": [
+   "__imp__sub_823B9668",
+   "after-label",
+   "loc_823B970C:",
+   "RECOMP_RG_GEOM(ctx.r26.u32, ctx.r29.u32);"
+  ]
+ },
+ "groups": {
+  "tex": [
+   "tex-ps",
+   "tex-vs"
+  ],
+  "geom": [
+   "geom"
+  ]
+ }
+}

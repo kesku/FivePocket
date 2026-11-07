@@ -538,8 +538,9 @@ def build(args) -> int:
     if recipe.get('schema') != SCHEMA:
         raise SystemExit('not a chunk recipe')
     out = Path(args.out).absolute()
-    if out.exists() or not out.is_relative_to(root / 'local-analysis') or out.is_relative_to(root / 'local-analysis/attempts'):
-        raise SystemExit('OUT_DIR must be new, under local-analysis/ and outside attempts/')
+    if out.exists() or out.is_relative_to(root / 'local-analysis/attempts'):
+        raise SystemExit('OUT_DIR must be new and outside attempts/')
+    host_support.private_output(out)
     if any(k.endswith('_MUTANT') for k in os.environ):
         raise SystemExit('a *_MUTANT variable is set: pass tools would run their mutants')
     problems = check_hashes(recipe, root)

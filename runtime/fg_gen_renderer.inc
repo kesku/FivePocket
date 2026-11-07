@@ -19,11 +19,6 @@
     //   diag-fg-audit      one made frame per window is audited (its block classes counted: RENDER_DIRECT_FG_GEN audit=)
     //   diag-fg-fail       text: the refusal threshold, 4 .. 32 (default 10)
     //   diag-fg-late-max   text: the slot keeper's limit in percent, 5 .. 95 (default 40)
-    //   diag-fg-gpu-max    text: the slot keeper's GPU-time limit in microseconds, 2000 .. 6000 (default 3000; fg-gpu-max, v639)
-    // fg-scaled (2026-10-10; fgGenPresent only, every edit is marked fg-scaled): with a render scale applied
-    // (files/settings/render-scale.txt, render_scale.h) the frame's picture and its scene depth are handed too, when they
-    // are the SAME frame at the SAME scale: the present image has the scaled frame's size (stage B hands the frame over at
-    // its render size) and the depth target is drawn at the run's scale. At 100 % both tests are v513's.
     bool fgGenOn=false;                 // the cached flag every hook tests first
     bool fgGenSeen=false;               // diag-fg-between was seen in this run (the window line is logged from then on; check c2)
     unsigned fgGenFile=0,fgGenAuditToken=0,fgGenDepthMoves=0;
@@ -32,6 +27,13 @@
     std::array<std::uint32_t,48> fgGenVariantFrames{}; // fixer2: frames whose camera came from tonemap postfx#(20 + k), since the last window line
     std::uint64_t fgGenDepthKey=~0ull;  // the depth target that has the role of the scene depth (fgGenDepthOf; ~0: none yet)
     std::uint64_t fgGenDepthClock=0;    // the renderer's write clock at the previous present with the generator on
+    // ios-fg-scaled (Claude 2026-10-17, owner: "make the generator accept scaled pictures"): with a render scale and stage A
+    // (diag-rs-stage-a: the renderer hands the presenter a 1280x720 present image), the scene depth is still at render size.
+    // The generator's shaders read depth with texelFetch at the PICTURE's pixel coordinates, so it gets a 1280x720 copy:
+    // the picture's region of the scaled depth, blitted with NEAREST (depth aspect). Refused (no depth) when the device cannot
+    // blit the format. Never used at scale 1.
+    Image fgGenDepthUp{};int fgGenDepthUpOk=-1; // (-1: not yet decided; 0: refused; 1: usable)
+    std::uint64_t fgGenDepthUpBlits=0;
 
     static bool fgGenHas(const char* name) noexcept {
         char path[160];std::snprintf(path,sizeof path,RECOMP_APP_PATH("/private-trace/%s"),name);
@@ -39,6 +41,18 @@
     }
     // A tuning file's text (null when absent or unreadable).
     static const char* fgGenText(const char* name,char* out,std::size_t cap) noexcept {
+#if defined(__APPLE__)
+        // (Claude 2026-10-20, iOS test runs) RECOMP_IOS_FG_TEXT="name=value;name=value": the text of these tuning files
+        // (diag-fg-fail, diag-fg-late-max), which the iOS shell cannot write; the file is read otherwise
+        if(const char* e=std::getenv("RECOMP_IOS_FG_TEXT")) {
+            const std::size_t nl=std::strlen(name);
+            for(const char* p=e;*p;) {
+                const char* end=std::strchr(p,';');const std::size_t len=end?std::size_t(end-p):std::strlen(p);
+                if(len>nl+1 && !std::strncmp(p,name,nl) && p[nl]=='='){const std::size_t v=std::min(len-nl-1,cap-1);std::memcpy(out,p+nl+1,v);out[v]=0;return out;}
+                if(!end)break;p=end+1;
+            }
+        }
+#endif
         char path[160];std::snprintf(path,sizeof path,RECOMP_APP_PATH("/private-trace/%s"),name);
         FILE* f=std::fopen(path,"r");
         if(!f)return nullptr;
@@ -50,8 +64,10 @@
     [[gnu::noinline]] void fgGenWindow() noexcept {
         namespace fgg=recomp::fgg;
         // (a path that ends with the switch's name: the app's Settings screen looks for exactly this string in the library)
-        const bool between=access(RECOMP_APP_PATH("/private-trace/diag-fg-between"),F_OK)==0 &&
-                           access(RECOMP_APP_PATH("/private-trace/diag-measure-unpaced"),F_OK)!=0; // v558 (measurement only): unpaced = no generation either
+        bool between=access(RECOMP_APP_PATH("/private-trace/diag-fg-between"),F_OK)==0;
+#if defined(__APPLE__)
+        between=between || recomp::apple::launcher::bridge::frameGeneration(); // (Claude, 2026-10-18: the launcher's Frame Generation)
+#endif
         const bool show=between && fgGenHas("diag-fg-show");
         const unsigned window=fgGenFile;
         fgGenFile=(between?fgg::SwGenBetween:0u)|(show?fgg::SwShow:0u);
@@ -63,13 +79,7 @@
             const float fail=fgg::tuned(fgGenText("diag-fg-fail",text,sizeof text),fgg::K::FailLo,fgg::K::FailHi,fgg::K::Fail);
             const float late=fgg::tuned(fgGenText("diag-fg-late-max",text,sizeof text),float(fgg::K::LateLo),float(fgg::K::LateHi),float(fgg::K::LateMaxPct));
             if(fgGenHas("diag-fg-audit"))++fgGenAuditToken;
-#if defined(RECOMP_THOR_EDITION) // Thor RC1 (v806): the Thor's GPU-time limit without the file is 3500 us (the owner's setting since v639's
-            constexpr float GpuMaxDefault=3500.0f;  // device runs; files/private-trace/diag-fg-gpu-max still overrides it within 2000 .. 6000)
-#else
-            constexpr float GpuMaxDefault=float(fgg::K::GpuMaxUs);
-#endif
-            const float gpu=fgg::tuned(fgGenText("diag-fg-gpu-max",text,sizeof text),float(fgg::K::GpuMaxLo),float(fgg::K::GpuMaxHi),GpuMaxDefault); // fg-gpu-max
-            presenter.fgGenTune(fail,unsigned(late),fgGenAuditToken,gpu);
+            presenter.fgGenTune(fail,unsigned(late),fgGenAuditToken);
             if(!fgGenOn){fgGenEveryFrame();fgGenDepthKey=~0ull;fgGenDepthClock=writeClock;fgGenDepthMoves=0;fgGenTonemapBase=postfxDraws[0];}
             fgGenSeen=true;
         }
@@ -98,56 +108,81 @@
         if(!fgGenCameraDraws++) {
             recomp::fgg::takeCamera(fgGenCamera,*in.pixelConstants);fgGenCameraFrame=frame;
             const unsigned v=post::tonemapVariant(psHash);if(v>=20 && v<20+fgGenVariantFrames.size())++fgGenVariantFrames[v-20]; // (the window line)
-            ffTonemapNow=std::uint16_t(v); // (fixer2: the frame facts)
         }
+    }
+    // ios-fg-scaled: the picture's region of a scaled depth target into fgGenDepthUp (1280x720, the target's format), NEAREST.
+    [[gnu::noinline]] bool fgGenDepthUpscale(const Target& t) noexcept {
+        namespace fgg=recomp::fgg;
+        if(fgGenDepthUpOk==0)return false;
+        if(fgGenDepthUpOk<0) {
+            VkFormatProperties p{};vkGetPhysicalDeviceFormatProperties(d.physical,t.image.format,&p);
+            const VkFormatFeatureFlags need=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            const bool can=(p.optimalTilingFeatures&need)==need;
+            const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY};
+            const bool made=can && makeImage(fgg::Width,fgg::Height,1,t.image.format,VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                              (t.image.format==VK_FORMAT_D32_SFLOAT_S8_UINT || t.image.format==VK_FORMAT_D24_UNORM_S8_UINT)?
+                                              VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT):VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT),
+                                              false,identity,fgGenDepthUp); // (the view: depth only - makeImage's rule)
+            fgGenDepthUpOk=made?1:0;
+            GLOG("RENDER_IOS_FG_SCALED depth_up=%u blit_features=%u format=%d k=%d",unsigned(made),unsigned(can),int(t.image.format),int(t.image.k));
+            if(!made)return false;
+            endPass(__LINE__);toGeneral(fgGenDepthUp);
+        }
+        endPass(__LINE__);barrier();
+        VkImageBlit b{};b.srcSubresource={VK_IMAGE_ASPECT_DEPTH_BIT,0,0,1};b.dstSubresource=b.srcSubresource;
+        b.srcOffsets[1]={std::int32_t(rscale::extent(fgg::Width,t.image.k)),std::int32_t(rscale::extent(fgg::Height,t.image.k)),1};
+        b.dstOffsets[1]={std::int32_t(fgg::Width),std::int32_t(fgg::Height),1};
+        vkCmdBlitImage(cmd,t.image.image,VK_IMAGE_LAYOUT_GENERAL,fgGenDepthUp.image,VK_IMAGE_LAYOUT_GENERAL,1,&b,VK_FILTER_NEAREST);
+        barrier();++fgGenDepthUpBlits;
+        return true;
     }
     // ---- hook: present(), after the blit into the present image: this frame's inputs for the presenter's generator.
     [[gnu::noinline]] void fgGenPresent(const Image& presentImage) noexcept {
         namespace fgg=recomp::fgg;
         fgg::FrameIn in;in.tag=presentTag;in.frame=fgGenCameraFrame;
         // the picture: the game's 1280x720 UNORM present image (not the sRGB image of diag-gamma-on, the mosaic, a census frame)
-        // fg-scaled: ... or, with a render scale, the present image that IS the scaled frame (frameW x frameH: 960x540 at
-        // 75 %; stage B's present image of a frame that goes to the presenter on the GPU). A scaled run's 1280x720 present
-        // images (stage A's blit: diag-rs-stage-a; a frame that is read back) are not handed: their pixels are not the
-        // scaled depth's texels. At 100 % frameW x frameH is 1280x720 and the test is v513's.
-        const unsigned frameW=rscale::extent(fgg::Width,rsK),frameH=rscale::extent(fgg::Height,rsK);
-        const bool picture=presentImage.view && fgg::pictureIsFrame(presentImage.width,presentImage.height,frameW,frameH) &&
-            presentImage.format==VK_FORMAT_R8G8B8A8_UNORM && !v369Mosaic && !census.active;
-        if(picture){in.sourceView=reinterpret_cast<std::uint64_t>(presentImage.view);in.sourceW=std::uint16_t(frameW);in.sourceH=std::uint16_t(frameH);}
+        // ios-fg-native (Claude 2026-10-19): under stage B the presenter receives the picture at the render size (rsbW x rsbH); the
+        // generator then works at that size (when the block grid divides it), with the depth target of the same scale as it is
+        const bool native=rsbW && rsK!=rscale::One && fgg::sizeOk(rsbW,rsbH);
+        // (under stage B the present image is made at the render size itself: rsbPresentW/H, host texels, k = 16)
+        const bool picture=presentImage.view && presentImage.width==(native?rsbW:fgg::Width) && presentImage.height==(native?rsbH:fgg::Height) &&
+            presentImage.format==VK_FORMAT_R8G8B8A8_UNORM && !v369Mosaic && !census.active && (rsK==rscale::One || !rsbW || native); // (ios-fg-scaled: stage A's 1280x720 present image)
+        if(picture)in.sourceView=reinterpret_cast<std::uint64_t>(presentImage.view);
         // the camera: taken while this frame was rendered (presentCount was advanced at the top of this present), and only
         // from a frame with exactly one tonemap draw (the renderer's own count; the hook sees a frame's first draw only)
         in.tonemapDraws=std::uint32_t(postfxDraws[0]-fgGenTonemapBase);fgGenTonemapBase=postfxDraws[0];
+        if(!in.tonemapDraws)++iosNoTonemapPs[iosLastFullPs]; // (ios-notonemap diagnosis: which full-picture shader ended such a frame)
+        iosLastFullPs=0;
         const bool taken=fgGenCameraDraws && fgGenCameraInterval+1==presentCount;
         if(taken)in.cam=fgGenCamera;
         in.why=fgg::cameraVerdict(in.tonemapDraws,taken,fgGenCamera);
         // the scene depth, read as it is. Nothing here can see what a target HOLDS; what can be checked is checked (check c2):
         //   candidates  depth targets of pitch 1280, not scaled, that THIS frame drew into (a write stamp newer than the
         //               previous present's: a target the frame did not touch holds another frame's depth and is never handed);
-        //               (fg-scaled: "not scaled" is now "at the run's scale": with a render scale every pitch-1280 target is
-        //               drawn at rsK (render_scale.h targetK), so its texel (x, y) is the scaled frame's pixel (x, y);
-        //               a target at any other scale is never handed. The pitch stays the guest's 1280 at every scale.)
         //   the role    the candidate that had it at the previous present keeps it, so a later pass of the frame that draws
         //               into another pitch-1280 depth target (a phone, a 3D menu) does not take it away; otherwise the newest.
         // No candidate: no depth is handed and the frame gets no made picture (nogen=no-depth). Every change of the role is
         // logged with the number of candidates and of changes since the switch came on (DEVICE-PLAN.md G1: one line, 0:17:1280).
         const Target* best=nullptr;const Target* same=nullptr;unsigned candidates=0;
         for(const auto& [key,t]:targets) {
-            if(!t.depth || t.pitch!=fgg::Width || !t.image.image || !t.image.view || t.image.k!=rsK || t.written<=fgGenDepthClock)continue; // (fg-scaled: rsK; was rscale::One)
+            if(!t.depth || t.pitch!=fgg::Width || !t.image.image || !t.image.view || t.written<=fgGenDepthClock)continue;
+            if(native?t.image.k!=rsK:(t.image.k!=rscale::One && (rsbW || t.image.k!=rsK)))continue; // (ios-fg-scaled: a scaled target under stage A; ios-fg-native: the render scale's)
             ++candidates;
             if(fgGenDepthOf(t)==fgGenDepthKey)same=&t;
             if(!best || t.written>best->written)best=&t;
         }
         if(same)best=same;
         fgGenDepthClock=writeClock;
+        if(best && !native && best->image.k!=rscale::One && !fgGenDepthUpscale(*best))best=nullptr; // ios-fg-scaled: no usable 1280x720 copy -> no depth
         if(best) {
-            // (fg-scaled: the depth image's size in ITS texels: Image::width / height are guest pixels, the Vulkan image is their scaled extent; the same numbers at 100 %)
-            in.depthView=reinterpret_cast<std::uint64_t>(best->image.view);in.depthW=rscale::extent(best->image.width,best->image.k);in.depthH=rscale::extent(best->image.height,best->image.k);
+            const bool up=!native && best->image.k!=rscale::One;
+            in.depthView=reinterpret_cast<std::uint64_t>(up?fgGenDepthUp.view:best->image.view);
+            in.depthW=native?rsHostW(best->image):best->image.width;in.depthH=native?rscale::extent(best->image.height,best->image.k):best->image.height; // (ios-fg-native: host texels)
             if(const std::uint64_t key=fgGenDepthOf(*best);key!=fgGenDepthKey) { // (once, and whenever another target takes the role)
                 if(fgGenDepthKey!=~0ull)++fgGenDepthMoves;
                 fgGenDepthKey=key;
-                // (fg-scaled: size= is the depth image's own size, in.depthW x in.depthH: 960x576 at 75 %; at 100 % the numbers it always printed)
                 GLOG("RENDER_DIAG_FG_GEN depth=%u:%u:%u size=%ux%u vkformat=%d pending_clears=%zu residue=%u tonemap_draws=%u camera=%s candidates=%u moves=%u",best->base,best->xenosFormat,best->pitch,
-                     in.depthW,in.depthH,int(best->image.format),best->pendingClears.size(),unsigned(best->residuePending),in.tonemapDraws,fgg::text(in.why),candidates,fgGenDepthMoves);
+                     best->image.width,best->image.height,int(best->image.format),best->pendingClears.size(),unsigned(best->residuePending),in.tonemapDraws,fgg::text(in.why),candidates,fgGenDepthMoves);
             }
         }
         recomp::gpu::direct::presenter().fgGenFrame(in);

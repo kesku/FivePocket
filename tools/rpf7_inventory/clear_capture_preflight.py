@@ -144,10 +144,10 @@ def main():
     names = ['device-state.bin', 'clear-rectangle.bin', 'clear-color.bin'] + [f'surface-{i}-resource.bin' for i in range(5)]
     report = clear_requirements(meta, {name: read(name, True) for name in names})
     report['source_sha256'] = {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in (
-        'tools/rpf7_inventory/clear_capture_preflight.py', 'android/app/src/main/cpp/gta5_color8_clear_plan.h',
-        'android/app/src/main/cpp/gta5_color8_clear.h', 'android/app/src/main/cpp/gta5_clear_capture.h',
-        'android/app/src/main/cpp/xenos_float24_clear.h',
-        'android/app/src/main/cpp/native_color8_clear_target.h')}
+        'tools/rpf7_inventory/clear_capture_preflight.py', 'runtime/host/gta5_color8_clear_plan.h',
+        'runtime/host/gta5_color8_clear.h', 'runtime/host/gta5_clear_capture.h',
+        'runtime/host/xenos_float24_clear.h',
+        'runtime/host/native_color8_clear_target.h')}
     print(json.dumps(report, indent=2, allow_nan=False))
 
 

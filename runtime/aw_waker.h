@@ -31,6 +31,10 @@
 #include <thread>
 #include <utility>
 #include "cpu_topology.h" // topology lane: the waker's little role
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #if defined(__ANDROID__) || defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -231,6 +235,12 @@ private:
         recomp_aw_waker_tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_relaxed);
         (void)pthread_setname_np(pthread_self(), "recomp-aw-waker");
         (void)setpriority(PRIO_PROCESS, 0, -20); // (the app's RLIMIT_NICE allows it, as trace_runner's v336)
+#elif defined(__APPLE__)
+        // iOS (Claude 2026-10-17): the waker spins for its window after each notify; at utility QoS it runs on an efficiency
+        // core (the CPU and GPU share one power budget, c105/c129). Named for the sampler; tid = pthread_threadid_np's.
+        (void)pthread_setname_np("recomp-aw-waker");
+        (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        { std::uint64_t id = 0; (void)pthread_threadid_np(nullptr, &id); recomp_aw_waker_tid.store(static_cast<int>(id), std::memory_order_relaxed); }
 #endif
         place();
         auto& st = stats();

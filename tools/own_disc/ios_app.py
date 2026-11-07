@@ -6,7 +6,7 @@
                    [--version TEXT] [--display-name TEXT] [--sdk-label SDK[:BUILD]] [--icon FILE.png]
 
 payload: made before the compile, because the shell seeds Library/r only when the SHA-256 of payload/manifest.txt
-equals the RECOMP_PAYLOAD_MANIFEST_SHA256 compiled into it (ios_compile.py --define). The payload map (ios-payload/1)
+equals the RECOMP_PAYLOAD_MANIFEST_SHA256 compiled into it (the CMake source target). The payload map (ios-payload/1)
 names, for every file of the seed, the stage and path it comes from and its SHA-256 (the decoded image, the boot modules,
 the catalogs, the shader pack), checked when it is placed, and the runtime's switch files (one byte "1" each: the app's
 own settings, not game data). It writes NEW_DIR/r/<path> for each, NEW_DIR/manifest.txt ("<sha256> <bytes> <path>",
@@ -104,7 +104,7 @@ def xcode_fields(xcode: Path) -> dict:
 
 def compile_icon(icon: Path, xcode: Path, app: Path, minimum: str) -> dict:
     """the app icon as Xcode builds it from a single-size 1024 catalog entry: Assets.car + icon files into the app; returns the
-    Info.plist keys actool writes (CFBundleIcons, CFBundleIcons~ipad)"""
+    Info.plist keys actool writes for the iPhone app"""
     import tempfile
     head = icon.read_bytes()[:33]
     if head[:8] != b'\x89PNG\r\n\x1a\n' or int.from_bytes(head[16:20], 'big') != 1024 or int.from_bytes(head[20:24], 'big') != 1024:
@@ -121,7 +121,7 @@ def compile_icon(icon: Path, xcode: Path, app: Path, minimum: str) -> dict:
         partial = Path(tmp) / 'partial.plist'
         r = subprocess.run(['/usr/bin/xcrun', 'actool', str(cat), '--compile', str(app), '--platform', 'iphoneos',
                             '--minimum-deployment-target', minimum, '--app-icon', 'AppIcon', '--output-partial-info-plist',
-                            str(partial), '--target-device', 'iphone', '--target-device', 'ipad', '--output-format',
+                            str(partial), '--target-device', 'iphone', '--output-format',
                             'human-readable-text'], capture_output=True, text=True, env=dict(os.environ, DEVELOPER_DIR=str(xcode)))
         if r.returncode or not partial.is_file() or not (app / 'Assets.car').is_file():
             raise SystemExit(f'refused: actool did not build the icon: {(r.stdout + r.stderr).strip()[-400:]}')
@@ -193,6 +193,10 @@ def build_app(executable: Path, app_files: Path, payload: Path, bundle_id: str, 
         info['CFBundleDisplayName'] = info['CFBundleName'] = display_name
     if icon is not None:
         info.update(compile_icon(icon, xcode, out, info.get('MinimumOSVersion', '17.4')))
+    info['UIDeviceFamily'] = [1]
+    for key in list(info):
+        if key.endswith('~ipad'):
+            del info[key]
     info.pop('BuildMachineOSBuild', None)                 # the building Mac's own system: not a property of the app
     with (out / 'Info.plist').open('wb') as f:
         plistlib.dump(info, f, fmt=plistlib.FMT_BINARY, sort_keys=True)

@@ -1,0 +1,66 @@
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2138,6 +2138,12 @@
+             uint32_t count = 0;
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
++            // (artifact A) A boolean-conditional exec block runs only while its boolean constant equals `condition`
++            // (the instruction's boolAddress / condition fields, the same two fields CondJmp already honours below).
++            // The block used to be emitted unconditionally.
++            bool boolConditional = false;
++            uint32_t boolAddress = 0;
++            bool boolCondition = false;
+ 
+             switch (cfInstr.opcode)
+             {
+@@ -2156,7 +2162,10 @@
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++                boolConditional = true;
++                boolAddress = cfInstr.condExec.boolAddress;
++                boolCondition = cfInstr.condExec.condition != 0;
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -2245,6 +2254,24 @@
+                 }
+                 break;
+             }
++            }
++
++            if (boolConditional)
++            {
++                // g_Booleans carries vertex b0-b15 in bits 0-15 and pixel b0-b15 in bits 16-31; a named bool's
++                // #define is its bit. The end forms keep their return inside the block: when the test fails,
++                // execution continues with the next control-flow instruction.
++                indent();
++                auto findResult = boolConstants.find(boolAddress);
++                if (findResult != boolConstants.end())
++                    println("if ((g_Booleans & {}) {}= 0)", findResult->second, boolCondition ? "!" : "=");
++                else if (boolAddress < 16)
++                    println("if ((g_Booleans & (1u << {})) {}= 0)", boolAddress + (isPixelShader ? 16 : 0), boolCondition ? "!" : "=");
++                else
++                    throw std::runtime_error("conditional exec tests a boolean constant outside g_Booleans");
++                indent();
++                out += "{\n";
++                ++indentation;
+             }
+ 
+             auto instructionCode = code + address * 3;
+@@ -2394,6 +2421,13 @@
+                     out += "\t\t\tbreak;\n";
+                 }
+             }
++
++            if (boolConditional)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
+         }
+ 
+         controlFlowCode += 3;

@@ -1,7 +1,7 @@
 #!/bin/sh
 # The FivePocket builder on macOS (2026-11-05): runs the front end (tools/own_disc/builder.py) with the Python of the Mac's Xcode
 # (Python 3.9: python-compat/ adds what the tools use from 3.10), this folder as the package, its host programs, and Xcode from
-# DEVELOPER_DIR (default /Applications/Xcode.app when it is there). Usage: ./builder [check|fetch|build|verify|sign] ...
+# DEVELOPER_DIR (default /Applications/Xcode.app when it is there). Usage: ./builder [check|fetch|build|sign] ...
 # Without a word it prints what to do. Nothing here installs anything.
 here=$(cd "$(dirname "$0")" && pwd -P) || exit 2
 export BUILDER_PACKAGE_ROOT="$here"

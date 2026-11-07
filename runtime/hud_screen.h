@@ -67,10 +67,20 @@
 #include <string>
 #include <thread>
 #include <vector>
-#if defined(__ANDROID__)
-#include <android/log.h>
+// ios-duo (2026-10-24): the iOS Duo edition's lower screen is the bottom half of a portrait screen, a second CAMetalLayer the app hands
+// over through recomp_set_hud_window_v1 (Main.mm, RECOMP_DUO_EDITION); the surface is VK_EXT_metal_surface, as direct_present.h makes
+// the main one on iOS. Everything else is the Thor's code. Host builds (macOS, no RECOMP_DUO_EDITION) keep the stub below.
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(RECOMP_DUO_EDITION))
+#define RECOMP_HUD2_REAL 1
+#endif
+#if defined(RECOMP_HUD2_REAL)
+#include <android/log.h> // (iOS: platform/apple/include/android/log.h, the port's log shim)
 #include <pthread.h>
+#if defined(__APPLE__)
+#include <vulkan/vulkan_metal.h>
+#else
 #include <vulkan/vulkan_android.h>
+#endif
 #include "recomp_app_dir.h"
 #include "hud_screen_spirv.h"
 #endif
@@ -112,7 +122,7 @@ struct HudWindow {
     void (*release)(void*,ANativeWindow*) noexcept=nullptr;
     std::uint64_t (*generation)(void*) noexcept=nullptr;
 };
-#if defined(__ANDROID__)
+#if defined(RECOMP_HUD2_REAL)
 #define RECOMP_HUD2_LOG(...) __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",__VA_ARGS__)
 class Screen {
 public:
@@ -124,7 +134,19 @@ public:
         RECOMP_HUD2_LOG("RENDER_HUD2 callbacks=1");
     }
     // Per real frame, Presenter::m held: false = nothing to do (no callbacks, or off for the run).
+#if defined(RECOMP_DUO_EDITION)
+    // ios-duo (2026-10-24): the Thor's lower screen always exists; the Duo's is the bottom half of a portrait screen, and the player's
+    // fullscreen toggle takes it away (recomp_duo_set_lower_screen_v1, Main.mm). shown=false makes wanted() false, so the game's own
+    // minimap box and wheels stay on the main frame and nothing is prepared for the lower screen, exactly as without callbacks.
+    void setShown(bool on) noexcept {if(shown.exchange(on,std::memory_order_relaxed)!=on)RECOMP_HUD2_LOG("RENDER_DUO lower=%d",int(on));}
+    bool wanted() const noexcept {return callbacks.load(std::memory_order_relaxed) && !off.load(std::memory_order_relaxed) && shown.load(std::memory_order_relaxed);}
+    std::atomic<bool> shown{true};
+    // ios-duo: the lower screen's map rectangle in its pixels (layout3's map, as RENDER_HUD3 logs it), for the app's tap zone
+    // (recomp_duo_lower_map_rect_v1); all 0 before a layout.
+    std::atomic<int> duoMapRect[4]{};
+#else
     bool wanted() const noexcept {return callbacks.load(std::memory_order_relaxed) && !off.load(std::memory_order_relaxed);}
+#endif
     // hud4 (v597): whether the renderer replays the minimap for this screen (files/settings/second-screen.txt replica=0: no)
     bool replicaWanted() const noexcept {return wanted() && replicaOn.load(std::memory_order_relaxed);}
     // hud5 (v604): files/settings/minimap.txt as read when the HUD window was set up ("bottom": the renderer leaves the game's minimap
@@ -389,7 +411,12 @@ private:
     static constexpr std::uint32_t PoolSets=16; // hud4: the radar set + replica sets
     VkPipelineLayout pipelineLayout=VK_NULL_HANDLE;VkShaderModule vs=VK_NULL_HANDLE,fs=VK_NULL_HANDLE;bool statics=false;
     VkRenderPass renderPass=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;VkBuffer lutBuffer=VK_NULL_HANDLE;
-    PFN_vkCreateAndroidSurfaceKHR createSurface=nullptr;PFN_vkDestroySurfaceKHR destroySurface=nullptr;
+#if defined(__APPLE__)
+    PFN_vkCreateMetalSurfaceEXT createSurface=nullptr; // ios-duo
+#else
+    PFN_vkCreateAndroidSurfaceKHR createSurface=nullptr;
+#endif
+    PFN_vkDestroySurfaceKHR destroySurface=nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR surfaceSupport=nullptr;PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surfaceCaps=nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surfaceFormats=nullptr;PFN_vkCreateSwapchainKHR createSwapchain=nullptr;
     PFN_vkDestroySwapchainKHR destroySwapchain=nullptr;PFN_vkGetSwapchainImagesKHR swapchainImages=nullptr;
@@ -398,7 +425,11 @@ private:
     bool load() noexcept {
         const auto i=[&](const char* n){return vkGetInstanceProcAddr(inst,n);};
         const auto d=[&](const char* n){return vkGetDeviceProcAddr(dev,n);};
+#if defined(__APPLE__)
+        createSurface=reinterpret_cast<PFN_vkCreateMetalSurfaceEXT>(i("vkCreateMetalSurfaceEXT")); // ios-duo (device.cpp enables the extension)
+#else
         createSurface=reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(i("vkCreateAndroidSurfaceKHR"));
+#endif
         destroySurface=reinterpret_cast<PFN_vkDestroySurfaceKHR>(i("vkDestroySurfaceKHR"));
         surfaceSupport=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(i("vkGetPhysicalDeviceSurfaceSupportKHR"));
         surfaceCaps=reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(i("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
@@ -605,7 +636,12 @@ private:
         if(!nw)return "-no-window";
         if(g!=gen){gen=g;}
         readSettings();
+#if defined(__APPLE__)
+        // ios-duo: nw is the app's lower-screen CAMetalLayer (opaque here; the app keeps it alive while its generation lasts)
+        VkMetalSurfaceCreateInfoEXT si{};si.sType=VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;si.pLayer=reinterpret_cast<const CAMetalLayer*>(nw);
+#else
         VkAndroidSurfaceCreateInfoKHR si{};si.sType=VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;si.window=nw;
+#endif
         if(createSurface(inst,&si,nullptr,&surface)!=VK_SUCCESS){surface=VK_NULL_HANDLE;return "surface";}
         VkBool32 supported=VK_FALSE;
         if(surfaceSupport(phys,queueFamily,surface,&supported)!=VK_SUCCESS || !supported)return "surface-queue";
@@ -679,6 +715,9 @@ private:
         lookGameV.store(settings.lookGame,std::memory_order_relaxed); // v638
 #endif
         shownValid=false;
+#if defined(RECOMP_DUO_EDITION)
+        duoMapRect[0].store(int(layout.map.x0));duoMapRect[1].store(int(layout.map.y0));duoMapRect[2].store(int(layout.map.x1));duoMapRect[3].store(int(layout.map.y1));
+#endif
         RECOMP_HUD2_LOG("RENDER_HUD3 window=1 generation=%llu extent=%ux%u format=%d images=%u transform=%u timed=%u frame=%.0f,%.0f..%.0f,%.0f "
             "map=%.0f,%.0f..%.0f,%.0f bars=%.0f..%.0f stars=%.0f,%.0f..%.0f,%.0f",(unsigned long long)gen,e.width,e.height,int(format),n,
             unsigned(caps.currentTransform),unsigned(timePool!=VK_NULL_HANDLE),double(layout.frame.x0),double(layout.frame.y0),double(layout.frame.x1),
@@ -694,7 +733,11 @@ private:
         return nullptr;
     }
     void loop() noexcept {
+#if defined(__APPLE__)
+        pthread_setname_np("recomp-hud2"); // (ios-duo: Darwin names the calling thread only)
+#else
         pthread_setname_np(pthread_self(),"recomp-hud2");
+#endif
         std::unique_lock l(hm);
         for(;;) {
             cv.wait(l,[&]{return stop || !pending.empty();});

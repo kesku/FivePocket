@@ -82,6 +82,14 @@ struct Meter {
 // v309 glyphs made bold (each row OR'd with itself one column right: 6 x 7) at scale 3 (2 for the small number). The picture is copied
 // into the frame (no blending), so the label carries its opaque pixels as runs: one copy region per run, the background untouched.
 // files/private-trace/diag-fps-detail = the v309 strip (fps, ms, max) instead. Host test: tests/fps_label_test.cpp.
+// v714 (owner 2026-10-25: "that fps counter is not clean. it needs to be minimalistic and much smaller"; his pick: "60" alone): the
+// label moves to the app (an anti-aliased text view: white 78 %, a soft shadow, ~1.4 % of the frame high), which reads the rates through
+// recomp_fps_v1 (generic_renderer.cpp). While an app has read them within AppHoldMs the library draws no label of its own; the v309
+// strip (diag-fps-detail, our measuring) is drawn whatever the app does.
+namespace recomp::gpu::generic::v714 {
+constexpr long long AppHoldMs=2000;
+inline bool appDrawing(long long nowMs,long long lastReadMs) noexcept {return lastReadMs>0 && nowMs>=lastReadMs && nowMs-lastReadMs<=AppHoldMs;}
+}
 namespace recomp::gpu::generic::v713 {
 constexpr unsigned BigScale=3,SmallScale=2,GlyphW=6,GlyphH=7,Shadow=2,Gap=6;
 constexpr std::uint8_t White=255,Grey=190;
@@ -131,27 +139,12 @@ inline Label render(double fps,double shownFps) {
     return out;
 }
 }
-// v826 (thor-radio, owner 2026-10-25 item 6: the restyled counter top-left on the Thor's main screen): the Thor edition draws v713's label
-// itself (map_tap_renderer.inc thorFpsDraw) and the v309 strip (top right) only with diag-fps-detail; the normal build keeps the strip.
+#ifdef RECOMP_THOR_EDITION
+// v826 (thor-radio; from v850's fps_overlay.h): the Thor edition's label switch for the v309 strip (map_tap_renderer.inc thorFpsDraw).
+// ios-duo: 238e draws the game-style label itself (generic_renderer.cpp present()), so the Duo's thorFpsDraw draws nothing (see there).
 #include <atomic>
 namespace recomp::gpu::generic::v309 {
-#if defined(RECOMP_THOR_EDITION)
 inline std::atomic<bool>& thorLabelOn() noexcept {static std::atomic<bool> b{false};return b;}
 inline bool stripShown() noexcept {return !thorLabelOn().load(std::memory_order_relaxed);}
-#else
-constexpr bool stripShown() noexcept {return true;}
-#endif
 }
-// v714 (android-qol; owner 2026-10-25: "that fps counter is not clean. it needs to be minimalistic and much smaller"; his pick: "60" alone): the
-// label moves to the app (an anti-aliased text view: white 78 %, a soft shadow, ~1.4 % of the frame high), which reads the rates through
-// recomp_fps_v1. While an app has read them within AppHoldMs the library draws no label of its own; the v309 strip (diag-fps-detail) stays.
-// (thor-radio v832: the Thor edition's copy - generic_renderer.cpp's end and map_tap_renderer.inc thorFpsDraw.)
-#if defined(RECOMP_THOR_EDITION)
-#include <chrono>
-namespace recomp::gpu::generic::v714 {
-constexpr long long AppHoldMs=2000;
-inline bool appDrawing(long long nowMs,long long lastReadMs) noexcept {return lastReadMs>0 && nowMs>=lastReadMs && nowMs-lastReadMs<=AppHoldMs;}
-inline std::atomic<float> fpsShown{0.0f},fpsReal{0.0f},fpsMs{0.0f};inline std::atomic<int> fpsOn{0};inline std::atomic<long long> fpsAppMs{0};
-inline long long nowMs() noexcept {return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
-}
-#endif
+#endif /* RECOMP_THOR_EDITION */

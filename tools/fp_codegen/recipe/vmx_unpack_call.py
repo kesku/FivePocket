@@ -4,7 +4,7 @@
 Patch 0017 makes XenonRecomp translate `vupkd3d128 vD,vS,type 2` inline (8 lines through temp/vTemp). The validated
 corpus, generated before that patch, carries the in-place repair
     recomp::vmx::unpackNormPacked32(ctx.vD.u32, ctx.vS.u32);
-(android/app/src/main/cpp/guest_vmx_packed.h; same lanes and NaN encoding, proven by the patch's own fixtures). This pass
+(runtime/host/guest_vmx_packed.h; same lanes and NaN encoding, proven by the patch's own fixtures). This pass
 replaces every exact 0017 block by that call and then applies the generator's declaration rule to the touched functions:
 `\\tPPCVRegister vTemp{};` / `\\tPPCRegister temp{};` at the function start are removed when no other line of the
 function uses vTemp / temp (the pre-0017 generator declared a local only for an instruction that used it). Every other

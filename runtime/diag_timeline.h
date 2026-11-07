@@ -12,12 +12,12 @@
 namespace recomp::diag::timeline {
 enum Kind : std::uint16_t {
     PermitWaitBegin=1, PermitWaitEnd=2,       // arg: permit reason (rotation, safepoint, wait return, delay return, start)
-    ParkBegin=3, ParkEnd=4,                   // parallelWait park / wake (arg 1 = notified, 2 = poll, 3 = deadline)
+    ParkBegin=3, ParkEnd=4,                   // parallelWait path, not necessarily OS sleep (arg 1 = predicate notified, 2 = poll, 3 = deadline)
     DelayBegin=5, DelayEnd=6,                 // parallelDelay
     SubmitBegin=7, SubmitEnd=8,               // graphics submission handler (extra: WPTR word)
     DrainBegin=9, DrainEnd=10,                // renderer queue drain (arg: reason 0 barrier, 1 present, 2 submit, 3 other)
     GpuWaitBegin=11, GpuWaitEnd=12,           // lockedQueueWaitIdle / fence waits (arg: site)
-    ExclusiveBegin=13, ExclusiveEnd=14,       // exclusive span (world stopped)
+    ExclusiveBegin=13, ExclusiveEnd=14,       // outermost exclusive ownership, including the wait for safepoints
     Present=15,                               // present hook (a frame boundary)
     WorkerItemBegin=16, WorkerItemEnd=17,     // renderer thread executes a queued item
     Signal=20,                                // v195: a guest wait object signalled (arg 1 handle, 2 dispatcher, 3 CS; extra: object)
@@ -54,7 +54,8 @@ extern std::atomic<bool> armed;
 // executor stamps it into ParkBegin's extra). 0 = unknown.
 extern thread_local std::uint32_t waitObject;
 void record(Kind kind, std::uint16_t arg = 0, std::uint32_t extra = 0) noexcept;
-// v318: a record stamped with a given steady-clock time (an event that happened earlier, or a driver-reported time).
+// An explicit timestamp in the event's source clock domain. Driver timestamps
+// (Displayed/DisplayMargin) need not share the CPU steady-clock epoch.
 void recordAt(std::uint64_t ns, Kind kind, std::uint16_t arg = 0, std::uint32_t extra = 0) noexcept;
 inline void mark(Kind kind, std::uint16_t arg = 0, std::uint32_t extra = 0) noexcept {
     if (armed.load(std::memory_order_relaxed)) record(kind, arg, extra);

@@ -46,9 +46,8 @@ import sys
 open(sys.argv[1], 'ab').write(b'INDEXED\\n')
 '''
 sha = lambda data: hashlib.sha256(data).hexdigest()
-spec = importlib.util.spec_from_file_location('elf_fixture_for_the_decoder', Path(__file__).resolve().parent / 'test_replay_tools.py')
-replay_tests = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(replay_tests)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import elf_fixtures as replay_tests
 # Stand-ins that write real objects and a real archive: the object holds what the compiler was asked and read, and, for
 # a unit compiled from C, the compiler's own name as the file compiler-name beside the stand-in gives it (the host).
 CLANG_OBJECTS = '''#!/usr/bin/env python3

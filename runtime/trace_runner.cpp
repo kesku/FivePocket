@@ -1,3 +1,13 @@
+#include "ios_renderer_async.hpp"
+extern "C" void recomp_autopilot_note_human() noexcept; // (ios-duo: trainer_glue.inc, in indirect_call_resolver.cpp)
+#include "ios_gpu_frame_bridge.h"
+#include "ios_async_shared_dispatch.hpp"
+#include "ios_guest_frame_limit.hpp"
+#include "ios_bot_commit.hpp"
+#include "ios_renderer_qos.hpp"
+#if defined(__APPLE__)
+#include "apple/thread_policy.h"
+#endif
 #include "vulkan_queue_lock_all.h" // v177: every VkQueue call in this file holds the shared queue lock
 #include "diag_log_sample.h" // v218
 #include <vector>
@@ -23,6 +33,10 @@
 #include "guest_execution_guard.h"
 #include "guest_image_loader.h"
 #include "guest_import_registry.h"
+#include "private_gamepad_reader_selector.h"
+#if defined(RECOMP_PRIVATE_TRACE_LIBRARY)
+#include "private_gamepad_observer_lifecycle.h"
+#endif
 namespace recomp::bootstrap { const char* exchangeGuestHostActivity(const char* label) noexcept; } // v226 (executor)
 namespace { struct HostActivityScope { const char* p; explicit HostActivityScope(const char* l) noexcept : p(recomp::bootstrap::exchangeGuestHostActivity(l)) {}
     ~HostActivityScope() { recomp::bootstrap::exchangeGuestHostActivity(p); } }; } // v226 DIAGNOSTIC
@@ -102,7 +116,6 @@ thread_local bool completionSectionOpen=false; // v210: from the submission's dr
 std::function<bool(int)> deferredIrqDeliver;
 void deferredIrqImportHook(){if(deferredIrqDeliver)(void)deferredIrqDeliver(0);}
 }
-extern "C" void recomp_autopilot_note_human() noexcept; // v842 (trainer_glue.inc)
 extern "C" __attribute__((weak)) std::atomic<bool> recomp_v233_baseline; // v233 (generic_renderer.cpp)
 extern "C" std::atomic<unsigned> recomp_v338_presents,recomp_v338_spin_main_us; // v338 (generic_renderer.cpp: causal spins)
 namespace {
@@ -145,19 +158,33 @@ namespace recomp::gpu {std::uint64_t nativeQueueFenceCount() noexcept;}
 #include "xenos_stopped_constant_initialization.h"
 #include "native_swap_image_file.h"
 #include "private_trace_api.h"
+#include "scanout_map_timing.hpp"
+#if defined(__APPLE__)
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#include <atomic>
+// (Claude 2026-10-17) the host thread id of the game's main loop (stored by Main.mm's pad-poll hook): ios-qos-audio leaves it alone
+extern "C" { std::atomic<std::uint64_t> recomp_ios_main_tid{0}; std::atomic<unsigned> recomp_ios_main_port{0},recomp_ios_audio_port{0}; } // (ports: the slow-frame line's per-thread CPU, generic_renderer.cpp)
+#endif
+#endif
 #include "private_display_sequence.h"
 #if defined(RECOMP_PRIVATE_TRACE_LIBRARY)
 #include <atomic>
 #endif
 #include "indirect_call_resolver.h"
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
 #include "vulkan_engine.h"
 #include "direct_present.h" // v255
 #ifdef RECOMP_THOR_EDITION
 #include "private_trace_hud_api.h" // hud2 (v575): recomp_set_hud_window_v1
 #include "map_tap.h" // thor-maptap (v658): the app's map-tap request -> the pause map, pressed by the library
 #endif /* RECOMP_THOR_EDITION */
+#if defined(__APPLE__)
+#include "apple/audio_output.h"
+#else
 #include "aaudio_output_stream.h"
+#endif
 #include "audio_ahead.h" // audio-ahead: diag-au-ahead (the callback worker's bounded lead while main waits on the engine)
 #include "native_color_program_input.h"
 #include "native_color_batch_capture.h"
@@ -188,6 +215,7 @@ namespace recomp::gpu {std::uint64_t nativeQueueFenceCount() noexcept;}
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <string_view>
 
 #include <fcntl.h>
@@ -208,6 +236,18 @@ namespace recomp::gpu {std::uint64_t nativeQueueFenceCount() noexcept;}
 // Attempt v44: the retirement walk, its namespace-scope state and the runtime-maintenance precheck
 // live in diagnostic_retire.h (host-testable; R held only for the ring snapshot and the publication).
 #include "diagnostic_retire.h"
+#if defined(__APPLE__) && !defined(RECOMP_TOUCH_MAPTAP)
+#define RECOMP_TOUCH_MAPTAP 1 // ios-qol (iPad build 231): the single-screen edition's map-tap macro (android-qol v700)
+#endif
+#if defined(__APPLE__) && !defined(RECOMP_TOUCH_CONTEXT)
+#define RECOMP_TOUCH_CONTEXT 1 // ios-touchpad (iPad build 235): the control context for the universal touch controls (android-qol v702)
+#endif
+#if defined(RECOMP_TOUCH_CONTEXT)
+#include "touch_context.h" // qol-touch (v702): the control context export
+#endif /* RECOMP_TOUCH_CONTEXT */
+#if defined(RECOMP_TOUCH_MAPTAP)
+#include "map_tap.h" // thor-maptap (v658) / qol-touch (v700): the app's map-tap request -> the pause map, pressed by the library
+#endif
 
 namespace recomp::bootstrap { void diagnosticDumpImports(); }
 namespace recomp::audio { void diagnosticDumpXma(); }
@@ -613,7 +653,7 @@ void addSaturating(std::uint64_t& target, std::size_t value) {
 }
 
 } // namespace
-// script-mods (2026-10-25, local-analysis/trainer-mods): files/mods/ overrides of archive entries (settings/mods.txt scripts=on).
+// script-mods (iPad 237, 2026-10-25; local-analysis/trainer-mods v952): files/mods/ overrides of archive entries (settings/mods.txt scripts=on).
 #include "mods_glue.inc"
 
 // Attempt v21: core placement on the Thor (Snapdragon 8 Gen 2: cpu0-2 A510, cpu3-4 A715, cpu5-6
@@ -643,25 +683,54 @@ static std::atomic<unsigned long long> v284Concurrent{0},v284Declined{0},v284Gat
 // image: a 33.3 ms minimum frame, the 30 fps cap; 1 = 60 fps; <= 0 skips the limiter). With diag-v280-limit60 the renderer's
 // A/B window calls this with on = true (limit 1), else false (limit 2). Only a word holding 1 or 2 is changed (anything
 // else is left and reported), so a value the game itself set elsewhere is never overwritten.
+extern "C" std::uint32_t recomp_apple_launcher_display_options() noexcept; // (launcher bridge: the saved choices word)
+namespace {iosguestlimit::Policy guestFrameLimitPolicy() {
+    // ios-defaults (Claude, 2026-10-16): without RECOMP_IOS_GUEST_FRAME_LIMIT the game's own limiter follows the launcher's cap:
+    // Off / 60 / 40 -> 60 (limit 1), 30 / 24 / Auto or no saved choice -> 30 (limit 2, the title image's own value).
+    // (ios-sidemenu, SPEC §12: the environment once; the launcher's word every call, so the in-game menu's live cap and frame generation
+    // reach the game's own limiter at the renderer's next switch window - one atomic load)
+    static const auto env=[]{
+        if(const char* e=std::getenv("RECOMP_IOS_GUEST_FRAME_LIMIT")) {
+            // (Claude) "inherit": the renderer's diag-v280-limit60/-limit30 switches decide (Android's v307 default 60), so an
+            // in-run A/B (RECOMP_IOS_SWITCHES_AB=diag-v280-limit30;P) can compare the two limits on the same scene.
+            if(std::string_view(e)=="inherit")return std::optional(iosguestlimit::Policy::Inherit);
+            return std::optional(iosguestlimit::parse(e));
+        }
+        return std::optional<iosguestlimit::Policy>();
+    }();
+    if(env)return *env;
+    const std::uint32_t w=recomp_apple_launcher_display_options();
+    const unsigned cap=(w&0x80000000u)?(w&7u):3u;
+    if((w&0x80000000u) && (w&0x8000u))return iosguestlimit::Policy::Thirty; // (Claude, 2026-10-18) Frame Generation On: the 30 fps game
+    return (cap==0 || cap==1 || cap==2)?iosguestlimit::Policy::Sixty:iosguestlimit::Policy::Thirty;
+}}
+extern "C" unsigned recomp_ios_guest_frame_limit_mode() {return static_cast<unsigned>(guestFrameLimitPolicy());}
 static std::uint8_t* v280GuestBase=nullptr;static std::atomic<unsigned> v280Last{0},v280Applied{0},v280Foreign{0};
+#if defined(RECOMP_TOUCH_CONTEXT)
+// qol-touch (v702, touch-controls-spec SPEC.md 1.3) / iPad 235: the player's control context for the universal touch controls
+// (touch_context.h). The iOS app calls it directly (one binary) every 100 ms on its main thread. Read-only guest loads.
+// Bit 15: the pause full map is on screen (map_tap.h mapShown, RECOMP_TOUCH_MAPTAP).
+extern "C" __attribute__((visibility("default"))) int recomp_touch_context_v1(void) {
+    if(!v280GuestBase)return -1;
+    int w=recomp::touchctx::word(recomp::touchctx::GuestMemory{v280GuestBase});
+#if defined(RECOMP_TOUCH_MAPTAP)
+    if(recomp::gpu::maptap::machine().mapShown())w|=0x8000;
+    if(recomp::gpu::maptap::machine().watching())w|=1<<30; // (v711, SPEC 3.10: a map-tap episode runs - opening or closing goes through the
+                                                            //  pause menu for ~0.8 s; the owner saw the menu set flash: the app keeps MAP)
+#endif
+    return w;
+}
+#endif /* RECOMP_TOUCH_CONTEXT */
 extern "C" void recomp_v280_apply_limiter(bool on) {
     if(!v280GuestBase)return;
     auto* p=v280GuestBase+0x837CA13Cu;
-    const std::uint32_t value=(std::uint32_t{p[0]}<<24)|(std::uint32_t{p[1]}<<16)|(std::uint32_t{p[2]}<<8)|p[3];
-    v280Last.store(value,std::memory_order_relaxed);
-    // v557 (driving goal, 2026-10-16): diag-v280-nolimit = limit 0 (the limiter skips its sleep and spin; frames under 16.7 ms
-    // are the only ones it would change). 0 is then also a value of ours.
-    static std::atomic<long long> v557CheckNs{0}; static std::atomic<bool> v557NoLimit{false};
-    {const long long ns=std::chrono::steady_clock::now().time_since_epoch().count();
-     if(ns-v557CheckNs.load(std::memory_order_relaxed)>500'000'000ll){v557CheckNs.store(ns,std::memory_order_relaxed);
-         v557NoLimit.store(::access(RECOMP_APP_PATH("/private-trace/diag-v280-nolimit"),F_OK)==0,std::memory_order_relaxed);}}
-    const std::uint32_t want=v557NoLimit.load(std::memory_order_relaxed)?0u:on?1u:2u;
-    __android_log_print(ANDROID_LOG_INFO,"RecompRenderer","V557_LIMIT want=%u value=%u",want,value); // (one per 60-present window: the in-run A/B's label)
-    if(value==want)return;
-    if(value!=0 && value!=1 && value!=2){v280Foreign.fetch_add(1,std::memory_order_relaxed);return;}
-    __atomic_store_n(p,std::uint8_t(0),__ATOMIC_RELAXED);__atomic_store_n(p+1,std::uint8_t(0),__ATOMIC_RELAXED);
-    __atomic_store_n(p+2,std::uint8_t(0),__ATOMIC_RELAXED);__atomic_store_n(p+3,std::uint8_t(want),__ATOMIC_RELEASE);
-    v280Applied.fetch_add(1,std::memory_order_relaxed);
+    const auto result=iosguestlimit::applyWord(p,on);
+    v280Last.store(result.before,std::memory_order_relaxed);
+    if(result.foreign)v280Foreign.fetch_add(1,std::memory_order_relaxed);
+    if(result.changed)v280Applied.fetch_add(1,std::memory_order_relaxed);
+    if(guestFrameLimitPolicy()!=iosguestlimit::Policy::Inherit)
+        __android_log_print(ANDROID_LOG_INFO,"RecompRenderer","RENDER_IOS_GUEST_FRAME_LIMIT requested=%u desired_word=%u before_word=%u actual_word=%u changed=%u foreign=%u",
+            recomp_ios_guest_frame_limit_mode(),result.wanted,result.before,result.after,unsigned(result.changed),unsigned(result.foreign));
 }
 // pace-caps (lane A, pace_caps.h; called by renderer_boundary_trace.cpp paceHold on the render thread only): a paced hold is the
 // delay the game's own Sleep takes, in the two steps of the registry's delay handler (v211). recomp_pace_park_ready: a pending
@@ -769,16 +838,30 @@ std::atomic<unsigned long long> v224Unpinned{0};
 // v245 (prime_swap_v245.h): main's affinity while the render thread waits for main's kick; the setter and main's tid.
 #include "prime_swap_v245.h"
 namespace {
+#if defined(__APPLE__)
+int v245SetAffinity(int tid,unsigned mask) {
+    return recomp::apple::unavailableThreadAffinity(tid,mask);
+}
+#else
 int v245SetAffinity(int tid,unsigned mask) {
     cpu_set_t set;CPU_ZERO(&set);
 #pragma clang loop unroll(full) vectorize(disable) // (topology lane: 32 cpus, was 8; the hint keeps the generated code one move, as it was)
     for(int c=0;c<32;++c)if(mask>>c&1u)CPU_SET(c,&set);
     return sched_setaffinity(tid,sizeof set,&set)==0?0:(errno?errno:-1);
 }
+#endif
 // main-sched (prime_swap_v245.h boostNice, switch diag-ms-prime-nice): main's nice while it holds cpu7, and the placement
 // thread's v238/v246 re-application of main's nice through the same protocol (deferred to the release while boosted).
+#if defined(__APPLE__)
+int msSetNice(int tid,int nice) { return recomp::apple::unavailableThreadPriority(tid,nice); }
+#else
 int msSetNice(int tid,int nice) { return ::setpriority(PRIO_PROCESS,tid,nice)==0?0:(errno?errno:-1); }
+#endif
+#if defined(__APPLE__)
+int msGetNice(int tid,int* nice) { return recomp::apple::unavailableThreadPriorityQuery(tid,nice); }
+#else
 int msGetNice(int tid,int* nice) { errno=0;const int v=::getpriority(PRIO_PROCESS,tid);if(v==-1 && errno)return errno;*nice=v;return 0; }
+#endif
 [[maybe_unused]] const bool v245Init=(recomp_v245::state().set=v245SetAffinity,recomp_v245::state().setNice=msSetNice,
                                       recomp_v245::state().getNice=msGetNice,true);
 // topology lane: the library's one start-up step - the roles are detected (cpu_topology.h reads the kernel's description),
@@ -794,12 +877,15 @@ int msGetNice(int tid,int* nice) { errno=0;const int v=::getpriority(PRIO_PROCES
 // topology lane: a set's cpus 0-31 as a mask - what the ranking stores as main's / the v251 extras' mask to restore. It
 // replaces every call of v458's maskBits (below: cpus 0-7 only, no longer called; its line is left untouched so that another
 // lane's insertion next to it merges without a conflict - delete it once the lanes are merged).
+#if defined(__APPLE__)
+#else
 unsigned maskBits32(const cpu_set_t& set){
     unsigned m=0;
 #pragma clang loop unroll(full) vectorize(disable)
     for(int c=0;c<32;++c)if(CPU_ISSET(c,&set))m|=1u<<c;
     return m;
 }
+#endif
 // main-waits-2 (mw2_producers.h): the producers' nice setter (the placement thread's v249 block goes through applyBase).
 [[maybe_unused]] const bool mw2Init=(recomp_mw2::producers().set=msSetNice,true);
 // prime-exchange (prime_swap_v245.h pxPlacementPin; diag-px-*): the placement thread's 250 ms pin of the prime owner to {7}.
@@ -811,15 +897,21 @@ unsigned maskBits32(const cpu_set_t& set){
 // the call it replaces (sched_setaffinity, a plain C declaration) is an invoke inside the lambda, which has locals to destroy;
 // a noexcept helper turned it into a call and changed the lambda's profile hash (measured with -Wbackend-plugin: "up to 1029674
 // count discarded"). Nothing in here throws.
+#if defined(__APPLE__)
+#else
 [[gnu::noinline]] int pxPinPrime(pid_t prime,const cpu_set_t* x3) {
     const int r=recomp_v245::pxPlacementPin(recomp_v245::state(),static_cast<int>(prime));
     return r<0?sched_setaffinity(prime,sizeof *x3,x3):(r==0?0:-1);
 }
+#endif
 // prime-exchange: the render thread's host tid (not with diag-prime-main, where main owns cpu7: px stays inert).
 [[gnu::noinline]] void pxTaskStarted(std::uint32_t token,int tid) noexcept {
     if(token==recomp_v245::RenderToken && !primeMain())recomp_px::state().renderTid.store(tid,std::memory_order_relaxed);
 }
+#if defined(__APPLE__)
+#else
 unsigned maskBits(const cpu_set_t& set){unsigned m=0;for(int c=0;c<8;++c)if(CPU_ISSET(c,&set))m|=1u<<c;return m;}
+#endif
 }
 extern "C" void recomp_diag_task_host_started(std::uint32_t token,int tid) {
     pxTaskStarted(token,tid); // prime-exchange (out of line)
@@ -840,6 +932,13 @@ namespace {
 // cpu_set_t. So every role's set is built HERE with the sites' own two builders - prime with cpuSet() (the owner's pin,
 // tier 0), the other four with RECOMP_TOPOLOGY_ADD_CPUS (every other site) - and read back: maskBits32() for cpus 0-31,
 // setBitCount() for every bit of the object the kernel is handed.
+#if defined(__APPLE__)
+void startCorePlacement() {
+    // No Linux core placement monitor on Apple. Do not advertise applied masks
+    // or translate Mach thread names into process IDs for setpriority().
+    __android_log_print(ANDROID_LOG_INFO,"RecompRenderer","APPLE_HOST_SCHEDULER os_default=1 affinity=unsupported remote_nice=unsupported");
+}
+#else
 [[gnu::noinline]] void logTopology() noexcept {
     const recomp_topology::Topology& tp=recomp_topology::roles();
     char line[1536];const int used=recomp_topology::formatLine(tp,line,sizeof line);
@@ -1069,6 +1168,7 @@ void startCorePlacement() {
         }
     }).detach();
 }
+#endif
 // Attempt v36: an Android performance hint session (ADPF, API 33, resolved at runtime) for the render
 // thread; the present path reports each frame's duration against a 33.3 ms target, so the vendor
 // power HAL may raise the thread's capacity (placement and frequency). Diagnostic only.
@@ -1167,9 +1267,68 @@ void reportFrameToPerformanceHint() {
     recomp::diag::timeline::mark(recomp::diag::timeline::InputRead,lat2::readFlags(threadChanged,synthetic,firstOfChange),lat2::padReadLr);
 }
 
+// Optional iOS bridge owns one sequence across CPU fallback and GPU frames.
+class IosSharedDisplay final {
+    RecompPrivateTraceCallbacksV4 cpu_;
+    RecompIosGpuCallbacksV1 gpu_;
+    recomp::private_trace::DisplaySequence sequence_;
+    mutable std::recursive_mutex mutex_;
+    bool adopted_=false,closed_=false;
+public:
+    IosSharedDisplay(const RecompPrivateTraceCallbacksV4& cpu,const RecompIosGpuCallbacksV1& gpu):cpu_(cpu),gpu_(gpu){}
+    void close(bool terminal) noexcept {std::lock_guard lock(mutex_);if(closed_)return;closed_=true;gpu_.close(gpu_.user,terminal?1:0);}
+    [[noreturn]] void fail() noexcept {close(true);std::_Exit(4);}
+    bool adopted()const noexcept{std::lock_guard lock(mutex_);return adopted_;}
+    int cpu(const uint8_t* bytes,uint32_t size,uint32_t width,uint32_t height) noexcept {
+        std::lock_guard lock(mutex_);
+        if(adopted_ || closed_ || !bytes || size!=1280U*720U*4U || width!=1280 || height!=720)fail();
+        const auto seq=sequence_.next();if(!sequence_.begin(seq))fail();
+        const int result=cpu_.orderedRgba(cpu_.user,seq,bytes,size,width,height);
+        if(result!=1 || !sequence_.finish(true))fail();return 1;
+    }
+    int gpu(RecompIosGpuFrameV1& frame) noexcept {
+        std::lock_guard lock(mutex_);
+        if(closed_)fail();frame.sequence=sequence_.next();if(!sequence_.begin(frame.sequence))fail();
+        adopted_=true;
+        if(gpu_.frame(gpu_.user,&frame)!=RECOMP_IOS_GPU_ACCEPTED || !sequence_.finish(true))fail();
+        return RECOMP_IOS_GPU_ACCEPTED;
+    }
+};
+static IosSharedDisplay* iosSharedDisplay=nullptr; // one entry; installed before workers
+
+namespace recomp::gpu::generic {void setAsyncModeForTest(int);}
+
 static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV2* callbacks=nullptr,
         const RecompPrivateTraceCallbacksV3* liveCallbacks=nullptr,
         const RecompPrivateTraceCallbacksV5* inputCallbacks=nullptr) {
+    try {(void)guestFrameLimitPolicy();}
+    catch(const std::invalid_argument&) {std::fputs("APPLE_IOS_GUEST_FRAME_LIMIT invalid=1 guest_started=0\n",stderr);return 2;}
+    try {
+        const bool asyncShared=recomp::ios_async_shared::requested();
+        if(asyncShared && (!iosrendererasync::parse(std::getenv("RECOMP_IOS_RENDERER_ASYNC"),"invalid renderer async") ||
+           !recomp::ios_shared::requested() || iosrendererasync::parse(std::getenv("RECOMP_IOS_QUEUED_PRESENT"),"invalid queued present")))
+            throw std::invalid_argument("async shared present requires async1 shared1 queued0");
+        const auto policy=iosrendererasync::configure(
+            [](int mode){recomp::gpu::generic::setAsyncModeForTest(mode);},
+            [](iosrendererasync::Marker marker){
+                switch(marker) {
+                case iosrendererasync::Marker::SyncRenderer:return ::access(RECOMP_APP_PATH("/private-trace/diag-generic-sync-renderer"),F_OK)==0;
+                case iosrendererasync::Marker::SyncPresent:return ::access(RECOMP_APP_PATH("/private-trace/diag-generic-sync-present"),F_OK)==0;
+                case iosrendererasync::Marker::SubmitProxy:return ::access(RECOMP_APP_PATH("/private-trace/diag-generic-submit-proxy"),F_OK)==0;
+                // ios-direct-present (Claude): the library's presenter reads nothing back, so the CPU presenter's sync-readback
+                // requirement for a queued present does not apply when the shell selected V6 (RECOMP_IOS_DIRECT_PRESENT=1).
+                case iosrendererasync::Marker::SyncReadback:return ::access(RECOMP_APP_PATH("/private-trace/diag-generic-sync"),F_OK)==0 ||
+                    [] { const char* e=std::getenv("RECOMP_IOS_DIRECT_PRESENT"); return e && e[0]=='1' && !e[1]; }();
+                }
+                return true;
+            });
+        recomp::ios_async_shared::enabled=asyncShared;
+        std::fprintf(stderr,"APPLE_IOS_ASYNC_SHARED requested=%u initial_adoption=synchronous no_submit_reservation=1\n",unsigned(asyncShared));
+        std::fprintf(stderr,"APPLE_IOS_RENDERER_ASYNC requested=%u forced_mode=%d queued_present=%u queued_readback_match=1 queued_effective=%u shared=%u combined=%u before_core=1 effective_pending_initialize=1\n",
+            unsigned(policy.requested),policy.forcedMode,unsigned(policy.queuedPresent),unsigned(policy.queuedPresent),unsigned(policy.shared),unsigned(policy.shared && policy.requested));
+    } catch(const std::exception& error) {
+        std::fprintf(stderr,"APPLE_IOS_RENDERER_ASYNC rejected=1 guest_started=0 why=%s\n",error.what());return 2;
+    }
     startCorePlacement(); // attempt v21
 
     std::array<std::uint64_t, 3> kernelVersionValues{};
@@ -1238,7 +1397,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         inspectColorDirectory=argv[argc-1];argc-=2;
         if(inspectColorDirectory.empty() || inspectColorDirectory.front()!='/' || inspectColorDirectory.size()>4096)return 2;
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     std::optional<recomp::gpu::NativeColorChainProgram> inspectColorProgram;
     if(!inspectColorDirectory.empty()){
         inspectColorProgram=recomp::gpu::readNativeColorProgram(inspectColorDirectory,recomp::gpu::NativeColorCoordinateProfile::Padded1280W1);
@@ -1293,7 +1452,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
     if (experimentalNativeAudioRenderer && !experimentalNativeAudio) {
         std::cerr << "trace setup failed: renderer requires explicit experimental native audio\n";return 2;
     }
-#if !defined(__ANDROID__)
+#if !(defined(__ANDROID__) || defined(__APPLE__))
     if (experimentalNativeAudio) { std::cerr << "trace setup failed: native audio currently requires Android\n"; return 2; }
 #endif
     const bool disconnectedInput = argc >= 2 && std::string_view(argv[argc - 1]) == "--disconnected-input";
@@ -1330,7 +1489,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
     if ((experimentalGpuClock || nativeInitialCoherency || captureStoppedShaders || captureStoppedPm4 ||
             !capturePhysicalRanges.empty() || !inspectOwnershipRanges.empty() || !inspectColorDirectory.empty()) && !hasGraphics) return 2;
     if (hasGraphics) {
-#if !defined(__ANDROID__)
+#if !(defined(__ANDROID__) || defined(__APPLE__))
         std::cerr << "trace setup failed: Vulkan backend currently requires Android\n"; return 2;
 #else
         if (std::string_view(argv[argc - 1]) != "vulkan-headless") return 2;
@@ -1822,7 +1981,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         return 2;
     }
     if(physicalAcAlias)std::cout<<"GUEST_PHYSICAL_AC_ALIAS_V1 shared_backing=1 bytes=536870912 e_view_implemented=0\n";
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     // v260: the renderer's write watch over both physical views (opt-in, files/private-trace/diag-v260-write-watch).
     if(physicalAcAlias)(void)recomp::gpu::generic::installWriteWatch(addressSpace.base());
 #endif
@@ -1971,6 +2130,29 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             addressSpace.translate(v),[&](auto p,auto bytes,auto writable) { return registry.mapNativeAudioPhysical(p,bytes,writable); });
         if (!nativeXma->ready() || !registry.bindNativeXma(nativeXma) ||
             !recomp::bootstrap::bindGuestXmaRegisters([&](auto address,bool write,std::uint32_t& value) {
+#if defined(__APPLE__)
+                { // ios-qos-audio (Claude 2026-10-16; scheduling only, ADOPTED by c107-c109): this callback runs on the guest audio
+                  // thread (the XMA register accesses; decode runs inside them). The thread asks for utility QoS (efficiency cores):
+                  // the CPU and GPU share one power budget and the GPU limits (c105: higher CPU QoS made frames 6 ms worse); with audio
+                  // there, frames were 0.3-2.9 ms shorter and display 1-4 ms in three in-run A/Bs, audio_starved 0 in every phase.
+                  // files/private-trace/ios-qos-audio-keep (or RECOMP_IOS_SWITCHES_*) keeps the default QoS; checked every 4096 accesses.
+                    static std::atomic<unsigned> calls{0};static std::atomic<int> want{1};thread_local int applied=0;
+                    if((calls.fetch_add(1,std::memory_order_relaxed)&4095u)==0) {
+                        static const std::string path=std::string(std::getenv("HOME")?std::getenv("HOME"):"")+"/Library/r/private-trace/ios-qos-audio-keep";
+                        want.store(recomp_ios_switches_access(path.c_str(),F_OK)==0?0:1,std::memory_order_relaxed);
+                    }
+                    std::uint64_t self=0;pthread_threadid_np(nullptr,&self);
+                    if(recomp::bootstrap::currentGuestThreadToken()==0x64141000u) // (the audio guest thread's host port: slow-frame CPU)
+                        recomp_ios_audio_port.store(unsigned(pthread_mach_thread_np(pthread_self())),std::memory_order_relaxed);
+                    // (c128: the XMA callback also runs on the main loop's host thread, at start-up and later; the first version
+                    // demoted MAIN there. The main thread's QoS belongs to Main.mm's pad-poll hook.)
+                    if(self!=recomp_ios_main_tid.load(std::memory_order_relaxed))
+                    if(const int w=want.load(std::memory_order_relaxed);w!=applied) {
+                        applied=w;const int r=pthread_set_qos_class_self_np(w?QOS_CLASS_UTILITY:QOS_CLASS_DEFAULT,0);
+                        std::fprintf(stderr,"APPLE_IOS_QOS thread=audio tid=%llu want=%d result=%d\n",(unsigned long long)self,w,r);
+                    }
+                }
+#endif
                 const auto accepted=nativeXma->access(address,write,value);
                 if (!accepted) {
                     char words[160]{};
@@ -2183,8 +2365,12 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             [](auto callback) { return recomp::bootstrap::hasExactGuestFunction(callback); })) {
         std::cerr << "trace setup failed: title termination metadata binding rejected\n"; return 2;
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
+#if defined(__APPLE__)
+    auto nativeAudio = experimentalNativeAudio ? std::make_shared<recomp::audio::AppleAudioOutputStream>() : nullptr;
+#else
     auto nativeAudio = experimentalNativeAudio ? std::make_shared<recomp::audio::AAudioOutputStream>() : nullptr;
+#endif
     // audio-ahead: the render client and the registry see the stream through AheadBackend (pass-through; capacity reported
     // + 4 packets, so diag-au-ahead can toggle in-run); the worker's gate keeps v431's demand rule unless the switch is on.
     const auto auAheadBackend = experimentalNativeAudio && experimentalNativeAudioRenderer
@@ -2207,7 +2393,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
     if (nativeGraphics) recomp::gpu::direct::presenter().setDeviceSource([g = nativeGraphics.get()] { return g->diagnosticDevice(); });
     struct DirectPresentShutdown { ~DirectPresentShutdown() { recomp::gpu::direct::presenter().shutdown(); } } directPresentShutdown;
 #endif
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     // Attempt v43: one display path to the app for the whole run. The synchronous display of a frame (the
     // v35 inlinePresent body: scan-out mapping, then the app's ordered callback), run either on the
     // presenter thread for queued generic frames or here, after every queued frame, for everything else.
@@ -2217,8 +2403,22 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         if(!liveCallbacks || !liveCallbacks->orderedRgba || !nativeGraphics ||
             !nativeGraphics->nativeScalerConfigured())return false;
         static thread_local std::vector<std::uint8_t> pixels; // v227: reused per display thread (no 3.7 MB allocation per frame)
-        return nativeGraphics->mapNativeScanout(rgba.data(),rgba.size(),width,height,pixels) &&
-            liveCallbacks->orderedRgba(liveCallbacks->user,pixels.data(),
+        static thread_local scanout_map_timing::Stats mapTiming;
+        const bool mapped=scanout_map_timing::measure(mapTiming,width,height,[&] {
+            return nativeGraphics->mapNativeScanout(rgba.data(),rgba.size(),width,height,pixels);
+        },[](const scanout_map_timing::Snapshot& s) {
+            std::uint64_t thread=0;bool threadValid=false;
+#if defined(__APPLE__)
+            threadValid=pthread_threadid_np(nullptr,&thread)==0;
+#endif
+            __android_log_print(ANDROID_LOG_INFO,"RecompRenderer",
+                "RENDER_DIAG_SCANOUT_MAP clock=std-steady-unjoined source=displayLive thread=%llu thread_valid=%u calls=%llu ok=%llu fail=%llu ns=%llu invalid=%llu interval_calls=%llu interval_ok=%llu interval_fail=%llu interval_ns=%llu interval_invalid=%llu width=%u height=%u dimensions_consistent=%u interval_consistent=%u ns_valid_only=1",
+                (unsigned long long)thread,unsigned(threadValid),
+                (unsigned long long)s.total.calls,(unsigned long long)s.total.ok,(unsigned long long)s.total.fail,(unsigned long long)s.total.ns,(unsigned long long)s.total.invalid,
+                (unsigned long long)s.interval.calls,(unsigned long long)s.interval.ok,(unsigned long long)s.interval.fail,(unsigned long long)s.interval.ns,(unsigned long long)s.interval.invalid,
+                s.width,s.height,unsigned(s.dimensionsConsistent),unsigned(s.intervalConsistent));
+        });
+        return mapped && liveCallbacks->orderedRgba(liveCallbacks->user,pixels.data(),
                 static_cast<std::uint32_t>(pixels.size()),width,height)==1;
     };
     recomp::diag::AsyncFramePresenter framePresenter(displayLive,[](const char* what,std::uint64_t sequence) {
@@ -2227,6 +2427,98 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
     });
 #else
     recomp::diag::AsyncFramePresenter framePresenter([](const std::vector<std::uint8_t>&,unsigned,unsigned){return false;});
+#endif
+    // Producer-side mapping remains under the original native ownership. Only
+    // owned mapped bytes and a leased GPU source cross to the new worker.
+    std::unique_ptr<recomp::ios_async_shared::Dispatcher> iosDispatcher;
+    struct IosSharedBinding {
+        recomp::diag::AsyncFramePresenter& presenter;
+        std::unique_ptr<recomp::ios_async_shared::Dispatcher>& dispatcher;
+        const std::thread::id owner=std::this_thread::get_id();
+        ~IosSharedBinding(){
+            if(!iosSharedDisplay)return;
+            if(owner!=std::this_thread::get_id())std::terminate();
+#if defined(__APPLE__)
+            if(pthread_main_np())std::terminate();
+#endif
+            auto control=recomp::ios_async_shared::control.exchange(nullptr);
+            if(control){control->close();control->drain();} // no new preparation; owned snapshots safe
+            presenter.drain();
+            if(dispatcher){
+                dispatcher->closeAndJoin(); // no source/native/renderer lock
+                const auto c=dispatcher->counts();
+                std::fprintf(stderr,"APPLE_IOS_ASYNC_SHARED_STOP submitted=%llu replaced=%llu accepted=%llu cancelled_unproven=%llu failed=%llu quarantined=%llu published_while_active=%llu\n",
+                    (unsigned long long)c.submitted,(unsigned long long)c.replaced,(unsigned long long)c.completed,(unsigned long long)c.cancelled,(unsigned long long)c.failed,(unsigned long long)c.quarantined,(unsigned long long)c.publishedWhileActive);
+            }
+            {
+                std::lock_guard sourceLease(recomp::ios_shared::producerGate);
+                recomp::ios_shared::producer=nullptr;recomp::ios_shared::producerUser=nullptr;
+            }
+            iosSharedDisplay->close(std::uncaught_exceptions()!=0);
+            if(const auto retire=recomp::ios_async_shared::retireSources.load())
+                if(!retire())std::_Exit(4);
+            recomp::ios_async_shared::retireSources=nullptr;
+        }
+    };
+#if defined(__APPLE__)
+    std::atomic<bool> iosScanoutReady{false};
+    recomp::gpu::direct::Lut iosNativeLut{};bool iosNativeLutReady=false;
+    std::vector<uint8_t> iosMappedReference;
+    std::function<bool(RecompIosGpuFrameV1&,const uint8_t*,uint64_t,std::vector<uint8_t>&)> iosPrepareMap;
+    std::function<int(RecompIosGpuFrameV1&,const uint8_t*,uint64_t)> iosSharedMap;
+#endif
+    IosSharedBinding iosSharedBinding{framePresenter,iosDispatcher};
+#if defined(__APPLE__)
+    if(iosSharedDisplay) {
+        iosPrepareMap=[&](RecompIosGpuFrameV1& f,const uint8_t* raw,uint64_t bytes,std::vector<uint8_t>& mapped) {
+            if(f.sourceFenceComplete!=1)return false;
+            if(!iosScanoutReady.load(std::memory_order_acquire))return false;
+            auto& lut=iosNativeLut;auto& lutReady=iosNativeLutReady;
+            if(!lutReady) {
+                const auto ramp=recomp::gpu::direct::rampSource();std::vector<uint8_t> mappedRamp;
+                lutReady=nativeGraphics->mapNativeScanout(ramp.data(),ramp.size(),1280,720,mappedRamp) &&
+                    recomp::gpu::direct::lutFromMapped(mappedRamp.data(),mappedRamp.size(),lut);
+            }
+            if(!lutReady || !raw || bytes!=1280ULL*720*4 ||
+               !nativeGraphics->mapNativeScanout(raw,bytes,1280,720,mapped) || mapped.size()!=bytes)return false;
+            f.mappedRgba=mapped.data();f.mappedBytes=mapped.size();f.lutGeneration=1;
+            std::memcpy(f.nativeLut,lut.data(),sizeof(f.nativeLut));return true;
+        };
+        iosSharedMap=[&](RecompIosGpuFrameV1& f,const uint8_t* raw,uint64_t bytes) {
+            if(f.sourceFenceComplete!=1)iosSharedDisplay->fail();
+            if(!iosScanoutReady.load(std::memory_order_acquire)) {
+                if(iosSharedDisplay->adopted())iosSharedDisplay->fail();
+                return int(RECOMP_IOS_GPU_INELIGIBLE);
+            }
+            if(!iosPrepareMap(f,raw,bytes,iosMappedReference))iosSharedDisplay->fail();
+            const int result=iosSharedDisplay->gpu(f);
+            if(result==RECOMP_IOS_GPU_ACCEPTED)recomp::ios_async_shared::adopted.store(true,std::memory_order_release);
+            return result;
+        };
+        recomp::ios_shared::producerUser=&iosSharedMap;
+        recomp::ios_shared::producer=[](void* user,RecompIosGpuFrameV1& f,const uint8_t* raw,uint64_t bytes) {
+            return (*static_cast<std::function<int(RecompIosGpuFrameV1&,const uint8_t*,uint64_t)>*>(user))(f,raw,bytes);
+        };
+        if(recomp::ios_async_shared::enabled) {
+            iosDispatcher=std::make_unique<recomp::ios_async_shared::Dispatcher>(
+                [&](RecompIosGpuFrameV1& f,const std::vector<uint8_t>& raw,std::vector<uint8_t>& mapped){return iosPrepareMap(f,raw.data(),raw.size(),mapped);},
+                [](RecompIosGpuFrameV1& f){return iosSharedDisplay->gpu(f);},
+                []{iosSharedDisplay->fail();},
+                [&](const RecompIosGpuFrameV1& f,recomp::ios_async_shared::Mailbox::Token token,bool accepted,bool cancelled){
+                    const auto c=iosDispatcher->counts();
+                    if(!accepted || c.completed<=4 || c.completed%60==0)
+                        std::fprintf(stderr,"APPLE_IOS_ASYNC_SHARED_DELIVERY sequence=%u source_frame=%llu source_generation=%llu slot=%u token_generation=%llu epoch=%llu accepted=%u cancelled=%u submitted=%llu replaced=%llu published_while_active=%llu\n",
+                            f.sequence,(unsigned long long)f.sourceFrame,(unsigned long long)f.sourceGeneration,token.slot,
+                            (unsigned long long)token.generation,(unsigned long long)token.epoch,unsigned(accepted),unsigned(cancelled),
+                            (unsigned long long)c.submitted,(unsigned long long)c.replaced,(unsigned long long)c.publishedWhileActive);
+                });
+            auto* dispatcher=iosDispatcher.get();
+            recomp::ios_async_shared::control.store(std::make_shared<recomp::ios_async_shared::Control>(
+                [dispatcher](std::shared_ptr<recomp::ios_async_shared::Mailbox> box,
+                    recomp::ios_async_shared::Mailbox::Producer&& producer,RecompIosGpuFrameV1 f,std::vector<uint8_t>&& raw){
+                    return dispatcher->submit(std::move(box),std::move(producer),f,std::move(raw));}));
+        }
+    }
 #endif
     std::uint32_t lastFileMetadataIndex = 0;
     // script-mods: the original file of a guest path (the read-only binding below), and the view the guest gets instead.
@@ -2290,14 +2582,14 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             if (!registry.graphicsInitialized()) return std::nullopt;
             return elapsed();
         }))return 2;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         // Backend calls this under the registry mutex. Share the pure epoch,
         // not the MMIO readiness wrapper which would reenter that mutex.
         if(nativeSwapCommands && (!nativeGraphics || !nativeGraphics->bindNativeSwapCompletionClock(elapsed)))return 2;
 #endif
     }
     const auto submitOwnedColor=[&](std::uint32_t word){
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         if(!experimentalOwnedColor || !nativeGraphics || !inspectColorProgram)return false;
         const auto& state=nativeGraphics->stateBatchSnapshot();
         const recomp::gpu::DrawBinState bins{{{static_cast<std::uint32_t>(state.binMask),static_cast<std::uint32_t>(state.binMask>>32),
@@ -2648,7 +2940,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         (nativeSwapCommands && !registry.bindExperimentalNativeSwapCommands([&](const auto& image){
           // v43: after every queued frame, serialised with the presenter thread.
           return framePresenter.runSync([&]()->bool {
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             if (nativeGraphics && nativeGraphics->nativeScalerConfigured()) {
                 std::vector<std::uint8_t> pixels;
                 if (!nativeGraphics->mapNativeScanout(image.rgba.data(),image.rgba.size(),image.request.width,image.request.height,pixels)) return false;
@@ -2699,7 +2991,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 return result;
             };
             diagnostic_skip::RetireTiming retireTiming;bool retireCalled=false;
-#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && defined(__ANDROID__)
+#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && (defined(__ANDROID__) || defined(__APPLE__))
             if(const auto captured=submissionDiagnostic.attempt("captureRendererTileSubmission",
                     [&]{return captureRendererTileSubmission(word);})) {
                 // v183: a native recording completes submissions outside this handler: nothing may stay queued.
@@ -2761,7 +3053,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                     if(r){const auto t=submitNs(started,SubmitClock::now());++who.rcsN;who.rcsNs+=t;who.rcsMaxNs=std::max(who.rcsMaxNs,t);}
                     return r;
                 }))
-#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && defined(__ANDROID__)
+#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && (defined(__ANDROID__) || defined(__APPLE__))
                 || (nativeDisplayOutput && nativeStateBatches && experimentalIdleCachePair &&
                     traced("submitRendererRuntimeMaintenance",[&]{
                         // v44: open the registry's budget-256 exclusive gate only for a submission that can
@@ -2939,12 +3231,8 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
     // Multicore plan WP4: atomic sequence and slots, safe for concurrent sinks; same contents and order.
     diagnostic_skip::FunctionLabelRing functionLabels(functionLabelLimit);
     if (disconnectedInput && !registry.bindDisconnectedInput()) return 2;
-    if(nativeInput && !registry.bindNativeGamepad([&](std::uint32_t user,recomp::input::GamepadState& state){
+    if(nativeInput && !registry.bindNativeGamepad(recomp::input::delivery::embedding::selectNativeGamepadReader(inputCallbacks,[&](std::uint32_t user,recomp::input::GamepadState& state){
         const int connected=inputCallbacks->gamepadState(inputCallbacks->inputUser,user,&state);
-        // v842: the owner's own input (the physical pad, or the app's touch controls, which arrive here too) makes the bot's
-        // autopilot let go at once (trainer_glue.inc; one relaxed load while the autopilot is idle).
-        if(user==0 && connected==1 && (state.buttons || state.leftTrigger>40 || state.rightTrigger>40 || std::abs(int(state.leftX))>9000 ||
-           std::abs(int(state.leftY))>9000 || std::abs(int(state.rightX))>9000 || std::abs(int(state.rightY))>9000))recomp_autopilot_note_human();
         // Attempt v13: synthetic sticks for harness movement tests (diagnostic builds only). The
         // harness writes files/private-trace/diag-stick = "LX LY RX RY millis"; the values replace the
         // physical sticks of user 0 until they expire, with a fresh packet number so the title sees
@@ -2957,6 +3245,14 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         static std::mutex syntheticMutex;static std::vector<SyntheticStep> syntheticSteps;static long long syntheticStart=0,syntheticTotal=0;
         static std::atomic<std::uint32_t> syntheticPacket{0x40000000u};
         static std::atomic<long long> nextPoll{0};
+        // ios-duo (2026-11-05, main: the Thor's autopilot on iOS): the owner's own input (the physical pad or the app's touch controls,
+        // read here before the bot's synthetic steps are laid over it) makes the autopilot let go at once, as on the Thor.
+        if(iosbot::physicalActivity(state))recomp_autopilot_note_human();
+        if(iosbot::stopForPhysical(state)) {
+            iosrendererqos::experiment().close();
+            std::lock_guard lock(syntheticMutex);syntheticSteps.clear();syntheticTotal=0;
+            return connected;
+        }
         const long long nowMs=std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         if(nowMs>=nextPoll.load(std::memory_order_relaxed)) {
@@ -3009,9 +3305,9 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             lat2NoteRead(out,probeStepAbsMs>=0,changed); // (out of line: this lambda's control flow and PGO record unchanged)
             last=out;have=true;lastStepAbsMs=probeStepAbsMs;lastSynthetic=probeStepAbsMs>=0;
         };
-#ifdef RECOMP_THOR_EDITION
-        // thor-maptap (v658, map_tap.h): user 0's pad: the app's request bit (0x0800) removed, the macro's START / A OR'd with a packet
-        // number of their own; a request first reads files/private-trace/diag-maptap-tune (at most once per 200 ms).
+#if defined(RECOMP_TOUCH_MAPTAP)
+        // thor-maptap (v658, map_tap.h) / qol-touch (v700) / iPad 231: user 0's pad: the app's request bit (0x0800) removed, the macro's
+        // START / A OR'd with a packet number of their own; a request first reads files/private-trace/diag-maptap-tune (at most once per 200 ms).
         const auto mapTapPad=[](recomp::input::GamepadState& st,long long now) {
             namespace mt=recomp::gpu::maptap;
             if((st.buttons&mt::Request) && !mt::machine().watching()) {
@@ -3024,10 +3320,10 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 }
             }
             bool fresh=false;std::uint32_t serial=0;
-            st.buttons=mt::machine().read(st.buttons,now,&fresh,&serial,mt::Sticks{&st.leftX,&st.leftY,&st.leftTrigger,&st.rightTrigger,&st.rightX,&st.rightY}); // (v663: the touch map; v672: + the right stick, v667's channel)
+            st.buttons=mt::machine().read(st.buttons,now,&fresh,&serial,mt::Sticks{&st.leftX,&st.leftY,&st.leftTrigger,&st.rightTrigger,&st.rightX,&st.rightY});
             if(fresh)st.packet=0x80000000u|((serial&0x7Fu)<<24)|(st.packet&0x00FFFFFFu);
         };
-#endif /* RECOMP_THOR_EDITION */
+#endif /* RECOMP_TOUCH_MAPTAP */
         if(user==0) {
             SyntheticStep step{};bool active=false;
             {
@@ -3047,9 +3343,9 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 state.leftTrigger=static_cast<std::uint8_t>(std::max<int>(state.leftTrigger,step.lt));
                 state.rightTrigger=static_cast<std::uint8_t>(std::max<int>(state.rightTrigger,step.rt));
                 state.packet=syntheticPacket.fetch_add(1)+1;
-#ifdef RECOMP_THOR_EDITION
+#if defined(RECOMP_TOUCH_MAPTAP)
                 mapTapPad(state,nowMs); // thor-maptap (v658)
-#endif /* RECOMP_THOR_EDITION */
+#endif
                 probeInput(state);
 #ifdef RECOMP_THOR_EDITION
                 recomp::gpu::wheelrep::notePad(state.buttons,nowMs); // thor-radio (v651): the radio wheel's button (D-pad LEFT) for the renderer
@@ -3057,9 +3353,9 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 return connected?connected:1;
             }
         }
-#ifdef RECOMP_THOR_EDITION
+#if defined(RECOMP_TOUCH_MAPTAP)
         if(user==0)mapTapPad(state,nowMs); // thor-maptap (v658)
-#endif /* RECOMP_THOR_EDITION */
+#endif
         if(connected==1)probeInput(state);
 #ifdef RECOMP_THOR_EDITION
         if(user==0 && connected==1)recomp::gpu::wheelrep::notePad(state.buttons,nowMs); // thor-radio (v651): the radio wheel's button (D-pad LEFT)
@@ -3072,7 +3368,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 }
         }
         return connected;
-    },[&](std::uint32_t user,recomp::input::GamepadState& state){
+    }),[&](std::uint32_t user,recomp::input::GamepadState& state){
         return inputCallbacks->gamepadCapabilities(inputCallbacks->inputUser,user,&state);
     }))return 2;
     recomp_bind_generated_guest_import_registry(&registry, addressSpace.base());
@@ -3162,6 +3458,8 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
 #ifdef RECOMP_THOR_EDITION
         recomp::gpu::hud::guestBase().store(addressSpace.base(),std::memory_order_release); // hud3 (v585): the second screen reads the player's state
 #endif /* RECOMP_THOR_EDITION */
+        if(guestFrameLimitPolicy()!=iosguestlimit::Policy::Inherit)
+            recomp_v280_apply_limiter(guestFrameLimitPolicy()==iosguestlimit::Policy::Sixty);
         recomp::bootstrap::GuestCooperativeExecutor executor;
         // v119: in split mode a busy submission handler parks the submitter (at most 5 s, then v118's rejection).
         if(splitRenderDomains)(void)recomp::bootstrap::bindGuestGraphicsSubmissionWaiter([&executor](const std::function<bool()>& ready){
@@ -3252,6 +3550,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 recomp::bootstrap::noteGuestThreadStart(token, thread.startRoutine, thread.startContext,
                                                         thread.xapiStartup, addressSpace.base());
                 return executor.enqueue(token, [&, cpu, initial = *initial, token] {
+                    auto rendererQosBinding=iosrendererqos::experiment().bind(token);
                     recomp_host_guest_call_indirect(initial.address, *cpu, addressSpace.base());
                     const auto exitCode = initial.directEntry ? cpu->r3.u32 : 0U;
                     if (!registry.markGuestThreadReturned(token, exitCode)) {
@@ -3308,7 +3607,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         if (nativeHighPriorityTiers && !registry.bindNativeHighPriorityTiers()) {
             std::cerr << "trace setup failed: native +3/+4 priority tier rejected\n";return 2;
         }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         if (nativeAudioRenderer && !registry.bindExperimentalAudioRenderer(nativeAudioRenderer,
             [&](const recomp::bootstrap::GuestPreparedThread& thread) {
                 const auto initial=recomp::bootstrap::makeGuestThreadEntry(thread);
@@ -3358,7 +3657,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             std::cerr << "trace setup failed: native category1 unity-gain policy rejected\n";return 2;
         }
 #endif
-#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && defined(__ANDROID__)
+#if defined(RECOMP_RENDERER_BOUNDARY_TRACE) && (defined(__ANDROID__) || defined(__APPLE__))
         bindRendererInlineCapture(&registry,inspectColorProgram?&*inspectColorProgram:nullptr,
             [&](const auto& f){
                 // v212: the D3D hooks' gate entry is also a non-blocking delivery point for a deferred interrupt (v211: only
@@ -3422,6 +3721,10 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 if(!liveCallbacks || !liveCallbacks->orderedRgba || !nativeGraphics)return false;
                 if(!*scanoutFinal)*scanoutFinal=nativeGraphics->nativeScalerConfigured() &&
                     registry.completedNativeDisplayGamma().has_value();
+                if(iosSharedDisplay) {
+                    if(*scanoutFinal)iosScanoutReady.store(true,std::memory_order_release);
+                    return false; // first CPU frame establishes immutable map outside producer gate
+                }
                 // v255: once the scan-out can no longer change, its mapping as three tables for the direct present (the
                 // mapping of a ramp of every value, checked per value by lutFromMapped; not sent if it is not per value).
                 if(*scanoutFinal && !*lutSent && recomp::gpu::direct::presenter().gpuWanted()) {
@@ -3444,6 +3747,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             // v158: the interpolated + real frame pair (only once frames are queued at all: same scan-out condition).
             bindRendererDiagnosticV158Pair([&,scanoutFinal](const std::vector<std::uint8_t>& mid,const std::vector<std::uint8_t>& rgba,unsigned width,
                     unsigned height,std::chrono::microseconds delay) {
+                if(iosSharedDisplay)return false; // preserve synchronous sequence for excluded interpolation
                 if(!liveCallbacks || !liveCallbacks->orderedRgba || !nativeGraphics || !*scanoutFinal)return false;
                 if(!framePresenter.submitPair(mid.data(),rgba.data(),rgba.size(),width,height,delay))return false;
                 const auto c=framePresenter.counters();
@@ -3479,7 +3783,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
 #if defined(RECOMP_RENDERER_BOUNDARY_TRACE)
     if(!saveStoppedRendererDraw((std::filesystem::path(argv[1]).parent_path()/"renderer-first-unsupported").string()))
         std::cerr<<"trace evidence failed: unsupported renderer draw save failed\n";
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     dumpStoppedRendererTextureDescriptions(registry,nativeGraphics.get(),inspectColorProgram?&*inspectColorProgram:nullptr);
 #else
     dumpStoppedRendererTextureDescriptions(registry);
@@ -3709,7 +4013,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         if (nativeScalerWrapper) {
             const auto registration=registry.graphicsInterruptRegistration();
             std::optional<std::uint32_t> mask,base;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             if (nativeGraphics) { mask=nativeGraphics->retainedRegister(0x1DC);base=nativeGraphics->retainedRegister(0x1DD); }
 #endif
             std::cout<<1<<','<<nativeScalerWrapper->scratchPhysical()<<','<<nativeScalerWrapper->callbackAddress()<<','
@@ -3781,7 +4085,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         const auto status=registry.nativeDeferredColorPrefixStatus();
         const auto completed=registry.completedNativeDeferredColorPrefix();
         const auto ring=registry.graphicsRingConfiguration();bool repeatRejected=false;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         if(status[0] && inspectColorProgram)repeatRejected=
             !registry.executeExperimentalDeferredColorPrefix(*inspectColorProgram,{},submission.writeWord);
 #endif
@@ -3881,7 +4185,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 for(auto value:irq->queuedSurfaces)std::cout<<','<<value;
                 for(auto value:irq->scratch)std::cout<<','<<value;
                 std::optional<unsigned> base,mask;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
                 if(nativeGraphics){base=nativeGraphics->retainedRegister(0x1DD);mask=nativeGraphics->retainedRegister(0x1DC);}
 #endif
                 std::cout<<','<<base.has_value()<<','<<base.value_or(0)<<','<<mask.has_value()<<','<<mask.value_or(0);
@@ -4026,7 +4330,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
         std::cout << "thread_delays=" << s[0] << ',' << s[1] << ',' << s[2] << ',' << s[3]
                   << ',' << s[4] << ',' << s[5] << ',' << s[6] << '\n';
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if (experimentalNativeAudio) {
         const auto c=nativeAudio->configuration();
         if (!c || (!nativeAudioRenderer && (nativeAudio->started() || nativeAudio->framesWritten()!=0 || nativeAudio->framesRead()!=0))) {
@@ -4077,8 +4381,36 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             }
             std::cout << '\n';
         }
+        // (Claude 2026-10-18, c207) the game's job worker sub_83197450 calls job->func(job) at 83197564 (LR 83197568) on a job
+        // taken from the manager in r26 by sub_83196290: 4 bounded rings of 8200 bytes (head +0, tail +4, seq[1024] +8,
+        // data[1024] +4104). Search every ring's data for the job pointer (r3): found = the ring still holds what it handed
+        // out (a job freed or reused while queued); not found = a newer job overwrote that slot (the worker read it stale).
+        if (rejectedIndirect->linkRegister == 0x83197568u) {
+            const std::uint32_t job = rejectedIndirect->registers[0], manager = rejectedIndirect->registers[6];
+            constexpr std::uint32_t ringBytes = 8200, rings = 4;
+            std::optional<std::vector<std::uint8_t>> m = registry.snapshotStoppedGuestHeap(manager, ringBytes * rings);
+            if (!m && manager >= imageBase && std::uint64_t{manager} + ringBytes * rings <= std::uint64_t{imageBase} + titleValues[1]) {
+                const auto* begin = addressSpace.translate(manager);
+                m = std::vector<std::uint8_t>(begin, begin + ringBytes * rings);
+            }
+            const auto word = [&](std::size_t off) {const auto* q = m->data() + off;
+                return (std::uint32_t{q[0]} << 24) | (std::uint32_t{q[1]} << 16) | (std::uint32_t{q[2]} << 8) | q[3];};
+            std::cout << "job_ring_check manager=" << manager << " job=" << job << " snapshot=" << bool(m);
+            if (m) {
+                unsigned found = 0;
+                for (std::uint32_t r = 0; r < rings; ++r) {
+                    const std::size_t b = std::size_t(r) * ringBytes;
+                    std::cout << " ring" << r << "=" << word(b) << '/' << word(b + 4);
+                    for (std::uint32_t i = 0; i < 1024; ++i) if (word(b + 4104 + i * 4) == job) {
+                        ++found; std::cout << " found=" << r << ':' << i << ":seq=" << word(b + 8 + i * 4);
+                    }
+                }
+                std::cout << " found_count=" << found;
+            }
+            std::cout << '\n';
+        }
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if (nativeGraphics && nativeGraphics->displayConfiguration()) {
         const auto& dimensions = nativeGraphics->displayConfiguration()->dimensions;
         std::cout << "native_display_dimensions=" << dimensions[0] << ',' << dimensions[1] << ','
@@ -4128,7 +4460,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             std::cout << "native_state_batches=" << state->batches << ',' << state->readWord << ',' << state->words << ','
                 << state->stateWrites << ',' << state->invalidations << '\n';
         else std::cout << "native_state_batches=0,0,0,0,0\n";
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
         if (nativeGraphics) {
             const auto& state=nativeGraphics->stateBatchSnapshot();
             std::cout << "native_bin_state=" << static_cast<std::uint32_t>(state.binMask) << ','
@@ -4327,7 +4659,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
             // the failed retail graph as successful work. No image pixel read,
             // execution, event publication or ring retirement is authorized.
             unsigned shaderStatus=0;recomp::gpu::NativeDeferredShaderCapture shaders;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             std::array<std::uint32_t,10> colorInspection{};
             const auto ring=registry.graphicsRingConfiguration();colorInspection[9]=ring?ring->readWord:0;
             std::array<std::uint32_t,4> memoryInspection{{0,0,0,colorInspection[9]}};
@@ -4348,7 +4680,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                             if(frame && recomp::gpu::captureNativeDeferredPrefixShaders(*frame,
                                 [&](auto address,auto count){return registry.snapshotStoppedGraphicsPhysical(address,count);},shaders)){
                                 shaderStatus=1;
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
                                 if(inspectColorProgram && experimentalOwnedColor && nativeDisplayOutput && nativeGraphics){
                                     const auto state=nativeGraphics->stateBatchSnapshot();
                                     const recomp::gpu::DrawBinState bins{{{static_cast<std::uint32_t>(state.binMask),static_cast<std::uint32_t>(state.binMask>>32),
@@ -4453,7 +4785,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
                 for(auto b:shaders.bytes[i])std::cout<<digits[b>>4]<<digits[b&15];
                 std::cout<<'\n';
             }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
             if(inspectColorProgram && experimentalOwnedColor && nativeDisplayOutput){
                 std::cout<<"stopped_deferred_color_inspection=[";
                 for(unsigned i=0;i<colorInspection.size();++i)std::cout<<(i?",":"")<<colorInspection[i];
@@ -4479,7 +4811,7 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
 #endif
         }
     }
-#if defined(__ANDROID__)
+#if (defined(__ANDROID__) || defined(__APPLE__))
     if(inspectColorProgram && experimentalOwnedColor && nativeDisplayOutput){
         // Stopped, read-only diagnostic of the next batch. This does NOT use
         // the one-shot live publisher, advance the queue, or export textures.
@@ -4888,14 +5220,25 @@ static int runTraceMain(int argc, char** argv,const RecompPrivateTraceCallbacksV
 
 #if defined(RECOMP_PRIVATE_TRACE_LIBRARY)
 namespace {
+[[gnu::noinline]] int runTraceWithInputObserver(int argc,char** argv,const RecompPrivateTraceCallbacksV2* callbacks,
+        const RecompPrivateTraceCallbacksV3* liveCallbacks,const RecompPrivateTraceCallbacksV5* inputCallbacks) {
+    if(!recomp::input::delivery::embedding::beginRun())return 3;
+    // Only normal core completion admits release. Exceptional unwind does not
+    // prove all workers joined; keep registration frozen and its owner alive.
+    const int result=runTraceMain(argc,argv,callbacks,liveCallbacks,inputCallbacks);
+    recomp::input::delivery::embedding::finishAfterJoin();
+    return result;
+}
 std::atomic_flag privateTraceEntered=ATOMIC_FLAG_INIT;
 int privateTraceEntry(int argc,char** argv,const RecompPrivateTraceCallbacksV2* callbacks,
         const RecompPrivateTraceCallbacksV3* liveCallbacks=nullptr,
-        const RecompPrivateTraceCallbacksV5* inputCallbacks=nullptr) noexcept {
+        const RecompPrivateTraceCallbacksV5* inputCallbacks=nullptr,IosSharedDisplay* shared=nullptr) noexcept {
     if(argc<1 || argc>1024 || !argv)return 2;
     for(int i=0;i<argc;++i)if(!argv[i] || strnlen(argv[i],4097)>4096)return 2;
-    if(privateTraceEntered.test_and_set(std::memory_order_acq_rel))return 3; if(const int refused=::recomp::appdir::fromLoader(argv[0]))return refused; // data-paths: the files directory, before any thread
-    try {return runTraceMain(argc,argv,callbacks,liveCallbacks,inputCallbacks);}
+    if(privateTraceEntered.test_and_set(std::memory_order_acq_rel))return 3;
+    if(shared){iosSharedDisplay=shared;recomp::ios_shared::enabled=true;}
+    if(const int refused=::recomp::appdir::fromLoader(argv[0]))return refused; // data-paths: the files directory, before any thread
+    try {return runTraceWithInputObserver(argc,argv,callbacks,liveCallbacks,inputCallbacks);}
     catch(...) {return 2;}
 }
 }
@@ -4935,7 +5278,27 @@ extern "C" int recomp_run_private_trace_v5(int argc,char** argv,const RecompPriv
             return static_cast<recomp::private_trace::DisplayCallbacksV4*>(user)->consume(rgba,bytes,width,height);}};
     return privateTraceEntry(argc,argv,nullptr,&bridge,&owned);
 }
-#if defined(__ANDROID__)
+extern "C" int recomp_run_private_trace_gpu_v1(int argc,char** argv,const RecompPrivateTraceCallbacksV5* callbacks,
+        const RecompIosGpuCallbacksV1* gpu) noexcept {
+    bool enabled=false;try{enabled=recomp::ios_shared::requested();}catch(...){return 2;}
+    if(!enabled)return recomp_run_private_trace_v5(argc,argv,callbacks);
+    if(!callbacks || callbacks->structureBytes!=sizeof(*callbacks) || callbacks->version!=5 ||
+       callbacks->reserved0 || callbacks->reserved1 || !callbacks->gamepadState || !callbacks->gamepadCapabilities ||
+       !gpu || gpu->structureBytes!=sizeof(*gpu) || gpu->version!=1 || gpu->reserved0 || gpu->reserved1 || !gpu->frame || !gpu->close)return 2;
+    const auto& d=callbacks->display;
+    if(d.structureBytes!=sizeof(d) || d.version!=4 || d.reserved0 || d.reserved1 || !d.orderedRgba)return 2;
+    // Permanent owner: exceptional worker unwind cannot leave callback storage dangling.
+    auto* owner=new IosSharedDisplay(d,*gpu);
+    const auto input=*callbacks;
+    const RecompPrivateTraceCallbacksV3 bridge{sizeof(RecompPrivateTraceCallbacksV3),3,0,0,owner,
+        [](void* user,const uint8_t* rgba,uint32_t bytes,uint32_t width,uint32_t height) noexcept {
+            return static_cast<IosSharedDisplay*>(user)->cpu(rgba,bytes,width,height);}};
+    const int result=privateTraceEntry(argc,argv,nullptr,&bridge,&input,owner);
+    if(result==3)return result; // old running entry owns all globals
+    if(result!=0)owner->fail();
+    owner->close(false);return result;
+}
+#if (defined(__ANDROID__) || defined(__APPLE__))
 namespace {
 // v255: V6's display bridge. The first frame decides for the run: the library's presenter claims the window (direct
 // present) or the app's own renderer gets every frame as with V5. A presenter that fails or gives the window back hands
@@ -4947,7 +5310,17 @@ public:
         try {
             std::lock_guard lock(mutex_);
             auto& presenter=recomp::gpu::direct::presenter();
+#if defined(__APPLE__)
+            // ios-direct-present: while the app's layer is not on screen yet the claim stays open and the frame is not shown
+            // (it would otherwise go to the app's own presenter, which then owns the layer for the run).
+            if(mode_==Mode::Undecided) {
+                if(presenter.claim())mode_=Mode::Direct;
+                else if(presenter.claimPending())return 1;
+                else mode_=Mode::App;
+            }
+#else
             if(mode_==Mode::Undecided)mode_=presenter.claim()?Mode::Direct:Mode::App;
+#endif
             if(mode_==Mode::Direct) {
                 if(presenter.presentCpu(rgba,bytes,width,height))return 1;
                 if(presenter.usable())return 1; // (dropped: an acquire timeout or an out-of-date swapchain, counted there)
@@ -4963,16 +5336,26 @@ private:
     std::mutex mutex_;
     Mode mode_=Mode::Undecided;
 };
-#ifdef RECOMP_THOR_EDITION
 }
+#ifdef RECOMP_THOR_EDITION
 // hud2 (v575): the app's second window (private_trace_hud_api.h), set once before the V6 entry.
 extern "C" int recomp_set_hud_window_v1(const RecompHudWindowV1* w) noexcept {
     if(!w || w->structureBytes!=sizeof(*w) || w->version!=1 || w->reserved0 || w->reserved1 || !w->acquireWindow || !w->releaseWindow ||
        !w->windowGeneration)return 2;
     recomp::gpu::hud2::screen().setWindow({w->windowUser,w->acquireWindow,w->releaseWindow,w->windowGeneration});
     return 0;
-#endif /* RECOMP_THOR_EDITION */
 }
+#if defined(RECOMP_DUO_EDITION)
+// ios-duo (2026-10-24): the app's split (1) / fullscreen (0) state; any thread, any time (hud_screen.h Screen::setShown).
+extern "C" void recomp_duo_set_lower_screen_v1(int on) noexcept {recomp::gpu::hud2::screen().setShown(on!=0);}
+// ios-duo: the lower screen's map rectangle (x0, y0, x1, y1 in its pixels); 0 = not laid out yet.
+extern "C" int recomp_duo_lower_map_rect_v1(int* r) noexcept {
+    auto& s=recomp::gpu::hud2::screen();if(!r)return 0;
+    for(int i=0;i<4;++i)r[i]=s.duoMapRect[i].load(std::memory_order_relaxed);
+    return r[2]>r[0] && r[3]>r[1];
+}
+#endif
+#endif /* RECOMP_THOR_EDITION */
 extern "C" int recomp_run_private_trace_v6(int argc,char** argv,const RecompPrivateTraceCallbacksV6* callbacks) noexcept {
     if(!callbacks || callbacks->structureBytes!=sizeof(*callbacks) || callbacks->version!=6 || callbacks->reserved0 ||
        callbacks->reserved1 || !callbacks->acquireWindow || !callbacks->releaseWindow || !callbacks->windowGeneration)return 2;

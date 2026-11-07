@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Player entry point: builder check|fetch|build|verify|sign. No shell or device commands.
+"""Player entry point for the Mac Duo builder: check, fetch, build and sign.
 
-iOS (a Mac with Xcode, 2026-11-05): a release may name more targets than its default profile in "profiles"
-({"ios": REL, "duo": REL}); builder build --ios / --duo builds that target's unsigned .ipa with the player's bundle
-identifier (the profiles take it as ${bundleid}): on the first iOS build a random one per player, com.fivepocket.<8 hex>.ios
-and .duo, kept in fivepocket-builder-settings.json next to the work folder and used by every later build (re-signing an app
-with another identifier makes a new app with empty storage: the import and the saves are lost; and a fixed identifier
-would collide between players' free Apple teams). --bundle-id overrides it for one build and is not stored. builder sign --ipa FILE --identity ID [--profile-file
-FILE.mobileprovision] [--entitlements FILE.plist] --out NEW.ipa signs it with the player's own identity (ios_sign.py,
-codesign reads the player's keychain) and writes the signed .ipa.
-
-A release is an audited payload plus builder-release/1 JSON. This development
-lane intentionally supplies no production release pins. Fetch has no usable
-publisher URL until an approved release is supplied; tests use local ZIPs only.
+Release inventories bind every shipped file. The Duo profile is selected explicitly,
+even when a legacy Mac inventory also contains an iOS profile. A player's generated
+bundle identifier is retained across builds so reinstalling preserves app storage.
 """
 from __future__ import annotations
 import argparse
@@ -305,129 +296,7 @@ def fetch(release, cache, accepted, archive=None, opener=None):
         lock.unlink()
 
 
-class PublisherOnlyRedirect(urllib.request.HTTPRedirectHandler):
-    # A release file of the shader compiler is handed out by the publisher's own file hosts; nowhere else is followed.
-    HOSTS = ('https://github.com/microsoft/DirectXShaderCompiler/', 'https://objects.githubusercontent.com/', 'https://release-assets.githubusercontent.com/')
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not newurl.startswith(self.HOSTS):
-            raise Refusal('publisher redirect left the publisher\'s hosts; obtain the pinned archive directly')
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def dxc_spec(release):
-    """The shader compiler the builder fetches instead of carrying it (Microsoft's DirectX Shader Compiler release):
-    None when the release names none, else the checked pins: address, size and hash of the archive, and for every file
-    taken out of it its name in the archive, its place below the package root and its hash."""
-    d = release.get('dxc')
-    if d is None:
-        return None
-    if not isinstance(d, dict) or not re.fullmatch('[0-9a-f]{64}', str(d.get('sha256'))) or type(d.get('size')) is not int or d['size'] <= 0:
-        raise Refusal('shader compiler archive SHA-256/size not pinned; ask the release publisher for a completed release')
-    if not re.fullmatch(r'https://github\.com/microsoft/DirectXShaderCompiler/releases/download/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.zip', str(d.get('url', ''))):
-        raise Refusal('shader compiler URL is not a pinned Microsoft release file; obtain a corrected release')
-    if not str(d.get('license_url', '')).startswith('https://github.com/microsoft/DirectXShaderCompiler/'):
-        raise Refusal('shader compiler licence link missing; obtain a corrected release')
-    files = d.get('files')
-    if not isinstance(files, list) or not files:
-        raise Refusal('shader compiler files not listed; obtain a corrected release')
-    places = set()
-    for rec in files:
-        if not isinstance(rec, dict) or not re.fullmatch('[0-9a-f]{64}', str(rec.get('sha256'))) or type(rec.get('size')) is not int or rec['size'] <= 0:
-            raise Refusal('shader compiler file not pinned; obtain a corrected release')
-        safe_name(rec.get('member')); place = str(safe_name(rec.get('path'))).casefold()
-        if place in places:
-            raise Refusal('shader compiler files share a place; obtain a corrected release')
-        places.add(place)
-    return d
-
-
-def existing_dxc(release, root):
-    """Every file of the fetched shader compiler is at its place with its pinned hash, or the build is refused."""
-    d = dxc_spec(release)
-    if d is None:
-        return
-    for rec in d['files']:
-        p = inside(root, rec['path'])
-        if not p.is_file():
-            raise Refusal('shader compiler missing; read its terms and run builder fetch --accept-dxc-license')
-        if db.sha256_file(p) != rec['sha256']:
-            raise Refusal(f'shader compiler file changed: {rec["path"]}; unpack the builder again and run builder fetch --accept-dxc-license')
-
-
-def fetch_dxc(release, root, cache, accepted, archive=None, opener=None):
-    """Fetches the pinned release of the shader compiler from its publisher (or takes a copy of the same archive from
-    disk) and puts the listed files at their places below the package root. A file already there is never written
-    over: with the pinned hash it stays, with another the run is refused."""
-    d = dxc_spec(release)
-    if d is None:
-        return
-    print(f'Shader compiler: {d["url"]}; {d["size"]} bytes; SHA-256 {d["sha256"][:12]}')
-    print(f'Its licence terms (Microsoft and LLVM), also inside the archive: {d["license_url"]}')
-    missing = []
-    for rec in d['files']:
-        p = inside(root, rec['path'])
-        if p.is_file():
-            if db.sha256_file(p) != rec['sha256']:
-                raise Refusal(f'another file lies where the shader compiler goes: {rec["path"]}; nothing is written over; unpack the builder again')
-        elif p.exists() or p.is_symlink():
-            raise Refusal(f'something that is no file lies where the shader compiler goes: {rec["path"]}; unpack the builder again')
-        else:
-            missing.append(rec['path'])
-    if not missing:
-        print('Shader compiler already verified.'); return
-    if not accepted:
-        raise Refusal('licence not accepted; read those terms, then rerun fetch with --accept-dxc-license if you agree')
-    host_support.private_output(cache)
-    cache.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(cache).free < d['size'] + sum(rec['size'] for rec in d['files']):
-        raise Refusal('not enough disk for the shader compiler archive and its files; free space or choose --cache elsewhere')
-    staged = cache / ('fetch-dxc-' + uuid.uuid4().hex)
-    staged.mkdir()
-    zip_path = staged / 'download.zip'
-    # No request is opened until all release/consent/disk checks above passed.
-    stream = open(archive, 'rb') if archive else (opener or urllib.request.build_opener(PublisherOnlyRedirect()).open)(d['url'], timeout=60)
-    h, total = hashlib.sha256(), 0
-    with stream, zip_path.open('xb') as out:
-        while block := stream.read(1 << 20):
-            total += len(block)
-            if total > d['size']:
-                raise Refusal('archive exceeds pinned size; keep failed evidence and obtain the correct archive')
-            h.update(block); out.write(block)
-    if total != d['size'] or h.hexdigest() != d['sha256']:
-        raise Refusal('archive hash/size mismatch; nothing installed; obtain the pinned publisher archive')
-    taken = {}
-    with zipfile.ZipFile(zip_path) as z:
-        names = {info.filename.replace('\\', '/'): info for info in z.infolist()}      # (the publisher's archive names its members with backslashes)
-        for rec in d['files']:
-            info = names.get(rec['member'])
-            if info is None or info.file_size != rec['size']:
-                raise Refusal(f'shader compiler archive lacks {rec["member"]} as pinned; nothing installed; obtain the pinned publisher archive')
-            data = z.read(info)
-            if len(data) != rec['size'] or hashlib.sha256(data).hexdigest() != rec['sha256']:
-                raise Refusal(f'{rec["member"]} is not the pinned file; nothing installed; obtain the pinned publisher archive')
-            taken[rec['path']] = data
-    for name in missing:                      # only now, with every file of the archive checked, is anything put into the package
-        data = taken[name]
-        dest = inside(root, name)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            out = dest.open('xb')             # a file that appeared since the look above is not written over either
-        except FileExistsError:
-            raise Refusal(f'a file appeared where the shader compiler goes: {name}; nothing is written over; unpack the builder again')
-        with out:
-            out.write(data)
-    existing_dxc(release, root)
-    print(f'Shader compiler installed and verified: {len(missing)} of {len(taken)} files put below {root}')
-
-
 def check_paths(work, cache):
-    # Until the whole native toolchain has passed long-path tests, refuse early;
-    # no administrator/policy changes are requested or made.
-    if sys.platform == 'win32':
-        for p in (work.resolve(), cache.resolve()):
-            if len(str(p)) > 80:
-                raise Refusal('Windows build/cache path exceeds 80 characters; choose a short user-owned folder such as C:\\b')
     host_support.private_output(work)
     host_support.private_output(cache)
 
@@ -451,9 +320,9 @@ class DiscNamedAtBuild:
 
 
 SETTINGS_NAME = 'fivepocket-builder-settings.json'
-TARGETS = ('ios', 'duo', 'thor', 'fold')          # a release's other profiles; ios and duo make apps (a bundle id each)
-APP_TARGETS = ('ios', 'duo')
-ANDROID_ELSEWHERE = 'The Android editions are built with the Windows builder in this release.'
+# Accepted inventory vocabulary includes older upstream Mac packages. Only Duo is buildable here.
+TARGETS = ('ios', 'duo', 'thor', 'fold')
+BUILD_TARGET = 'duo'
 
 
 def bundle_id_for(target: str, work: Path, given: str | None = None) -> str:
@@ -479,12 +348,13 @@ def say_bundle_id(bundle_id: str, target: str) -> None:
           'the imported discs and your saves would be gone.')
 
 
-def profile_of(release, target):
-    if target is None:
-        return release['profile']
-    if target not in release.get('profiles', {}):
-        raise Refusal(f'this builder release makes no {target} app; obtain the Mac builder release that does')
-    return release['profiles'][target]
+def profile_of(release, target=None):
+    if target not in (None, BUILD_TARGET):
+        raise Refusal('this builder supports only FivePocket Duo')
+    profile = release.get('profiles', {}).get(BUILD_TARGET)
+    if profile is None:
+        raise Refusal('release has no Duo profile; obtain the Mac Duo builder package')
+    return profile
 
 
 def check(release, root, work, cache, target=None):
@@ -501,7 +371,6 @@ def check(release, root, work, cache, target=None):
     if free < need:
         raise Refusal('not enough free disk; free space or choose another --work directory')
     ndk = existing_ndk(cache, ndk_spec(release))
-    existing_dxc(release, root)
     profile = db.load_profile(inside(root, profile_of(release, target)))
     # Check every supported game's plan without pretending either disc was identified.
     with environment({'BUILDER_PYTHON': str(inside(root, release['python'])) if release.get('python') else sys.executable,
@@ -511,10 +380,7 @@ def check(release, root, work, cache, target=None):
             ctx = db.Context(profile, work, root, work); ctx.game = game
             ctx.discs = {role: DiscNamedAtBuild(role) for role in ('play', 'install')}  # names only; no stage runs, no disc is read
             db.plan_paths(profile, ctx)
-            if 'output' in profile:
-                db.plan_output(profile, ctx)
-            else:
-                db.plan_bundle(profile, ctx)
+            db.plan_output(profile, ctx)
             failures.extend(db.check_prerequisites(profile, ctx))
     if failures:
         raise Refusal('; '.join(dict.fromkeys(failures)) + '; obtain the complete payload or fix the profile; no stage ran')
@@ -533,94 +399,32 @@ def default_work(root):
     return root / 'local-analysis' / 'builder' / 'work'
 
 
-def ios_only_text(release, targets):
-    ndk, need = release['ndk'], release['estimates']['min_free_bytes']
-    android = [t for t in targets if t not in APP_TARGETS]
-    targets = [t for t in targets if t in APP_TARGETS]
-    which = ' or '.join('--' + t for t in targets)
-    out = default_work(Path()) / 'out'
-    return f'''This program makes the FivePocket app for iPhone and iPad ({', '.join(targets)}) from your own two disc images,
-on a Mac with Xcode (DEVELOPER_DIR, or Xcode in /Applications). Open Terminal in this folder and run, in this order:
-
-  1. ./builder fetch --accept-ndk-license
-       Once. Fetches the compiler the shader stages use (Android NDK, {ndk["size"] / 1e6:.0f} MB from {ndk["url"]}).
-       Read its terms first ({ndk["license_url"]}); the switch says you accept them.
-  2. ./builder build {which} --play-disc PLAY-DISC.iso --install-disc INSTALL-DISC.iso
-       Needs {need / 2**30:.0f} GiB of free space. Takes about an hour; the second app reuses most of the first one's work.
-       Writes an unsigned .ipa to {out} in this folder. The game's data is not in it: the app imports it from your discs.
-       Your app's bundle identifier is made once and printed at the end: ALWAYS SIGN WITH THAT IDENTIFIER
-       (another one makes a new app with empty storage). --bundle-id ID chooses your own for one build.
-  3. ./builder sign --ipa UNSIGNED.ipa --identity "Apple Development: you@example.com" --profile-file YOUR.mobileprovision --out SIGNED.ipa
-       Signs it with your own identity and profile (or sign and install it with your usual tools).
-
-{android_text(android, out)}A build that was interrupted goes on where it stopped when step 2 is run again.
-Apart from short-lived files in the system's temporary folder, nothing is written outside this folder and the
-compiler's cache folder; nothing is installed.'''
-
-
-def android_text(android, out):
-    if not android:
-        return ANDROID_ELSEWHERE + '\n\n'
-    names = {'thor': 'the Thor Edition app (AYN Thor, two screens)', 'fold': 'the single-screen app (Fold and other phones)'}
-    lines = ''.join(f'  ./builder build --{t} --play-disc PLAY-DISC.iso --install-disc INSTALL-DISC.iso\n'
-                    f'       The code bundle for {names.get(t, t)}, written to {out}.\n' for t in android)
-    return f'''
-It also makes the code bundle for the Android apps, which import it from the phone's storage:
-{lines}  ./builder verify BUNDLE
-       Checks a bundle and prints its seal: the app shows the same seal when it imports the bundle.
-
-'''
-
-
-def ios_text(targets):
-    if not targets:
-        return ''
-    which = ' or '.join('--' + t for t in targets)
-    return f'''
-On a Mac with Xcode (DEVELOPER_DIR, or Xcode in /Applications) it also makes the iOS app ({', '.join(targets)}):
-  builder build {which} --bundle-id com.yourname.fivepocket --play-disc PLAY-DISC.iso --install-disc INSTALL-DISC.iso
-       Writes an unsigned .ipa to the same folder. The game's data is not in it: the app imports it from your discs.
-  builder sign --ipa UNSIGNED.ipa --identity "Apple Development: you@example.com" --profile-file YOUR.mobileprovision --out SIGNED.ipa
-       Signs it with your own identity and profile (or sign and install it with your usual tools).
-
-'''
-
-
 def how_to(release_path):
-    # What a player sees when the program is started without a word (a double click). Numbers come from the
-    # package's own inventory when it can be read; nothing is checked or started here.
     try:
         release = read_json(release_path)
-        ndk, need = release['ndk'], release['estimates']['min_free_bytes']
+        ndk = release['ndk']
         compiler = f'{ndk["size"] / 1e6:.0f} MB from {ndk["url"]}'
-        space = f'{need / 2**30:.0f} GiB of free space'
+        space = f'{release["estimates"]["min_free_bytes"] / 2**30:.0f} GiB of free space'
         terms = ndk['license_url']
-        dxc = release.get('dxc')
-        targets = sorted(release.get('profiles', {}))
-        if release['profile'] in release.get('profiles', {}).values():
-            return ios_only_text(release, targets)
-        shaders = (f'\n       And the shader compiler (DirectX Shader Compiler, {dxc["size"] / 1e6:.0f} MB from {dxc["url"]});'
-                   f'\n       its terms: {dxc["license_url"]}') if dxc else ''
     except (OSError, ValueError, KeyError, TypeError):
-        compiler, space, terms, dxc, shaders, targets = 'from its publisher', 'free space as the check step reports', 'named by the fetch step', None, '', []
-    switches = '--accept-ndk-license --accept-dxc-license' if dxc else '--accept-ndk-license'
-    accept = 'each switch says you accept the one' if dxc else 'the switch says you accept them'
+        compiler, space, terms = 'from its publisher', 'the free space reported by check', 'named by the fetch step'
     out = default_work(Path()) / 'out'
-    return f'''This program makes the game's code bundle for the phone app from your own two disc images.
-Open a command prompt in this folder and run, in this order:
+    return f'''Build FivePocket Duo from your own two disc images on a Mac with Xcode.
 
-  1. builder fetch {switches}
-       Once. Fetches the compiler (Android NDK, {compiler}).
-       Read its terms first ({terms}); {accept}.{shaders}
-  2. builder build --play-disc PLAY-DISC.iso --install-disc INSTALL-DISC.iso
-       Needs {space}. Takes from half an hour to a few hours.
-       The bundle is written to {out} in this folder.
-  3. builder verify BUNDLE
-       Checks a bundle and prints its seal: the app shows the same seal when it imports the bundle.
+  ./builder fetch --accept-ndk-license
+      Fetches the Android NDK shader and decoder tools ({compiler}).
+      Read the terms first ({terms}); the switch accepts them.
+  ./builder check
+      Checks the package, compiler and stage inputs without reading discs.
+  ./builder build --play-disc PLAY-DISC.iso --install-disc INSTALL-DISC.iso
+      Needs {space}. Writes an unsigned Duo .ipa to {out}.
+      An interrupted build resumes from its verified completed stages.
+  ./builder sign --ipa UNSIGNED.ipa --identity "Apple Development: you@example.com" --profile-file YOUR.mobileprovision --out SIGNED.ipa
+      Signs the app with your own identity and profile.
 
-{ios_text(targets)}A build that was interrupted goes on where it stopped when step 2 is run again.
-Apart from short-lived files in the system's temporary folder, nothing is written outside this folder and the
-compiler's cache folder; nothing is installed.'''
+Keep the printed bundle identifier when signing and reinstalling: a different identifier
+creates a different app with empty storage. --bundle-id chooses an identifier for one build.
+The app imports game data from your discs on the Duo.'''
 
 
 def sign_ipa(ipa: Path, identity: str, profile: Path | None, entitlements: Path | None, out: Path) -> int:
@@ -657,65 +461,46 @@ def main(argv=None):
     if (sys.argv[1:] if argv is None else argv) == []:
         print(how_to(default_release()))
         return 0
-    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap = argparse.ArgumentParser(description='Build and sign FivePocket Duo on macOS.')
     ap.add_argument('--release', type=Path, default=default_release())
-    ap.add_argument('--cache', type=Path, default=Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.cache'))) / 'own-disc-builder')
+    ap.add_argument('--cache', type=Path, default=Path.home() / '.cache' / 'own-disc-builder')
     sub = ap.add_subparsers(dest='cmd', required=True)
     c = sub.add_parser('check'); c.add_argument('--work', type=Path)
     f = sub.add_parser('fetch'); f.add_argument('--accept-ndk-license', action='store_true'); f.add_argument('--archive', type=Path)
-    f.add_argument('--accept-dxc-license', action='store_true'); f.add_argument('--dxc-archive', type=Path)
     b = sub.add_parser('build')
     b.add_argument('--work', type=Path); b.add_argument('--play-disc', type=Path, required=True)
-    b.add_argument('--install-disc', type=Path); b.add_argument('--out', type=Path); b.add_argument('--allow-heavy', action='store_true')
+    b.add_argument('--install-disc', type=Path, required=True); b.add_argument('--out', type=Path)
+    b.add_argument('--allow-heavy', action='store_true', help=argparse.SUPPRESS)
     b.add_argument('--report', type=Path); b.add_argument('--stop-after')
-    target = b.add_mutually_exclusive_group()
-    target.add_argument('--ios', dest='target', action='store_const', const='ios')
-    target.add_argument('--duo', dest='target', action='store_const', const='duo')
-    target.add_argument('--thor', dest='target', action='store_const', const='thor')
-    target.add_argument('--fold', dest='target', action='store_const', const='fold')
+    b.add_argument('--duo', action='store_true', help='build FivePocket Duo (the default)')
     b.add_argument('--bundle-id')
-    v = sub.add_parser('verify'); v.add_argument('bundle', type=Path); v.add_argument('--executable-sha256')
     s = sub.add_parser('sign'); s.add_argument('--ipa', type=Path, required=True); s.add_argument('--identity', required=True)
     s.add_argument('--profile-file', type=Path); s.add_argument('--entitlements', type=Path); s.add_argument('--out', type=Path, required=True)
     a = ap.parse_args(argv)
     try:
-        if a.cmd == 'verify':
-            return db.main(['verify', str(a.bundle)] + (['--executable-sha256', a.executable_sha256] if a.executable_sha256 else []))
         if a.cmd == 'sign':
             return sign_ipa(a.ipa, a.identity, a.profile_file, a.entitlements, a.out)
         release, root = load_release(a.release)
         if a.cmd == 'fetch':
             check_paths(a.cache, a.cache)
             fetch(release, a.cache.resolve(), a.accept_ndk_license, a.archive)
-            fetch_dxc(release, root, a.cache.resolve(), a.accept_dxc_license, a.dxc_archive)
-        else:
-            work = a.work or default_work(root)
-            target = getattr(a, 'target', None)
-            profiles = release.get('profiles', {})
-            if target not in APP_TARGETS + (None,) and target not in profiles and any(t in APP_TARGETS for t in profiles):
-                print(ANDROID_ELSEWHERE)               # an iOS release without the Android packs (PUBLISH-DECISIONS 23)
-                return 2
-            if target is None:                          # a release whose default profile is one of its iOS targets (the Mac release)
-                target = next((t for t, rel in sorted(release.get('profiles', {}).items()) if rel == release['profile']), None)
-            # check plans the target with a stand-in identifier (no settings are written before a build)
-            bundle_id = ((bundle_id_for(target, work.resolve(), a.bundle_id) if a.cmd == 'build' else f'com.fivepocket.check.{target}')
-                         if target in APP_TARGETS else None)
-            with environment({'BUILDER_BUNDLE_ID': bundle_id} if bundle_id else {}):
-                ndk = check(release, root, work.resolve(), a.cache.resolve(), target)
-            if a.cmd == 'build':
-                # A player who starts a build has asked for the long stages too: the engine's switch for them is
-                # always given (--allow-heavy is still taken on the command line, and changes nothing).
-                command = ['build', '--profile', str(inside(root, profile_of(release, target))), '--work', str(work),
-                           '--play-disc', str(a.play_disc), '--repo', str(root), '--data-root', str(work), '--allow-heavy']
-                for name in ('install_disc', 'out', 'report', 'stop_after'):
-                    if getattr(a, name): command += ['--' + name.replace('_', '-'), str(getattr(a, name))]
-                with environment(dict({'BUILDER_PYTHON': str(inside(root, release['python'])) if release.get('python') else sys.executable,
-                                       'BUILDER_NDK_ROOT': str(ndk), 'BUILDER_PACKAGE_ROOT': str(root)},
-                                      **({'BUILDER_BUNDLE_ID': bundle_id} if bundle_id else {}))):
-                    code = db.main(command)
-                if bundle_id:
-                    say_bundle_id(bundle_id, target)
-                return code
+            return 0
+        work = a.work or default_work(root)
+        selected = inside(root, profile_of(release))
+        bundle_id = bundle_id_for(BUILD_TARGET, work.resolve(), a.bundle_id) if a.cmd == 'build' else 'com.fivepocket.check.duo'
+        with environment({'BUILDER_BUNDLE_ID': bundle_id}):
+            ndk = check(release, root, work.resolve(), a.cache.resolve())
+        if a.cmd == 'build':
+            command = ['build', '--profile', str(selected), '--work', str(work),
+                       '--play-disc', str(a.play_disc), '--install-disc', str(a.install_disc),
+                       '--repo', str(root), '--data-root', str(work), '--allow-heavy']
+            for name in ('out', 'report', 'stop_after'):
+                if getattr(a, name): command += ['--' + name.replace('_', '-'), str(getattr(a, name))]
+            with environment({'BUILDER_PYTHON': str(inside(root, release['python'])) if release.get('python') else sys.executable,
+                              'BUILDER_NDK_ROOT': str(ndk), 'BUILDER_PACKAGE_ROOT': str(root), 'BUILDER_BUNDLE_ID': bundle_id}):
+                code = db.main(command)
+            say_bundle_id(bundle_id, BUILD_TARGET)
+            return code
         return 0
     except (Refusal, db.BuilderError, OSError, ValueError, KeyError, zipfile.BadZipFile) as error:
         print(f'REFUSED: {error}. No automatic retry. Correct the input or use an intact release, then run check again.')

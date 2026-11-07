@@ -122,9 +122,6 @@ private:
         return lo;
     }
     void* allocateLocked(std::size_t size,std::size_t align) {
-        // wf-heap guard (2026-10-15): a size the 32-bit header fields cannot hold, or an alignment that is not a power of two up to
-        // 64 KiB, is refused before any arithmetic (nullptr = Vulkan's allocation failure; a reallocation keeps the old block).
-        if(size>0x7FFF0000u || align>0x10000u || (align&(align-1)))return nullptr;
         // a block of class c holds HeaderBytes + caps_[c]; the payload starts HeaderBytes after the block start (16-aligned), or later
         // for larger alignments (need = size + align - 16 then leaves room to move the payload up to an aligned address)
         const std::size_t need=align<=16?size:size+align-16;

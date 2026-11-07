@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- The name on the home screen (the lead's decision under the owner's "use your discretion", 2026-10-05).
-         Owner 2026-10-25: the project is FivePocket (FivePocket, FivePocket iOS, FivePocket Duo, FivePocket Thor Edition); the menu header is "FivePocket" (ShellPages.TITLE). -->
-    <string name="app_name">FivePocket</string>
-    <string name="smoke_heading">Graphics self-test</string>
-</resources>

@@ -66,21 +66,26 @@ struct Stats {
     std::uint64_t drainSpins=0,drainSpinHits=0; // v151: drains that spun before sleeping, and those done while spinning
 };
 
+struct WorkerScopeHooks {void* context=nullptr;bool(*enter)(void*) noexcept=nullptr;void(*leave)(void*) noexcept=nullptr;};
+
 class Pipeline {
 public:
     using Execute=std::function<void(const Item&)>;
     // depth: bounded items in flight at most (queued + executing); spin: how long an idle worker polls before sleeping.
     // drainSpin (v151): how long drain() polls (unlocked) for its target before it sleeps; 0 = sleep at once (v150).
     Pipeline(Execute execute,unsigned depth,std::chrono::nanoseconds spin,const char* threadName="recomp-render-w",
-             std::chrono::nanoseconds drainSpin=std::chrono::nanoseconds{RECOMP_ASYNC_QUEUE_DEFAULT_DRAIN_SPIN_NS})
+             std::chrono::nanoseconds drainSpin=std::chrono::nanoseconds{RECOMP_ASYNC_QUEUE_DEFAULT_DRAIN_SPIN_NS},
+             WorkerScopeHooks workerScope={})
         :execute_(std::move(execute)),depth_(std::max(1u,depth)),spin_(spin),drainSpin_(drainSpin) {
-        worker_=std::thread([this,threadName]{
+        worker_=std::thread([this,threadName,workerScope]{
 #if defined(__ANDROID__) || defined(__linux__)
             pthread_setname_np(pthread_self(),threadName);
 #elif defined(__APPLE__)
             pthread_setname_np(threadName);
 #endif
             onWorker()=true;
+            struct Scope {WorkerScopeHooks hooks;bool entered;~Scope(){if(entered && hooks.leave)hooks.leave(hooks.context);}};
+            Scope scope{workerScope,workerScope.enter && workerScope.leave && workerScope.enter(workerScope.context)};
 #if defined(__ANDROID__)
             recomp_register_stop_yield_thread(int(gettid())); // v241
 #endif

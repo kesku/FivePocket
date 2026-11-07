@@ -135,10 +135,10 @@ def main():
     result = resolve_requirements(meta, {n: read(n, True) for n in names})
     result['source_sha256'] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
         'tools/rpf7_inventory/resolve_capture_preflight.py',
-        'android/app/src/main/cpp/native_offscreen_resolve_request.h',
-        'android/app/src/main/cpp/native_offscreen_resolve.h',
-        'android/app/src/main/cpp/native_offscreen_draw_target.h',
-        'android/app/src/main/cpp/xenos_texture_2d.cpp')}
+        'runtime/host/native_offscreen_resolve_request.h',
+        'runtime/host/native_offscreen_resolve.h',
+        'runtime/host/native_offscreen_draw_target.h',
+        'runtime/host/xenos_texture_2d.cpp')}
     print(json.dumps(result, indent=2))
 
 

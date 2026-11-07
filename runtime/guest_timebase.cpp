@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include "recomp_app_dir.h" // data-paths: the app's files directory.
 namespace recomp::bootstrap {
-#include "play_build.h" // play-config-2 (v527). v112 (declared here: the shared header stays unchanged)
+// v112 (declared here: the shared header stays unchanged)
 std::uint64_t guestTimebaseFromCounter(std::uint64_t ticks, std::uint64_t frequency) noexcept;
 bool guestTimebaseUsesCounter() noexcept;
 namespace {
@@ -54,12 +54,12 @@ std::uint64_t readGuestTimebase() noexcept {
     const auto& c = counterClock();
     if (c.enabled) {
         const std::uint64_t now = counter();
-        RECOMP_DIAG_ONLY(shards[now & 15].reads.fetch_add(1, std::memory_order_relaxed);) // play-config-2: not counted in the play build (cpu_timebase_reads=0, which run_trace.py accepts and records as reads 0)
+        shards[now & 15].reads.fetch_add(1, std::memory_order_relaxed);
         return guestTimebaseFromCounter(now - c.epoch, c.frequency);
     }
 #endif
     const auto ns = steadyNanoseconds();
-    RECOMP_DIAG_ONLY(shards[ns & 15].reads.fetch_add(1, std::memory_order_relaxed);) // play-config-2
+    shards[ns & 15].reads.fetch_add(1, std::memory_order_relaxed);
     // Signed nanoseconds cover over 292 years, far beyond a bounded trace.
     return guestTimebaseFromNanoseconds(ns);
 }

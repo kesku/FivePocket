@@ -145,7 +145,7 @@ class Checks(unittest.TestCase):
             self.assertEqual(entries[rows[0]['key']]['spirv_sha256'], m.sha(spv))
 
     def test_extract_records_the_title_packages_it_keeps(self):
-        from test_stfs_inventory import fixture as stfs_package, TITLE
+        from stfs_fixture import fixture as stfs_package, TITLE
         with self.temporary() as temp:
             root = Path(temp)
             stfs_package(root/'package.bin')
@@ -457,7 +457,7 @@ class Checks(unittest.TestCase):
     def test_every_recorded_name_is_made_by_the_one_rule(self):
         # the inventory's three kinds of file and the translation's record: with the rule replaced by a marked one,
         # every recorded name carries the mark
-        from test_stfs_inventory import fixture as stfs_package, TITLE
+        from stfs_fixture import fixture as stfs_package, TITLE
         marked = lambda path, base: 'RULE:' + path.relative_to(base).as_posix()
         with self.temporary() as temp:
             root = Path(temp)

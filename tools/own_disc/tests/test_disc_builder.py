@@ -5,10 +5,8 @@ Each test builds a throw-away "disc" (a folder or a synthetic XISO image), a pro
 fixture script that logs every execution, and calls main([...]) as the command line would. DISC_BUILDER=path selects
 the module under test (the mutant runner, mutants.py beside this file, points it at mutated copies).
 
-Two fixtures are written here from the format descriptions and not with the code under test: the disc image
-(make_xiso) and the bundle container (raw_bundle, plain struct packing, no zipfile). They are still this lane's own
-reading of the two formats: a real disc image and the phone app's importer are the outside checks (see the lane's
-report for which of them were run).
+The XISO fixture is written from the format description. Stage outputs are authored byte strings, so tests check
+publication, receipts and recovery without a compiler or game data.
 """
 from __future__ import annotations
 
@@ -23,7 +21,6 @@ import struct
 import sys
 import tempfile
 import unittest
-import zlib
 from pathlib import Path
 
 TOOL = Path(os.environ.get('DISC_BUILDER') or Path(__file__).resolve().parents[1] / 'disc_builder.py')
@@ -33,7 +30,6 @@ spec.loader.exec_module(db)
 
 XEX = b'FAKE-EXECUTABLE-' + bytes(range(256)) * 3
 OTHER_XEX = b'OTHER-EXECUTABLE-' + bytes(range(256)) * 2
-SEAL_PREFIX = b'own-disc-seal sha256='
 
 # The stand-in for every pipeline tool: step.py LOG NAME KIND OUT [INPUT...]. KIND says which output rule of a real
 # tool it imitates.
@@ -164,27 +160,6 @@ def make_xiso(path: Path, files: dict[str, bytes], partition: int = 0, trailer: 
     return layout
 
 
-def raw_bundle(entries: list[dict], junk_before: int | None = None) -> bytes:
-    """A sealed format-1 bundle written field by field. entries: dicts with name and data, and optionally flags,
-    method, crc, size and packed (the two sizes written into the headers) to make a damaged one."""
-    out, central = bytearray(), bytearray()
-    for index, e in enumerate(entries):
-        if junk_before == index:
-            out += b'JUNK'
-        name, data = e['name'].encode(), e['data']
-        crc, size = e.get('crc', zlib.crc32(data)), e.get('size', len(data))
-        fields = (20, e.get('flags', 0), e.get('method', 0), 0, 0x21, crc, e.get('packed', size), size, len(name), 0)
-        central += struct.pack('<4sHHHHHHIIIHHHHHII', b'PK\1\2', 0x0314, *fields, 0, 0, 0, 0o100644 << 16, len(out)) + name
-        out += struct.pack('<4sHHHHHIIIHH', b'PK\3\4', *fields) + name + data
-    out += central + struct.pack('<4sHHHHIIH', b'PK\5\6', 0, 0, len(entries), len(entries), len(central),
-                                 len(out), len(SEAL_PREFIX) + 64)
-    return bytes(out) + SEAL_PREFIX + hashlib.sha256(out).hexdigest().encode()
-
-
-def manifest_bytes(manifest: dict) -> bytes:
-    return json.dumps(manifest, indent=1, sort_keys=True).encode() + b'\n'
-
-
 class Fixture:
     def __init__(self, tmp: Path):
         self.tmp = tmp
@@ -221,11 +196,7 @@ class Fixture:
                 {'id': 'shaders', 'adapter': 'supplied', 'source': '${data}/pack.bin', 'outputs': {'pack': 'shaders/pack.bin'}},
                 self.command('link', 'file', 'link/libgame.so', ['${out:codegen:out}']),
             ],
-            'bundle': {'name': 'code-${profile}-${flavour}.bundle', 'runtime_abi': 'test-abi-1',
-                       'versions': {'recipe': 'r1'},
-                       'components': [{'name': 'lib/arm64-v8a/libgame.so', 'role': 'game-library', 'stage': 'link', 'output': 'out'},
-                                      {'name': 'title.xex', 'role': 'title-xex', 'stage': 'extract', 'output': 'xex'},
-                                      {'name': 'shaders/pack.bin', 'role': 'shader-pack', 'stage': 'shaders', 'output': 'pack'}]},
+            'output': {'name': 'result.ipa', 'stage': 'link', 'output': 'out'},
         }
 
     def command(self, sid: str, kind: str, out: str, inputs: list[str], tools: list[str] | None = None) -> dict:
@@ -252,8 +223,8 @@ class Fixture:
     def actions(self, report: dict) -> dict[str, str]:
         return {r['stage']: r['action'] for r in report.get('stages', [])}
 
-    def bundle(self) -> Path:
-        return self.work / 'out' / 'code-fixture-generic.bundle'
+    def artifact(self) -> Path:
+        return self.work / 'out' / 'result.ipa'
 
 
 class Base(unittest.TestCase):
@@ -412,25 +383,19 @@ class Prerequisites(Base):
         with mock.patch.dict(os.environ, dict(clean, DEVELOPER_DIR=str(self.fx.side), BUILDER_XCODE=str(xcode)), clear=True):
             self.assertEqual(self.fx.run()[0], 0, 'BUILDER_XCODE wins over DEVELOPER_DIR')
 
-    def test_an_output_profile_delivers_one_stage_file_instead_of_a_bundle(self):
-        del self.fx.profile['bundle']
+    def test_output_profile_publishes_the_exact_stage_file(self):
         self.fx.profile['output'] = {'name': 'Game-${flavour}.ipa', 'stage': 'link', 'output': 'out'}
         code, text, report = self.fx.run()
         self.assertEqual(code, 0, text)
         out = self.fx.work / 'out' / 'Game-generic.ipa'
         self.assertEqual(out.read_bytes(), (self.fx.work / 'link/libgame.so').read_bytes())
         self.assertEqual(report['output']['sha256'], hashlib.sha256(out.read_bytes()).hexdigest())
-        self.assertFalse(self.fx.bundle().exists(), 'no bundle is written')
+        self.assertEqual(report['output']['size'], out.stat().st_size)
         for broken, needle in (({'name': 'x.ipa', 'stage': 'link', 'output': 'nope'}, 'names no output of a stage'),
                                ({'name': '../x.ipa', 'stage': 'link', 'output': 'out'}, 'bad output name')):
             with self.subTest(needle=needle):
                 self.fx.profile['output'] = broken
                 self.assertEqual(self.fx.run()[0], db.EXIT_USAGE)
-        self.fx.profile['output'] = {'name': 'x.ipa', 'stage': 'link', 'output': 'out'}
-        self.fx.profile['bundle'] = {'name': 'a.bundle', 'runtime_abi': 'x', 'components': []}
-        code, text, _ = self.fx.run()
-        self.assertEqual(code, db.EXIT_USAGE)
-        self.assertIn('either "bundle" or "output"', text)
 
     def test_python_version_and_unknown_kinds_stop_everything(self):
         self.fx.profile['prerequisites'] = [{'id': 'python', 'kind': 'python', 'min': '99.1'}]
@@ -524,26 +489,19 @@ class Plan(Base):
                 self.assertFalse((self.fx.tmp / 'made').exists())
                 self.fx.profile = saved
 
-    def test_mistakes_in_the_bundle_description_are_refused_before_any_work(self):
-        bundle = self.fx.profile['bundle']
-        cases = (
-            ('component of an unknown stage output', lambda: bundle['components'][0].update(output='library'),
-             'names no output of a stage (link:library)'),
-            ('unknown role', lambda: bundle['components'][2].update(role='save-data'), "unknown role 'save-data'"),
-            ('upper-case component name', lambda: bundle['components'][2].update(name='Shaders/pack.bin'), 'bad name'),
-            ('component named like the manifest', lambda: bundle['components'][2].update(name='manifest.json'), 'bad name'),
-            ('component listed twice', lambda: bundle['components'].append(dict(bundle['components'][0])), 'names a component twice'),
-            ('no components', lambda: bundle.update(components=[]), 'bundle.components is empty'),
-            ('no runtime interface', lambda: bundle.pop('runtime_abi'), 'bundle.runtime_abi is missing'),
-            ('file name with a folder', lambda: bundle.update(name='../x.bundle'), 'bad bundle name'),
-        )
-        for label, change, needle in cases:
-            with self.subTest(label):
-                saved = copy.deepcopy(bundle)
-                change()
-                self.assert_refused_before_any_work(db.EXIT_USAGE, needle)
-                bundle.clear()
-                bundle.update(saved)
+    def test_invalid_final_output_is_refused_before_any_stage(self):
+        cases = [
+            (None, 'output must name a stage file'),
+            ([], 'output must name a stage file'),
+            ({'name': '../escape.ipa', 'stage': 'link', 'output': 'out'}, 'bad output name'),
+            ({'name': 'result.ipa.part', 'stage': 'link', 'output': 'out'}, 'bad output name'),
+            ({'name': 'result.ipa', 'stage': 'absent', 'output': 'out'}, 'names no output of a stage'),
+            ({'name': 'result.ipa', 'stage': 'link', 'output': 'absent'}, 'names no output of a stage'),
+        ]
+        for output, message in cases:
+            with self.subTest(output=output):
+                self.fx.profile['output'] = output
+                self.assert_refused_before_any_work(db.EXIT_USAGE, message)
 
     def test_malformed_profiles_are_refused(self):
         stages = self.fx.profile['stages']
@@ -558,7 +516,6 @@ class Plan(Base):
              'declares exactly one output'),
             ('disc stage without a path', lambda p: p['stages'][0].pop('path'), 'names no path on the disc'),
             ('stage id used twice', lambda p: p['stages'][4].update(id='decode'), 'stage ids must be unique'),
-            ('stage named bundle', lambda p: p['stages'][4].update(id='bundle'), '"bundle" is reserved'),
             ('no games', lambda p: p.update(games=[]), 'no games table'),
             ('game without a full hash', lambda p: p['games'][0].update(executable_sha256='0123456789ab'), '64 hex digits'),
         )
@@ -594,12 +551,12 @@ class Plan(Base):
         self.fx.profile['stages'].insert(1, self.fx.command('listing', 'file', 'listing/out.bin', ['${disc:install}/x']))
         self.assert_refused_before_any_work(db.EXIT_USAGE, '${disc:install} needs that disc on the command line')
 
-    def test_stop_after_runs_up_to_that_stage_and_writes_no_bundle(self):
+    def test_stop_after_runs_up_to_that_stage_and_writes_no_output(self):
         code, text, report = self.fx.run('--stop-after', 'decode')
         self.assertEqual(code, 0, text)
         self.assertEqual(self.fx.executed(), ['decode'])
         self.assertEqual(self.fx.actions(report), {'extract': 'ran', 'decode': 'ran'})
-        self.assertFalse(self.fx.bundle().exists())
+        self.assertFalse(self.fx.artifact().exists())
 
 
 class Receipts(Base):
@@ -609,13 +566,13 @@ class Receipts(Base):
         self.assertEqual(code, 0, text)
         return text, report
 
-    def test_unchanged_stages_are_skipped_and_bundle_is_identical(self):
+    def test_unchanged_stages_are_skipped_and_output_is_identical(self):
         self.assertEqual(self.fx.run()[0], 0)
-        first = self.fx.bundle().read_bytes()
+        first = self.fx.artifact().read_bytes()
         text, report = self.rerun()
         self.assertEqual(self.fx.executed(), [])                       # no command ran a second time
         self.assertEqual(set(self.fx.actions(report).values()), {'skipped'})
-        self.assertEqual(self.fx.bundle().read_bytes(), first)
+        self.assertEqual(self.fx.artifact().read_bytes(), first)
 
     def test_changed_input_reruns_that_stage_and_all_later_ones(self):
         self.assertEqual(self.fx.run()[0], 0)
@@ -664,7 +621,7 @@ class Receipts(Base):
         profile = self.fx.profile
         profile['games'].append({'id': 'other-game', 'executable_sha256': hashlib.sha256(OTHER_XEX).hexdigest()})
         profile['stages'] = [self.fx.command('decode', 'file', 'decode/image.bin', ['${repo}/config.toml'])]
-        profile['bundle']['components'] = [{'name': 'image.bin', 'role': 'decoded-image', 'stage': 'decode', 'output': 'out'}]
+        profile['output']['stage'] = 'decode'
         self.assertEqual(self.fx.run()[0], 0)
         self.rerun()
         self.assertEqual(self.fx.executed(), [])
@@ -688,11 +645,11 @@ class Receipts(Base):
         self.assertEqual(self.fx.run()[0], 0)
         other = self.fx.tmp / 'other-pack.bin'
         other.write_bytes(b'another pack')
-        self.rerun('--supply', f'shaders={other}')
+        _, report = self.rerun('--supply', f'shaders={other}')
         self.assertEqual(self.fx.executed(), ['link'])
-        manifest = db.verify_bundle(self.fx.bundle())
-        pack = next(c for c in manifest['components'] if c['role'] == 'shader-pack')
-        self.assertEqual((pack['sha256'], pack['provenance']), (hashlib.sha256(b'another pack').hexdigest(), 'supplied'))
+        stage = next(row for row in report['stages'] if row['stage'] == 'shaders')
+        self.assertEqual(stage['provenance'], 'supplied')
+        self.assertEqual((self.fx.work / 'shaders/pack.bin').read_bytes(), b'another pack')
 
     def test_modified_output_reruns_its_stage(self):
         self.assertEqual(self.fx.run()[0], 0)
@@ -722,11 +679,11 @@ class Receipts(Base):
 
     def test_moved_work_directory_keeps_its_receipts(self):
         self.assertEqual(self.fx.run()[0], 0)
-        first = self.fx.bundle().read_bytes()
+        first = self.fx.artifact().read_bytes()
         self.fx.work = self.fx.work.rename(self.fx.tmp / 'work-moved')
         self.rerun()
         self.assertEqual(self.fx.executed(), [])
-        self.assertEqual(self.fx.bundle().read_bytes(), first)
+        self.assertEqual(self.fx.artifact().read_bytes(), first)
 
     def test_failed_stage_stops_and_leaves_no_receipt(self):
         self.fx.stage('codegen')['argv'][4] = 'fail-late'               # the tool writes its output, then exits with 7
@@ -735,7 +692,7 @@ class Receipts(Base):
         self.assertIn('stage codegen: command exited with 7', text)
         self.assertEqual(self.fx.executed(), ['decode', 'codegen'])     # link never started
         self.assertFalse((self.fx.work / 'receipts/codegen.json').exists())
-        self.assertFalse(self.fx.bundle().exists())
+        self.assertFalse(self.fx.artifact().exists())
 
     def test_command_that_succeeds_without_writing_its_output_fails_the_stage(self):
         self.fx.stage('decode')['argv'][4] = 'none'
@@ -812,8 +769,10 @@ class ExternalOutputs(Base):
         self.assertNotEqual(new, b'library of an older build')
         kept = list((self.fx.work / 'backup' / 'link').iterdir())
         self.assertEqual([p.read_bytes() for p in kept], [b'library of an older build'])
-        lib = next(c for c in db.verify_bundle(self.fx.bundle())['components'] if c['role'] == 'game-library')
-        self.assertEqual((lib['sha256'], lib['provenance']), (hashlib.sha256(new).hexdigest(), 'built'))
+        self.assertEqual(self.fx.artifact().read_bytes(), new)
+        receipt = json.loads((self.fx.work / 'receipts/link.json').read_text())
+        self.assertEqual(receipt['outputs']['out']['sha256'], hashlib.sha256(new).hexdigest())
+        self.assertEqual(receipt['provenance'], 'built')
         self.fx.log.unlink()
         code, text, report = self.fx.run()                              # unchanged: covered by the receipt
         self.assertEqual((code, self.fx.executed()), (0, []), text)
@@ -831,7 +790,7 @@ class ExternalOutputs(Base):
         self.assertIn('an older file there is not accepted as built by this run', text)
         self.assertEqual(self.library.read_text(), 'library of an older build')
         self.assertFalse((self.fx.work / 'receipts/link.json').exists())
-        self.assertFalse(self.fx.bundle().exists())
+        self.assertFalse(self.fx.artifact().exists())
 
     def test_only_a_stage_that_says_so_may_write_outside_the_work_directory(self):
         del self.fx.stage('link')['external_outputs']
@@ -877,7 +836,7 @@ class WorkDirectory(Base):
                                                 external_outputs=True)
 
         cases = (('work directory', lambda: setattr(self.fx, 'work', repo / 'build'), [], 'work directory'),
-                 ('bundle directory', lambda: None, ['--out', str(repo / 'dist')], 'bundle directory'),
+                 ('output directory', lambda: None, ['--out', str(repo / 'dist')], 'output directory'),
                  ('report file', lambda: setattr(self.fx, 'report', repo / 'docs' / 'run.json'), [], 'report file'),
                  ('external stage output', external_link, [], 'output out of stage link'))
         for label, change, extra, needle in cases:
@@ -895,7 +854,7 @@ class WorkDirectory(Base):
         self.fx.work, self.fx.report = private / 'build', private / 'reports' / 'run.json'
         code, text, _ = self.fx.run('--out', str(private / 'dist'))
         self.assertEqual(code, 0, text)
-        self.assertTrue((private / 'dist' / 'code-fixture-generic.bundle').is_file())
+        self.assertTrue((private / 'dist' / 'result.ipa').is_file())
 
 
 class HeavyAndDryRun(Base):
@@ -904,7 +863,7 @@ class HeavyAndDryRun(Base):
         code, text, report = self.fx.run()
         self.assertEqual(code, db.EXIT_HEAVY, text)
         self.assertEqual(self.fx.executed(), ['decode'])
-        self.assertFalse(self.fx.bundle().exists())
+        self.assertFalse(self.fx.artifact().exists())
         code, text, _ = self.fx.run('--allow-heavy')
         self.assertEqual(code, 0, text)
         self.assertEqual(self.fx.executed(), ['decode', 'codegen', 'link'])
@@ -935,301 +894,6 @@ class HeavyAndDryRun(Base):
         self.assertEqual(code, db.EXIT_PREREQ, text)
         self.assertEqual(len(report['prerequisite_failures']), 1)
         self.assertEqual(len(report['stages']), 5)                      # the plan is still shown
-
-
-class BundleFormat2(Base):
-    """Format 2: runtime data beside the four main components, and a manifest two machines write alike."""
-
-    def second(self, fx=None):
-        fx = fx or self.fx
-        fx.profile['stages'].append(fx.command('catalog', 'file', 'catalog/files.bin', ['${out:extract:xex}']))
-        bundle = fx.profile['bundle']
-        bundle.update(format=2, provenance={'recipe': 'r1', 'compiler': 'c18'}, portable_tools=['${repo}/step.py'])
-        bundle.pop('versions')
-        bundle['components'] += [{'name': 'decoded.image.bin', 'role': 'decoded-image', 'stage': 'decode', 'output': 'out'},
-                                 {'name': 'runtime/inputs/files.bin', 'role': 'runtime-data', 'stage': 'catalog', 'output': 'out'}]
-        return bundle
-
-    def test_manifest_holds_the_profiles_statement_and_no_machine_records(self):
-        self.second()
-        code, text, _ = self.fx.run()
-        self.assertEqual(code, 0, text)
-        manifest = db.verify_bundle(self.fx.bundle(), hashlib.sha256(XEX).hexdigest())
-        self.assertEqual(sorted(manifest), ['_seal', 'components', 'flavour', 'game', 'portable_provenance', 'profile', 'runtime_abi', 'schema'])
-        self.assertEqual(manifest['schema'], 'gta5-code-bundle/2')
-        self.assertEqual(manifest['portable_provenance'], {'recipe': 'r1', 'compiler': 'c18', 'tools': [
-            {'name': '${repo}/step.py', 'sha256': hashlib.sha256(self.fx.step.read_bytes()).hexdigest()}]})
-        roles = {c['name']: (c['role'], c['provenance']) for c in manifest['components']}
-        self.assertEqual(roles['runtime/inputs/files.bin'], ('runtime-data', 'built'))
-        self.assertEqual(roles['decoded.image.bin'][0], 'decoded-image')
-        self.assertEqual(len(roles), 5)
-
-    def test_two_machines_write_the_same_file(self):
-        # the same discs and profile in two places with different paths: format 2 gives one file, format 1 does not
-        seals = {}
-        for fmt in (2, 1):
-            files = []
-            for place in ('first/machine', 'second/other-place'):
-                root = self.fx.tmp / str(fmt) / place
-                root.mkdir(parents=True)
-                fx = Fixture(root)
-                if fmt == 2:
-                    self.second(fx)
-                code, text, _ = fx.run()
-                self.assertEqual(code, 0, text)
-                files.append(fx.bundle().read_bytes())
-            seals[fmt] = files[0] == files[1]
-        self.assertEqual(seals, {2: True, 1: False})
-
-    def test_mistakes_in_a_format_2_description_are_refused_before_any_work(self):
-        cases = (
-            ('an unknown format', lambda b: b.update(format=3), 'bundle.format must be 1 or 2'),
-            ('no decoded image', lambda b: b['components'].pop(3), 'exactly one component of role decoded-image'),
-            ('two libraries', lambda b: b['components'].append({'name': 'lib/second.so', 'role': 'game-library', 'stage': 'link', 'output': 'out'}),
-             'exactly one component of role game-library'),
-            ('runtime data outside its folder', lambda b: b['components'][4].update(name='inputs/files.bin'), 'is named under runtime/'),
-            ('another role inside the runtime folder', lambda b: b['components'][2].update(name='runtime/pack.bin'), 'is named under runtime/'),
-            ('a statement that is not texts', lambda b: b.update(provenance={'recipe': 1}), 'bundle.provenance must map names to texts'),
-            ('a statement named tools', lambda b: b.update(provenance={'tools': 'x'}), 'bundle.provenance must map names to texts'),
-            ('a tool that is no file', lambda b: b.update(portable_tools=['${repo}/gone.py']), 'bundle.portable_tools names no file'),
-        )
-        for label, change, needle in cases:
-            with self.subTest(label):
-                saved = copy.deepcopy(self.fx.profile)
-                change(self.second())
-                self.assert_refused_before_any_work(db.EXIT_USAGE, needle)
-                self.fx.profile.clear()
-                self.fx.profile.update(saved)
-
-    def test_runtime_data_is_refused_in_format_1(self):
-        bundle = self.second()
-        bundle.update(format=1)
-        self.assert_refused_before_any_work(db.EXIT_USAGE, "unknown role 'runtime-data'")
-
-    def test_resealed_format_2_bundles_that_break_one_rule_each_are_refused(self):
-        self.second()
-        code, text, _ = self.fx.run()
-        self.assertEqual(code, 0, text)
-        good = db.verify_bundle(self.fx.bundle())
-        del good['_seal']
-        sources = {'lib/arm64-v8a/libgame.so': (self.fx.work / 'link/libgame.so').read_bytes(), 'shaders/pack.bin': b'shader pack bytes',
-                   'title.xex': XEX, 'decoded.image.bin': (self.fx.work / 'decode/image.bin').read_bytes(),
-                   'runtime/inputs/files.bin': (self.fx.work / 'catalog/files.bin').read_bytes()}
-        probe = self.fx.tmp / 'probe.bundle'
-
-        def write(manifest, renamed=None):
-            names = dict(renamed or {})
-            entries = [{'name': 'manifest.json', 'data': manifest_bytes(manifest)}] + [
-                {'name': names.get(n, n), 'data': d} for n, d in sorted(sources.items(), key=lambda kv: names.get(kv[0], kv[0]))]
-            probe.write_bytes(raw_bundle(entries))
-
-        def component(m, name):
-            return next(c for c in m['components'] if c['name'] == name)
-
-        write(good)
-        db.verify_bundle(probe)                      # the control: a resealed copy of the good manifest is accepted
-        cases = (
-            ('stage records', lambda m: m.update(stages=[]), 'no records of the machine that built it'),
-            ('version records', lambda m: m.update(versions={}), 'no records of the machine that built it'),
-            ('no statement', lambda m: m.pop('portable_provenance'), 'states what the build is made from'),
-            ('a statement that is a list', lambda m: m.update(portable_provenance=[]), 'states what the build is made from'),
-            ('the image marked as runtime data', lambda m: component(m, 'decoded.image.bin').update(role='runtime-data'), 'is named under runtime/'),
-            ('runtime data marked as a pack', lambda m: component(m, 'runtime/inputs/files.bin').update(role='shader-pack'), 'is named under runtime/'),
-            ('a role of no format', lambda m: component(m, 'runtime/inputs/files.bin').update(role='save-data'), "unknown role 'save-data'"),
-        )
-        for label, change, needle in cases:
-            with self.subTest(label):
-                manifest = copy.deepcopy(good)
-                change(manifest)
-                write(manifest)
-                with self.assertRaises(db.BuilderError) as cm:
-                    db.verify_bundle(probe)
-                self.assertEqual(cm.exception.code, db.EXIT_BUNDLE)
-                self.assertIn(needle, str(cm.exception))
-        with self.subTest('two shader packs'):
-            manifest = copy.deepcopy(good)
-            extra = dict(component(manifest, 'shaders/pack.bin'), name='shaders/second.bin')
-            manifest['components'].append(extra)
-            sources['shaders/second.bin'] = b'shader pack bytes'
-            write(manifest)
-            with self.assertRaises(db.BuilderError) as cm:
-                db.verify_bundle(probe)
-            self.assertIn('exactly one component of role shader-pack', str(cm.exception))
-            del sources['shaders/second.bin']
-        with self.subTest('no decoded image'):
-            manifest = copy.deepcopy(good)
-            manifest['components'] = [c for c in manifest['components'] if c['name'] != 'decoded.image.bin']
-            del sources['decoded.image.bin']
-            write(manifest)
-            with self.assertRaises(db.BuilderError) as cm:
-                db.verify_bundle(probe)
-            self.assertIn('exactly one component of role decoded-image', str(cm.exception))
-        with self.subTest('format 1 with runtime data'):
-            sources['decoded.image.bin'] = (self.fx.work / 'decode/image.bin').read_bytes()
-            manifest = copy.deepcopy(good)
-            manifest.update(schema='gta5-code-bundle/1')
-            write(manifest)
-            with self.assertRaises(db.BuilderError) as cm:
-                db.verify_bundle(probe)
-            self.assertIn("unknown role 'runtime-data'", str(cm.exception))
-
-
-class Bundle(Base):
-    def setUp(self):
-        super().setUp()
-        code, text, _ = self.fx.run()
-        self.assertEqual(code, 0, text)
-        self.path = self.fx.bundle()
-        self.good = self.path.read_bytes()
-        self.probe = self.fx.tmp / 'probe.bundle'
-        self.sources = {'lib/arm64-v8a/libgame.so': (self.fx.work / 'link/libgame.so').read_bytes(),
-                        'shaders/pack.bin': b'shader pack bytes', 'title.xex': XEX}
-
-    def entries(self, manifest) -> list[dict]:
-        """The entries of the built bundle for raw_bundle: the manifest (a dict, or bytes as they are), then the
-        components sorted by name."""
-        data = manifest if isinstance(manifest, bytes) else manifest_bytes(manifest)
-        return [{'name': 'manifest.json', 'data': data}] + [{'name': n, 'data': d} for n, d in sorted(self.sources.items())]
-
-    def test_manifest_lists_every_component_with_its_real_hash(self):
-        manifest = db.verify_bundle(self.path, hashlib.sha256(XEX).hexdigest())
-        got = {c['name']: (c['role'], c['sha256'], c['size'], c['provenance']) for c in manifest['components']}
-        self.assertEqual(got, {
-            name: (role, hashlib.sha256(self.sources[name]).hexdigest(), len(self.sources[name]), provenance)
-            for name, role, provenance in (('lib/arm64-v8a/libgame.so', 'game-library', 'built'),
-                                           ('title.xex', 'title-xex', 'disc'), ('shaders/pack.bin', 'shader-pack', 'supplied'))})
-        self.assertEqual(manifest['schema'], 'gta5-code-bundle/1')
-        self.assertEqual(manifest['game']['executable_sha256'], hashlib.sha256(XEX).hexdigest())
-        self.assertEqual((manifest['runtime_abi'], manifest['versions']['recipe']), ('test-abi-1', 'r1'))
-
-    def test_container_is_byte_for_byte_the_documented_layout(self):
-        # The file the builder wrote equals a bundle packed here field by field from BUNDLE-FORMAT.md: stored
-        # entries in file order with their sizes in the local headers (a reader of a stream needs them there),
-        # fixed 1980-01-01 times, the central directory, the end record and the seal over everything before it.
-        manifest = db.verify_bundle(self.path)
-        del manifest['_seal']
-        self.assertEqual(raw_bundle(self.entries(manifest)), self.good)
-
-    def test_every_single_flipped_byte_is_detected(self):
-        undetected = []
-        for pos in range(len(self.good)):
-            data = bytearray(self.good)
-            data[pos] ^= 0x01
-            self.probe.write_bytes(data)
-            try:
-                db.verify_bundle(self.probe)
-                undetected.append(pos)
-            except db.BuilderError as e:
-                self.assertEqual(e.code, db.EXIT_BUNDLE)
-        self.assertEqual(undetected, [])
-
-    def test_truncated_and_extended_files_are_detected(self):
-        for data in (self.good[:-1], self.good + b'\0', self.good[:len(self.good) // 2], b''):
-            self.probe.write_bytes(data)
-            with self.assertRaises(db.BuilderError):
-                db.verify_bundle(self.probe)
-
-    def test_resealed_bundles_that_break_one_rule_each_are_refused(self):
-        # Every case is a complete bundle with a correct seal (so the seal check passes) that breaks exactly one rule
-        # of the format; the refusal has to name that rule.
-        good = db.verify_bundle(self.path)
-        del good['_seal']
-        other_hash = hashlib.sha256(b'another executable').hexdigest()
-
-        def component(m, name):
-            return next(c for c in m['components'] if c['name'] == name)
-
-        def entry(e, name):
-            return next(x for x in e if x['name'] == name)
-
-        def deflated(e):
-            packer = zlib.compressobj(wbits=-15)
-            entry(e, 'title.xex').update(method=8, data=packer.compress(XEX) + packer.flush())
-
-        manifest_cases = (
-            ('a later format', lambda m: m.update(schema='gta5-code-bundle/3'), 'the manifest schema is not gta5-code-bundle/1'),
-            ('game is not an object', lambda m: m.update(game=[1]), 'names no game executable hash'),
-            ('executable hash is not a SHA-256', lambda m: m['game'].update(executable_sha256='0123456789ab'),
-             'names no game executable hash'),
-            ('no runtime interface', lambda m: m.pop('runtime_abi'), 'names no runtime interface'),
-            ('components are not objects', lambda m: m.update(components=[1]), 'lacks a name, a size or a SHA-256'),
-            ('component size is not a number', lambda m: component(m, 'title.xex').update(size='768'),
-             'lacks a name, a size or a SHA-256'),
-            ('no components', lambda m: m.update(components=[]), 'lists no components'),
-            ('unknown role', lambda m: component(m, 'shaders/pack.bin').update(role='save-data'), "unknown role 'save-data'"),
-            ('component listed twice', lambda m: m['components'].append(dict(m['components'][0])), 'listed twice'),
-            ('component name that climbs out', lambda m: component(m, 'shaders/pack.bin').update(name='../pack.bin'),
-             'is not allowed'),
-            ('executable is not the named one', lambda m: m['game'].update(executable_sha256=other_hash),
-             'the bundled executable is not the one the manifest names'),
-            ('component size differs', lambda m: component(m, 'title.xex').update(size=len(XEX) + 1),
-             'component title.xex: size differs from the manifest'),
-            ('component hash differs', lambda m: component(m, 'shaders/pack.bin').update(sha256=other_hash),
-             'component shaders/pack.bin: SHA-256 differs from the manifest'),
-            ('manifest above 1 MiB', lambda m: m['versions'].update(padding='x' * (1 << 20)), 'the manifest is larger than 1 MiB'),
-        )
-        entry_cases = (
-            ('manifest is not first', lambda e: e.append(e.pop(0)), 'the first entry is not manifest.json'),
-            ('manifest is not JSON', lambda e: e[0].update(data=b'{"schema": '), 'the manifest is not JSON'),
-            ('manifest CRC-32 is wrong', lambda e: e[0].update(crc=1), 'the manifest does not match its CRC-32'),
-            ('component CRC-32 is wrong', lambda e: entry(e, 'title.xex').update(crc=1), 'component title.xex: does not match its CRC-32'),
-            ('entry the manifest does not list', lambda e: e.append({'name': 'extra.bin', 'data': b'x'}),
-             "entry 'extra.bin' is not a component the manifest lists"),
-            ('entry twice', lambda e: e.append(dict(entry(e, 'title.xex'))), 'entry title.xex appears twice'),
-            ('component missing', lambda e: e.remove(entry(e, 'shaders/pack.bin')), 'component shaders/pack.bin is missing'),
-            ('compressed entry', deflated, "entry 'title.xex' is compressed, encrypted or written without its size"),
-            ('encrypted entry', lambda e: entry(e, 'title.xex').update(flags=1), 'is compressed, encrypted or written without its size'),
-            ('entry with its size after its data', lambda e: entry(e, 'title.xex').update(flags=8),
-             'is compressed, encrypted or written without its size'),
-            ('entry longer than the file', lambda e: entry(e, 'title.xex').update(size=1 << 30), 'runs past the end of the file'),
-            ('entry with two different sizes', lambda e: entry(e, 'title.xex').update(packed=len(XEX) - 1),
-             'is compressed, encrypted or written without its size'),
-        )
-        variants = [(label, change, None, needle) for label, change, needle in manifest_cases]
-        variants += [(label, None, change, needle) for label, change, needle in entry_cases]
-        for label, change_manifest, change_entries, needle in variants:
-            with self.subTest(label):
-                manifest = copy.deepcopy(good)
-                if change_manifest:
-                    change_manifest(manifest)
-                entries = self.entries(manifest)
-                if change_entries:
-                    change_entries(entries)
-                self.probe.write_bytes(raw_bundle(entries))
-                with self.assertRaises(db.BuilderError) as cm:
-                    db.verify_bundle(self.probe)
-                self.assertEqual(cm.exception.code, db.EXIT_BUNDLE)
-                self.assertIn(needle, str(cm.exception))
-        entries = self.entries(good)
-        entry(entries, 'title.xex').update(flags=0x0800)                # "the name is UTF-8": allowed, the app allows it too
-        self.probe.write_bytes(raw_bundle(entries))
-        self.assertEqual(db.verify_bundle(self.probe)['game'], good['game'])
-        self.probe.write_bytes(raw_bundle(self.entries(good), junk_before=2))
-        with self.assertRaises(db.BuilderError) as cm:
-            db.verify_bundle(self.probe)
-        self.assertIn('no ZIP entry where one has to start', str(cm.exception))
-
-    def test_bundle_the_app_would_refuse_is_not_left_behind(self):
-        # Nothing in the profile forbids long version notes, but the app reads at most 1 MiB of manifest: only the
-        # read-back of the written file can notice.
-        self.fx.profile['bundle']['versions']['notes'] = 'x' * (1 << 20)
-        code, text, _ = self.fx.run()
-        self.assertEqual(code, db.EXIT_BUNDLE, text)
-        self.assertIn('the manifest is larger than 1 MiB', text)
-        self.assertEqual(list(self.path.parent.iterdir()), [])
-
-    def test_bundle_for_another_executable_is_refused(self):
-        with self.assertRaises(db.BuilderError) as cm:
-            db.verify_bundle(self.path, 'cd' * 32)
-        self.assertIn('different game executable', str(cm.exception))
-
-    def test_verify_command(self):
-        code, text = run_main(['verify', str(self.path)])
-        self.assertEqual(code, 0, text)
-        self.assertIn('runtime interface test-abi-1', text)
-        self.assertIn(self.good[-64:].decode(), text)                    # the seal, in full, for comparison on the phone
-        self.path.write_bytes(self.good[:100] + b'\xff' + self.good[101:])
-        self.assertEqual(run_main(['verify', str(self.path)])[0], db.EXIT_BUNDLE)
 
 
 if __name__ == '__main__':

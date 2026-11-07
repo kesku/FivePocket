@@ -1,6 +1,7 @@
 #pragma once
 #include "native_geometry_query.h"
 #include "present_fast.h" // v227
+#include "scanout_fusion.h"
 #include "guest_graphics_backend.h"
 #include "device.h"
 #include "native_graphics_state.h"
@@ -579,6 +580,10 @@ public:
             if (!nativeScalerDisplay_.mapRgba(pixels,bytes,width,height,mapped) ||
                 (nativeGammaRamp_ && !nativeGammaRamp_->mapRgba(mapped.data(),mapped.size(),mapped))) return false;
             output.swap(mapped);return true;
+        }
+        if (scanout_fusion::enabled()) {
+            const auto result=scanout_fusion::map(nativeScalerDisplay_,nativeGammaRamp_?&*nativeGammaRamp_:nullptr,pixels,bytes,width,height,output);
+            if(result!=scanout_fusion::Outcome::NotApplicable)return result==scanout_fusion::Outcome::Success;
         }
         if (!present::identityScalerInto(nativeScalerDisplay_,pixels,bytes,width,height,output)) return false;
         return !nativeGammaRamp_ || present::gammaInPlace(*nativeGammaRamp_,output.data(),output.size());

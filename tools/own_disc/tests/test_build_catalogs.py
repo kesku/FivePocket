@@ -130,7 +130,7 @@ class WholeStage(unittest.TestCase):
 
     def run_stage(self, expected=None, times_rows=2):
         import subprocess
-        from test_stfs_inventory import fixture as stfs_package, TITLE
+        from stfs_fixture import fixture as stfs_package, TITLE
         self.SCRATCH.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.TemporaryDirectory(dir=self.SCRATCH)
         self.addCleanup(tmp.cleanup)

@@ -1,50 +1,13 @@
 #!/usr/bin/env python3
-"""disc_builder.py: desktop builder, "disc images in, code bundle out".
+"""Build the Duo pipeline from owned disc images and publish its final stage file.
 
-  disc_builder.py build   --profile P.json --play-disc ISO_OR_FOLDER --work DIR [--install-disc ISO_OR_FOLDER]
-                          [--dry-run] [--allow-heavy] [--stop-after STAGE] [--supply STAGE=PATH] [--report OUT.json]
-                          [--out DIR]
-  disc_builder.py identify --profile P.json --play-disc ISO_OR_FOLDER
-  disc_builder.py verify  BUNDLE [--executable-sha256 HEX]
+    disc_builder.py build --profile FILE --play-disc ISO --install-disc ISO --work DIR
+    disc_builder.py identify --profile FILE --play-disc ISO
 
-What it does, in this order:
-  1. Identify. Reads the game executable (default.xex) out of the play disc (an XISO image, or an extracted folder),
-     hashes it (SHA-256) and looks the hash up in the profile's "games" table. An unknown executable is refused
-     (exit 4) before anything else happens.
-  2. Plan. Every path and every ${...} variable of the profile is resolved, the stage named by --stop-after and the
-     bundle description are checked. A mistake stops the run here (exit 64), not after some stages have run.
-  3. Prerequisites. Every tool file of every stage, every "prerequisites" entry of the profile (files, optionally
-     with a pinned SHA-256; version commands with an expected pattern; the Python version) and the free disk space
-     are checked. Any failure stops the run before a single stage has run (exit 2). A dry run lists the failures and
-     still prints the plan.
-  4. Stages, in the profile's order. Each stage is an adapter ("disc-file", "command", "supplied") with declared
-     tools, inputs and outputs. Before a stage runs, its key is computed: SHA-256 over the stage definition, the
-     SHA-256 of every tool and input, the identified game and the key of the stage before it. If WORK/receipts/
-     <stage>.json holds the same key and every recorded output still has its recorded SHA-256, the stage is skipped.
-     Because every key contains the previous stage's key, a changed input re-runs its stage and every stage after it.
-     Stages marked "heavy" run only with --allow-heavy; without it the run stops in front of the first heavy stage
-     that is not covered by a receipt (exit 3).
-  5. Bundle. The declared components are written into one file (format: BUNDLE-FORMAT.md next to this tool), with
-     a manifest of names, roles, sizes, SHA-256s and versions, then the file is read back and verified.
-
-Stage fields besides tools / inputs / outputs / argv: "clean" (folders of the work directory removed before the stage
-runs), "make_dirs" (folders of the work directory created before the command runs, for tools that want an existing
-output folder), "expect" (required SHA-256 per output), "heavy", "cwd". A command stage whose tool can only write
-outside the work directory says "external_outputs": true; such an output must be a file, the file it replaces is
-first copied to WORK/backup/<stage>/, and the stage fails unless its command really wrote the file (an older file
-at that place is not accepted as built).
-
-Where the builder writes: the work directory, the bundle directory (--out, default WORK/out), the report (--report)
-and declared external outputs. All of it is game-derived (copies, hashes, paths), so inside a git checkout each of
-these must lie under that checkout's local-analysis/ (git-ignored). A work directory that already holds files must
-have been made by this builder (it carries a .own-disc-work file): the builder removes and rewrites folders in it.
-
-The tool ships nothing and uploads nothing: it has no network code. It contains no game data: the identification
-table, the stage commands and every game-derived parameter live in the profile, a private JSON file. Hashes are printed
-as 12-hex-digit prefixes; file contents are never printed.
-
-Exit codes: 0 done (or dry run without problems), 1 a stage failed, 2 a prerequisite is missing, 3 stopped in front of a
-heavy stage, 4 the executable is not a supported game, 5 a bundle does not verify, 64 bad usage or bad profile.
+Before execution, identify the disc, resolve every stage input/output and check
+prerequisites. Verified receipts allow unchanged stages to resume. Build outputs
+and reports must remain under local-analysis when written in a Git checkout.
+The profile's output names the file delivered by one of its declared stages.
 """
 from __future__ import annotations
 
@@ -58,8 +21,6 @@ import struct
 import subprocess
 import sys
 import time
-import zipfile
-import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))      # the host helper lies beside this file
@@ -68,22 +29,13 @@ import host_support  # noqa: E402
 TOOL_ROOT = host_support.package_root(__file__)
 PROFILE_SCHEMA = 'own-disc-pipeline/1'
 RECEIPT_SCHEMA = 'own-disc-receipt/1'
-BUNDLE_SCHEMA = 'gta5-code-bundle/1'
-# Format 2 (2026-10-07): what the public app reads. Two differences from format 1. It may carry small files the runtime
-# reads beside the game data (role runtime-data, names under runtime/). And its manifest holds nothing that differs
-# between two machines building from the same discs: no stage keys (they cover local paths and tool builds), no hash
-# of this file's host copy; instead the profile's own statement of what the build is made from (portable_provenance).
-# So two machines agree when their format-2 bundles are the same file.
-BUNDLE_SCHEMA_2 = 'gta5-code-bundle/2'
-RUNTIME_ROLE = 'runtime-data'
-RUNTIME_PREFIX = 'runtime/'
 ENGINE_KEY_VERSION = 3          # bump when the meaning of a stage key changes (2: tree digests skip TREE_IGNORED; 3: the engine's and the host helper's own hashes are part of every key, and a tree's files are ordered by their names with '/', the same on every host)
 BLOCK = 1 << 20
 PRIVATE_DIR = 'local-analysis'  # the git-ignored folder of a checkout; the only place in one the builder writes to
 WORK_MARKER = '.own-disc-work'  # a work directory made by this builder holds this file
 TREE_IGNORED = frozenset(('__pycache__', '.DS_Store'))
 
-EXIT_OK, EXIT_STAGE, EXIT_PREREQ, EXIT_HEAVY, EXIT_GAME, EXIT_BUNDLE, EXIT_USAGE = 0, 1, 2, 3, 4, 5, 64
+EXIT_OK, EXIT_STAGE, EXIT_PREREQ, EXIT_HEAVY, EXIT_GAME, EXIT_USAGE = 0, 1, 2, 3, 4, 64
 
 
 class BuilderError(Exception):
@@ -127,18 +79,6 @@ def sha256_tree(directory: Path) -> tuple[str, int]:
         h.update(rel.as_posix().encode() + b'\0' + sha256_file(p).encode() + b'\n')
         count += 1
     return h.hexdigest(), count
-
-
-def sha256_crc32(f, size: int) -> tuple[str, int]:
-    h, crc, left = hashlib.sha256(), 0, size
-    while left > 0:
-        block = f.read(min(BLOCK, left))
-        if not block:
-            raise BuilderError('unexpected end of data while hashing')
-        h.update(block)
-        crc = zlib.crc32(block, crc)
-        left -= len(block)
-    return h.hexdigest(), crc
 
 
 def sha256_path(path: Path) -> dict:
@@ -355,8 +295,8 @@ def load_profile(path: Path) -> dict:
             raise BuilderError(f'profile: stage {s["id"]} copies one file, so it declares exactly one output', EXIT_USAGE)
         if s['adapter'] == 'disc-file' and not s.get('path'):
             raise BuilderError(f'profile: disc-file stage {s["id"]} names no path on the disc', EXIT_USAGE)
-    if len(set(ids)) != len(ids) or 'bundle' in ids:
-        raise BuilderError('profile: stage ids must be unique and "bundle" is reserved', EXIT_USAGE)
+    if len(set(ids)) != len(ids):
+        raise BuilderError('profile: stage ids must be unique', EXIT_USAGE)
     if not profile.get('games'):
         raise BuilderError('profile: no games table', EXIT_USAGE)
     for g in profile['games']:
@@ -870,179 +810,11 @@ def run_pipeline(profile: dict, ctx: Context, *, dry_run: bool, allow_heavy: boo
     return rows, EXIT_OK
 
 
-# ------------------------------------------------------------------------------------------------------- bundle
-
-SEAL_PREFIX = b'own-disc-seal sha256='
-SEAL_LENGTH = len(SEAL_PREFIX) + 64
-ENTRY_NAME = re.compile(r'[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*')
-BUNDLE_FILE_NAME = re.compile(r'[A-Za-z0-9._-]+')
-MANIFEST_NAME = 'manifest.json'
-MAX_MANIFEST_BYTES = 1 << 20
-KNOWN_ROLES = ('game-library', 'title-xex', 'decoded-image', 'shader-pack')
-ZIP_LIMIT = (1 << 32) - 2       # no ZIP64: every size and offset must fit 32 bits
-EOCD = struct.Struct('<4sHHHHIIH')
-LOCAL_HEADER = struct.Struct('<4sHHHHHIIIHH')    # signature, version, flags, method, time, date, CRC-32, sizes, lengths
-
-
-def _zipinfo(name: str) -> zipfile.ZipInfo:
-    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-    info.compress_type = zipfile.ZIP_STORED
-    info.create_system = 3
-    info.external_attr = 0o100644 << 16
-    return info
-
-
-def write_bundle(path: Path, manifest: dict, sources: dict[str, Path]) -> str:
-    """Writes the bundle deterministically (same manifest + same component bytes = same file). Returns its seal."""
-    names = [c['name'] for c in manifest['components']]
-    if sum(c['size'] for c in manifest['components']) > ZIP_LIMIT - (64 << 20):
-        raise BuilderError('bundle: larger than 4 GiB is not supported by format 1', EXIT_USAGE)
-    tmp = path.with_name(path.name + '.tmp')
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_STORED, allowZip64=False) as zf:
-        zf.writestr(_zipinfo(MANIFEST_NAME), json.dumps(manifest, indent=1, sort_keys=True).encode() + b'\n')
-        for name in sorted(names):
-            with open(sources[name], 'rb') as src, zf.open(_zipinfo(name), 'w') as dst:
-                shutil.copyfileobj(src, dst, BLOCK)
-        zf.comment = b'\0' * SEAL_LENGTH
-    size = tmp.stat().st_size
-    with open(tmp, 'r+b') as f:
-        seal = sha256_stream(f, size - SEAL_LENGTH)
-        f.seek(size - SEAL_LENGTH)
-        f.write(SEAL_PREFIX + seal.encode())
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    return seal
-
-
-def check_manifest(manifest, bad) -> dict[str, dict]:
-    """Shape and meaning of manifest.json. Returns the components by name."""
-    if not isinstance(manifest, dict) or manifest.get('schema') not in (BUNDLE_SCHEMA, BUNDLE_SCHEMA_2):
-        raise bad(f'the manifest schema is not {BUNDLE_SCHEMA} or {BUNDLE_SCHEMA_2}')
-    second = manifest['schema'] == BUNDLE_SCHEMA_2
-    game = manifest.get('game')
-    if not isinstance(game, dict) or not isinstance(game.get('executable_sha256'), str) or \
-            not HEX64.fullmatch(game['executable_sha256']):
-        raise bad('the manifest names no game executable hash')
-    if not isinstance(manifest.get('runtime_abi'), str) or not manifest['runtime_abi']:
-        raise bad('the manifest names no runtime interface (runtime_abi)')
-    comps = manifest.get('components')
-    if not isinstance(comps, list) or not comps:
-        raise bad('the manifest lists no components')
-    by_name: dict[str, dict] = {}
-    for c in comps:
-        if not isinstance(c, dict) or not isinstance(c.get('name'), str) or type(c.get('size')) is not int or \
-                not isinstance(c.get('sha256'), str) or not HEX64.fullmatch(c['sha256']):
-            raise bad('a component in the manifest lacks a name, a size or a SHA-256')
-        name = c['name']
-        if not ENTRY_NAME.fullmatch(name) or name == MANIFEST_NAME or name in by_name:
-            raise bad(f'component name {name!r} is not allowed or is listed twice')
-        if c.get('role') not in KNOWN_ROLES and not (second and c.get('role') == RUNTIME_ROLE):
-            raise bad(f'component {name} has the unknown role {c.get("role")!r}')
-        if (c['role'] == RUNTIME_ROLE) != name.startswith(RUNTIME_PREFIX):
-            raise bad(f'component {name}: runtime data, and nothing else, is named under {RUNTIME_PREFIX}')
-        if c['role'] == 'title-xex' and c['sha256'] != game['executable_sha256']:
-            raise bad('the bundled executable is not the one the manifest names')
-        by_name[name] = c
-    if second:
-        for role in KNOWN_ROLES:
-            if sum(c['role'] == role for c in by_name.values()) != 1:
-                raise bad(f'a format-2 bundle has exactly one component of role {role}')
-        if 'stages' in manifest or 'versions' in manifest:
-            raise bad('a format-2 manifest carries no records of the machine that built it (stages, versions)')
-        if not isinstance(manifest.get('portable_provenance'), dict):
-            raise bad('a format-2 manifest states what the build is made from (portable_provenance)')
-    return by_name
-
-
-def verify_bundle(path: Path, executable_sha256: str | None = None) -> dict:
-    """The check of a bundle file that the phone app makes on import (BUNDLE-FORMAT.md), made the same way: the
-    seal first, then the entries front to back through their ZIP local file headers, as a reader of a stream sees
-    them (the ZIP central directory is not consulted). Returns the manifest (plus "_seal"); raises
-    BuilderError(EXIT_BUNDLE) naming the first problem. Whether the app implements the manifest's runtime_abi is
-    the one check only the app can make."""
-    def bad(why: str):
-        return BuilderError(f'bundle {path.name}: {why}', EXIT_BUNDLE)
-
-    try:
-        size = path.stat().st_size
-    except OSError:
-        raise bad('cannot be read')
-    if size < EOCD.size + SEAL_LENGTH or size > ZIP_LIMIT:
-        raise bad('wrong size for a format-1 bundle')
-    with open(path, 'rb') as f:
-        # 1. the seal: the last 85 bytes are the ZIP comment "own-disc-seal sha256=<hex>" over everything before it
-        end = size - SEAL_LENGTH - EOCD.size
-        f.seek(end)
-        sig, _, _, _, _, _, _, comment_len = EOCD.unpack(f.read(EOCD.size))
-        comment = f.read(SEAL_LENGTH)
-        if sig != b'PK\x05\x06' or comment_len != SEAL_LENGTH or not comment.startswith(SEAL_PREFIX):
-            raise bad('the seal record is missing or damaged')
-        f.seek(0)
-        seal = sha256_stream(f, size - SEAL_LENGTH)
-        if comment[len(SEAL_PREFIX):] != seal.encode():
-            raise bad('the seal does not match the file contents (the file is damaged or was changed)')
-        # 2. the entries in file order: the manifest, then exactly the components it lists
-        pos, manifest, comps, seen = 0, None, {}, set()
-        while True:
-            f.seek(pos)
-            head = f.read(LOCAL_HEADER.size)
-            if manifest is not None and head[:4] in (b'PK\x01\x02', b'PK\x05\x06'):
-                break                                               # the central directory: no more entries
-            if len(head) < LOCAL_HEADER.size or head[:4] != b'PK\x03\x04':
-                raise bad('no ZIP entry where one has to start')
-            _, _, flags, method, _, _, crc, packed, length, name_len, extra_len = LOCAL_HEADER.unpack(head)
-            name = f.read(name_len).decode('latin-1')
-            if flags & ~0x0800 or method != 0 or packed != length:
-                raise bad(f'entry {name!r} is compressed, encrypted or written without its size')
-            data_at = pos + LOCAL_HEADER.size + name_len + extra_len
-            pos = data_at + length
-            if pos > end:
-                raise bad(f'entry {name!r} runs past the end of the file')
-            f.seek(data_at)
-            if manifest is None:
-                if name != MANIFEST_NAME:
-                    raise bad(f'the first entry is not {MANIFEST_NAME}')
-                if length > MAX_MANIFEST_BYTES:
-                    raise bad('the manifest is larger than 1 MiB')
-                data = f.read(length)
-                if zlib.crc32(data) != crc:
-                    raise bad('the manifest does not match its CRC-32')
-                try:
-                    manifest = json.loads(data)
-                except ValueError:
-                    raise bad('the manifest is not JSON')
-                comps = check_manifest(manifest, bad)
-                continue
-            if name not in comps:
-                raise bad(f'entry {name!r} is not a component the manifest lists')
-            if name in seen:
-                raise bad(f'entry {name} appears twice')
-            seen.add(name)
-            # 3. every component: size, CRC-32 and SHA-256
-            if length != comps[name]['size']:
-                raise bad(f'component {name}: size differs from the manifest')
-            digest, crc_now = sha256_crc32(f, length)
-            if crc_now != crc:
-                raise bad(f'component {name}: does not match its CRC-32')
-            if digest != comps[name]['sha256']:
-                raise bad(f'component {name}: SHA-256 differs from the manifest')
-        if len(seen) != len(comps):
-            raise bad(f'component {sorted(set(comps) - seen)[0]} is missing')
-    if executable_sha256 and manifest['game']['executable_sha256'] != executable_sha256:
-        raise bad('built for a different game executable than the one given')
-    return dict(manifest, _seal=seal)
-
-
-def plan_output(profile: dict, ctx: Context) -> tuple[str, str, str] | None:
-    """A profile whose result is one file a stage makes (the iOS app's .ipa) instead of a code bundle:
-    "output": {"name": FILE, "stage": ID, "output": NAME}. Checked before any stage runs; None for a bundle profile."""
+def plan_output(profile: dict, ctx: Context) -> tuple[str, str, str]:
+    """Validate the named file delivered by the final stage before any stage runs."""
     spec = profile.get('output')
-    if spec is None:
-        return None
-    if 'bundle' in profile:
-        raise BuilderError('profile: give either "bundle" or "output", not both', EXIT_USAGE)
+    if not isinstance(spec, dict):
+        raise BuilderError('profile: output must name a stage file', EXIT_USAGE)
     name = ctx.expand(str(spec.get('name', '')))
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,120}', name) or name.endswith('.part'):
         raise BuilderError(f'profile: bad output name {name!r}', EXIT_USAGE)
@@ -1050,95 +822,6 @@ def plan_output(profile: dict, ctx: Context) -> tuple[str, str, str] | None:
     if stage not in ctx.outputs or out not in ctx.outputs[stage]:
         raise BuilderError(f'profile: the output names no output of a stage ({stage}:{out})', EXIT_USAGE)
     return name, stage, out
-
-
-def plan_bundle(profile: dict, ctx: Context) -> str:
-    """Checks the profile's bundle description against the stages before any stage runs. Returns the file name."""
-    spec = profile.get('bundle') or {}
-    name = ctx.expand(spec.get('name', 'code-${profile}-${flavour}.bundle'))
-    if not BUNDLE_FILE_NAME.fullmatch(name):
-        raise BuilderError(f'profile: bad bundle name {name!r}', EXIT_USAGE)
-    if not isinstance(spec.get('runtime_abi'), str) or not spec['runtime_abi']:
-        raise BuilderError('profile: bundle.runtime_abi is missing', EXIT_USAGE)
-    second = spec.get('format', 1) == 2
-    if spec.get('format', 1) not in (1, 2):
-        raise BuilderError('profile: bundle.format must be 1 or 2', EXIT_USAGE)
-    names = [c.get('name', '') for c in spec.get('components') or []]
-    if not names or len(set(names)) != len(names):
-        raise BuilderError('profile: bundle.components is empty or names a component twice', EXIT_USAGE)
-    for c, component in zip(spec['components'], names):
-        known = c.get('role') in KNOWN_ROLES or (second and c.get('role') == RUNTIME_ROLE)
-        if not ENTRY_NAME.fullmatch(component) or component == MANIFEST_NAME or not known:
-            raise BuilderError(f'profile: bundle component {component!r} has a bad name or an unknown role '
-                               f'{c.get("role")!r}', EXIT_USAGE)
-        if (c['role'] == RUNTIME_ROLE) != component.startswith(RUNTIME_PREFIX):
-            raise BuilderError(f'profile: bundle component {component!r}: runtime data, and nothing else, is named '
-                               f'under {RUNTIME_PREFIX}', EXIT_USAGE)
-        if c.get('output') not in ctx.outputs.get(c.get('stage'), {}):
-            raise BuilderError(f'profile: bundle component {component} names no output of a stage '
-                               f'({c.get("stage")}:{c.get("output")})', EXIT_USAGE)
-    if second:
-        for role in KNOWN_ROLES:
-            if sum(c['role'] == role for c in spec['components']) != 1:
-                raise BuilderError(f'profile: a format-2 bundle has exactly one component of role {role}', EXIT_USAGE)
-        stated = spec.get('provenance', {})
-        if not isinstance(stated, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in stated.items()) \
-                or 'tools' in stated:
-            raise BuilderError('profile: bundle.provenance must map names to texts (and not use the name "tools")', EXIT_USAGE)
-        for tool in spec.get('portable_tools', []):
-            if not isinstance(tool, str) or not Path(ctx.expand(tool)).is_file():
-                raise BuilderError(f'profile: bundle.portable_tools names no file: {tool!r}', EXIT_USAGE)
-    return name
-
-
-def build_bundle(profile: dict, ctx: Context, rows: list[dict], path: Path) -> str:
-    spec = profile['bundle']
-    stage_by_id = {r['stage']: r for r in rows}
-    comps, sources = [], {}
-    for c in spec['components']:
-        src = ctx.outputs[c['stage']][c['output']]
-        if not src.is_file():
-            raise BuilderError(f'bundle: component {c["name"]} needs output {c["output"]} of stage {c["stage"]} (a file)')
-        sources[c['name']] = src
-        comps.append({'name': c['name'], 'role': c['role'], 'size': src.stat().st_size, 'sha256': sha256_file(src),
-                      'stage': c['stage'], 'provenance': stage_by_id[c['stage']]['provenance']})
-    game = {'id': ctx.game.get('id', ''), 'executable_sha256': ctx.game['executable_sha256'],
-            'executable_size': ctx.game['executable_size']}
-    if spec.get('format', 1) == 2:
-        # A tool is named as the profile writes it (unexpanded, so without this machine's paths) with its content hash.
-        tools = [{'name': t, 'sha256': sha256_file(Path(ctx.expand(t)))} for t in sorted(spec.get('portable_tools', []))]
-        manifest = {
-            'schema': BUNDLE_SCHEMA_2,
-            'profile': profile.get('id', ''),
-            'flavour': profile.get('flavour', ''),
-            'game': game,
-            'runtime_abi': spec['runtime_abi'],
-            'portable_provenance': dict(spec.get('provenance', {}), tools=tools),
-            'components': sorted(comps, key=lambda c: c['name']),
-        }
-        return _write_checked(path, manifest, sources, ctx, len(comps))
-    manifest = {
-        'schema': BUNDLE_SCHEMA,
-        'profile': profile.get('id', ''),
-        'flavour': profile.get('flavour', ''),
-        'game': game,
-        'runtime_abi': spec['runtime_abi'],
-        'versions': dict(spec.get('versions', {}), builder_sha256=hashlib.sha256(__loader__.get_data(__file__)).hexdigest()),
-        'stages': [{'id': r['stage'], 'key': r['key'], 'provenance': r['provenance']} for r in rows],
-        'components': sorted(comps, key=lambda c: c['name']),
-    }
-    return _write_checked(path, manifest, sources, ctx, len(comps))
-
-
-def _write_checked(path: Path, manifest: dict, sources: dict, ctx: Context, count: int) -> str:
-    seal = write_bundle(path, manifest, sources)
-    try:
-        verify_bundle(path, ctx.game['executable_sha256'])   # read back what was written, as the app will
-    except BuilderError:
-        path.unlink()                                        # a bundle the app would refuse is not left behind
-        raise
-    print(f'  {"bundle":<16} written     {path} ({path.stat().st_size} bytes, {count} components, seal {short(seal)})')
-    return seal
 
 
 # ---------------------------------------------------------------------------------------------------------- CLI
@@ -1158,7 +841,7 @@ def cmd_build(a) -> int:
     work = a.work.resolve()
     out_dir = (a.out or work / 'out').resolve()
     check_private_path(work, 'work directory')
-    check_private_path(out_dir, 'bundle directory')
+    check_private_path(out_dir, 'output directory')
     if a.report:
         check_private_path(a.report, 'report file')
     check_work_dir(work)
@@ -1190,11 +873,11 @@ def cmd_build(a) -> int:
     print(f'Game: {ctx.game.get("label", ctx.game.get("id", "?"))} ({ctx.discs["play"].kind} input, '
           f'{ctx.game["executable"]} {short(ctx.game["executable_sha256"])}, {ctx.game["executable_size"]} bytes)')
     if 'install' not in ctx.discs:
-        print('Install disc: not given (the code bundle does not need it unless a stage says so below).')
+        print('Install disc: not given (stages that require it will refuse the plan).')
     # 2. plan: every path and variable of the profile, before anything runs
     plan_paths(profile, ctx)
     output = plan_output(profile, ctx)
-    bundle_path = out_dir / (output[0] if output else plan_bundle(profile, ctx))
+    output_path = out_dir / output[0]
     # 3. prerequisites (and the other disc files), all before any stage
     failures = check_disc_files(ctx.game, ctx.discs, a.hash_disc_files) + check_prerequisites(profile, ctx, supply)
     for s in supply:
@@ -1223,35 +906,25 @@ def cmd_build(a) -> int:
     report['stages'] = rows
     if a.dry_run:
         would = [r['stage'] for r in rows if r['action'] == 'would-run']
-        print(f'  {"output" if output else "bundle":<16} would be written')
+        print(f'  {"output":<16} would be written')
         print(f'Dry run: {len(would)} stage(s) would run ({", ".join(would) or "none"}), '
               f'{sum(r["action"] == "skipped" for r in rows)} covered by receipts.')
         return finish(EXIT_PREREQ if failures else code)
     if code != EXIT_OK or any(r.get('stopped_after') for r in rows):
         return finish(code)
-    # 5. bundle (or the one output file of an output profile)
-    if output:
-        source = ctx.outputs[output[1]][output[2]]
-        if not source.is_file():
-            print(f'  {"output":<16} FAILED      the stage {output[1]} did not write {source.name}')
-            return finish(EXIT_STAGE)
-        check_private_path(bundle_path, 'the output')
-        bundle_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = bundle_path.with_name(bundle_path.name + '.part')
-        shutil.copyfile(source, tmp)
-        os.replace(tmp, bundle_path)
-        digest = sha256_file(bundle_path)
-        report['output'] = {'path': str(bundle_path), 'sha256': digest, 'size': bundle_path.stat().st_size}
-        print(f'  {"output":<16} written     {bundle_path}')
-        print(f'Done. Output {bundle_path.name}: sha256 {digest}')
-        return finish(EXIT_OK)
-    try:
-        seal = build_bundle(profile, ctx, rows, bundle_path)
-    except BuilderError as e:
-        print(f'  {"bundle":<16} FAILED      {e}')
-        return finish(e.code)
-    report['bundle'] = {'path': str(bundle_path), 'seal': seal, 'size': bundle_path.stat().st_size}
-    print(f'Done. Bundle seal (compare with what the phone app shows on import): {seal}')
+    source = ctx.outputs[output[1]][output[2]]
+    if not source.is_file():
+        print(f'  {"output":<16} FAILED      the stage {output[1]} did not write {source.name}')
+        return finish(EXIT_STAGE)
+    check_private_path(output_path, 'the output')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output_path.with_name(output_path.name + '.part')
+    shutil.copyfile(source, tmp)
+    os.replace(tmp, output_path)
+    digest = sha256_file(output_path)
+    report['output'] = {'path': str(output_path), 'sha256': digest, 'size': output_path.stat().st_size}
+    print(f'  {"output":<16} written     {output_path}')
+    print(f'Done. Output {output_path.name}: sha256 {digest}')
     return finish(EXIT_OK)
 
 
@@ -1264,26 +937,16 @@ def cmd_identify(a) -> int:
     return EXIT_OK
 
 
-def cmd_verify(a) -> int:
-    manifest = verify_bundle(a.bundle, a.executable_sha256)
-    print(f'{a.bundle.name}: verified. profile {manifest.get("profile")}, flavour {manifest.get("flavour")}, '
-          f'runtime interface {manifest["runtime_abi"]}, game executable {short(manifest["game"]["executable_sha256"])}, '
-          f'seal {manifest["_seal"]}')
-    for c in manifest['components']:
-        print(f'  {c["name"]:<28} {c["role"]:<16} {c["size"]:>12} bytes  {short(c["sha256"])}  {c.get("provenance", "")}')
-    return EXIT_OK
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__.split('\n\n', 1)[1])
     sub = ap.add_subparsers(dest='cmd', required=True)
-    b = sub.add_parser('build', help='identify, check prerequisites, run the stages, write the bundle')
+    b = sub.add_parser('build', help='identify, check prerequisites, run the stages, publish the output file')
     b.add_argument('--profile', type=Path, required=True)
     b.add_argument('--play-disc', type=Path, required=True)
     b.add_argument('--install-disc', type=Path)
     b.add_argument('--work', type=Path, required=True)
-    b.add_argument('--out', type=Path, help='where the bundle goes (default WORK/out)')
+    b.add_argument('--out', type=Path, help='where the output file goes (default WORK/out)')
     b.add_argument('--dry-run', action='store_true')
     b.add_argument('--allow-heavy', action='store_true')
     b.add_argument('--stop-after')
@@ -1298,10 +961,6 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument('--profile', type=Path, required=True)
     i.add_argument('--play-disc', type=Path, required=True)
     i.set_defaults(fn=cmd_identify)
-    v = sub.add_parser('verify', help='verify a bundle file')
-    v.add_argument('bundle', type=Path)
-    v.add_argument('--executable-sha256')
-    v.set_defaults(fn=cmd_verify)
     a = ap.parse_args(argv)
     try:
         return a.fn(a)

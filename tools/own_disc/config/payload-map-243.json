@@ -1,0 +1,162 @@
+{
+ "schema": "ios-payload/1",
+ "files": {
+  "private-trace/run-48c1a0c50a8a4f70b9eb437a20c66610/decoded.image.bin": {
+   "stage": "decode",
+   "path": "default.image.bin",
+   "sha256": "0b1c81507f827c29a7dccf5fc58dc23c8142ff4177efe66df21c790a8f65f3b2"
+  },
+  "private-trace/modules/boot/copy/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "copy/dataflow.spv",
+   "sha256": "96112b93f8ab99fb31735690d89d38ee29da070d4ddd6ef7f192af3242591a95"
+  },
+  "private-trace/modules/boot/depth/store/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "depth/store/dataflow.spv",
+   "sha256": "8b484936ccda1d1bcc6aa325b4492c17017c8a8db5e616cd730797818f3b89da"
+  },
+  "private-trace/modules/boot/depth/vertex/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "depth/vertex/dataflow.spv",
+   "sha256": "abe7ba53ce3ceeba286adb1224633eec0acfb27a16a59c6428bc1b1f33497bc9"
+  },
+  "private-trace/modules/boot/depth/vertex/guest-code.bin": {
+   "stage": "boot-shaders",
+   "path": "depth/vertex/guest-code.bin",
+   "sha256": "abfec28e9858fd1b9b27afd527f08421c38f288e9333cc7fc10d6391ac190fa9"
+  },
+  "private-trace/modules/boot/load/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "load/dataflow.spv",
+   "sha256": "a7621aebb6da67fb08fc66b462dc41b1fd0c524c8ae7d1c06e21b6e53e6246e5"
+  },
+  "private-trace/modules/boot/r8/fragment/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "r8/fragment/dataflow.spv",
+   "sha256": "a07036fa52d2a66d937ceb952d41813ffa52e1abb2b74a158cb3852fc5676eac"
+  },
+  "private-trace/modules/boot/r8/fragment/guest-code.bin": {
+   "stage": "boot-shaders",
+   "path": "r8/fragment/guest-code.bin",
+   "sha256": "a05a7c15f140b8435b86a9da4abf91a92e7eca4c2a451916bad3719863e31845"
+  },
+  "private-trace/modules/boot/r8/vertex/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "r8/vertex/dataflow.spv",
+   "sha256": "de64b536dcd4e8f3f595addd903569d7f84387188a027745a7cfb790719bb21a"
+  },
+  "private-trace/modules/boot/r8/vertex/guest-code.bin": {
+   "stage": "boot-shaders",
+   "path": "r8/vertex/guest-code.bin",
+   "sha256": "d2b5d5f65ad1fdbbf8698ee980c1439cf1a84d67c03a5fe321d3046c547fd75f"
+  },
+  "private-trace/modules/boot/small/fragment/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "small/fragment/dataflow.spv",
+   "sha256": "577793b75259eef8732313417579a19107b7ac7aab54669dc4b27491319ea75c"
+  },
+  "private-trace/modules/boot/small/fragment/guest-code.bin": {
+   "stage": "boot-shaders",
+   "path": "small/fragment/guest-code.bin",
+   "sha256": "6b56ae19cb07e38961a7eec2870cb3450f62bbc79ca07c4b1de4802ae6ea58e4"
+  },
+  "private-trace/modules/boot/small/vertex/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "small/vertex/dataflow.spv",
+   "sha256": "116d15decaa113cd65182f612c98a4de0cff3d93e36e5fc5e4c47f931310d56d"
+  },
+  "private-trace/modules/boot/small/vertex/guest-code.bin": {
+   "stage": "boot-shaders",
+   "path": "small/vertex/guest-code.bin",
+   "sha256": "e14114efbb2c72d5780dbf08ea4e6ec5f0dd9cc3196a447bff2dcaf2e080c9e2"
+  },
+  "private-trace/modules/boot/store/dataflow.spv": {
+   "stage": "boot-shaders",
+   "path": "store/dataflow.spv",
+   "sha256": "b1b44cabdafe8639ed69ee0017d7f25820d44c06602ef605745343703ca2e508"
+  },
+  "private-trace/inputs/4ec81dc527edbc4b2a9d011ebad2888cc374e4ba1fa67ea662368b6609de42bd.bin": {
+   "stage": "catalogs",
+   "path": "installed-package-2.bin",
+   "sha256": "4ec81dc527edbc4b2a9d011ebad2888cc374e4ba1fa67ea662368b6609de42bd"
+  },
+  "private-trace/inputs/79ddaf54aa2444dcd483aed955ed0cf97387a9ba38330e8feb19c8b539bd8d06.bin": {
+   "stage": "catalogs",
+   "path": "file-metadata.bin",
+   "sha256": "79ddaf54aa2444dcd483aed955ed0cf97387a9ba38330e8feb19c8b539bd8d06"
+  },
+  "private-trace/inputs/9104eda921076bb0602a7a813592be62a158487c2c54bac24c0584194ab82cb8.bin": {
+   "stage": "catalogs",
+   "path": "installed-package-3.bin",
+   "sha256": "9104eda921076bb0602a7a813592be62a158487c2c54bac24c0584194ab82cb8"
+  },
+  "private-trace/inputs/b22b488e9760f1af2a9766ead7922fd16279f96f858f5b8f7a754b8aa3278880.bin": {
+   "stage": "catalogs",
+   "path": "installed-package-4.bin",
+   "sha256": "b22b488e9760f1af2a9766ead7922fd16279f96f858f5b8f7a754b8aa3278880"
+  },
+  "private-trace/inputs/e640d9edc295f389a90c5c1f66e16235a0f2cb6d919965e89784500157778669.bin": {
+   "stage": "catalogs",
+   "path": "installed-content.bin",
+   "sha256": "e640d9edc295f389a90c5c1f66e16235a0f2cb6d919965e89784500157778669"
+  },
+  "private-trace/inputs/fbe6bc13646b0b7f5b526727d649e2e4c7a65a136f9c438db1590a85807b1536.bin": {
+   "stage": "catalogs",
+   "path": "installed-package-1.bin",
+   "sha256": "fbe6bc13646b0b7f5b526727d649e2e4c7a65a136f9c438db1590a85807b1536"
+  },
+  "private-trace/generic-shaders-v41.bin": {
+   "stage": "shader-select",
+   "path": "generic-shaders.bin",
+   "sha256": "17fc51a8b382fa84904e10ad8e86c9bdb7d98a90866f5e1c7851abcf11f93fa2"
+  }
+ },
+ "switches": [
+  "private-trace/diag-au-ahead",
+  "private-trace/diag-bot-vision",
+  "private-trace/diag-calls-gpr",
+  "private-trace/diag-df-float",
+  "private-trace/diag-direct-present",
+  "private-trace/diag-domain-each",
+  "private-trace/diag-domain-split-render",
+  "private-trace/diag-fps-overlay",
+  "private-trace/diag-gamma",
+  "private-trace/diag-gc-index-fold",
+  "private-trace/diag-gc-prewarm",
+  "private-trace/diag-generic-async-pool-reset",
+  "private-trace/diag-generic-first-scene",
+  "private-trace/diag-generic-swap-reuse",
+  "private-trace/diag-imports-fast",
+  "private-trace/diag-irq-deferred",
+  "private-trace/diag-jc-loop",
+  "private-trace/diag-jp-park-poll",
+  "private-trace/diag-mc-dcbt128",
+  "private-trace/diag-ms-prime-noyield",
+  "private-trace/diag-mw-cs-spin",
+  "private-trace/diag-mw2-scene-w",
+  "private-trace/diag-native-fence-only",
+  "private-trace/diag-oc-queries",
+  "private-trace/diag-pw-fix",
+  "private-trace/diag-read-fault-status",
+  "private-trace/diag-registry-adjacent-graphics-views",
+  "private-trace/diag-registry-cs-fast",
+  "private-trace/diag-scene-irq-foreign-ordinary",
+  "private-trace/diag-se-big",
+  "private-trace/diag-telemetry",
+  "private-trace/diag-v245-swap",
+  "private-trace/diag-v250-synth-little",
+  "private-trace/diag-v260-write-watch",
+  "private-trace/diag-v280-limit60",
+  "private-trace/diag-v287-gpu-passes",
+  "private-trace/diag-v312-release",
+  "private-trace/diag-v362-render-trims",
+  "private-trace/diag-v366-render-trims2",
+  "private-trace/diag-v409-scale-cubic",
+  "private-trace/diag-v450-scale-fsr1",
+  "private-trace/diag-vkw-all",
+  "private-trace/diag-vkw2-all",
+  "private-trace/diag-vkw3-prefetch",
+  "private-trace/diag-vkw4-all"
+ ]
+}

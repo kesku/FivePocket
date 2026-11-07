@@ -35,9 +35,7 @@ def load(name, path):
 os.environ['DISC_BUILDER'] = str(SRC / 'tools/own_disc/disc_builder.py')
 fixture = load('package_fixtures', REPO / 'tools/own_disc/tests/test_disc_builder.py')
 sys.path.insert(0, str(REPO / 'tools/iter'))
-it = load('package_iterate', SRC / 'tools/iter/iterate.py')
 rp = load('package_recipe', SRC / 'tools/fp_codegen/recipe_build.py')
-gen = load('package_generate', SRC / 'tools/fp_codegen/generate.py')
 
 
 class Package(unittest.TestCase):
@@ -58,14 +56,6 @@ class Package(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             b.fetch(self.release, self.cache, True, self.archive)
 
-    def test_01_dependency_receipt_roundtrip(self):
-        header = self.root / 'naïve # cost$.h'; header.write_bytes(b'v1')
-        dep = self.root / 'unit.d'
-        escaped = str(header).replace(' ', '\\ ').replace('#', '\\#').replace('$', '$$')
-        dep.write_text('obj.o: \\\n ' + escaped + '\n', encoding='utf-8')
-        self.assertEqual(it._deps(dep, self.root), {str(header): hashlib.sha256(b'v1').hexdigest()})
-        header.write_bytes(b'v2')
-        self.assertNotEqual(it._deps(dep, self.root)[str(header)], hashlib.sha256(b'v1').hexdigest())
 
     def test_02_drive_dependency_names(self):
         self.assertEqual(hs.dep_paths('C:\\obj\\a.o: C:\\src\\name\\ file.h D:/inc/a.h\nC:/phony.h:\n'),
@@ -81,19 +71,9 @@ class Package(unittest.TestCase):
     def test_04_copy_without_macos_command(self):
         src, dest = self.root / 'src', self.root / 'copy'; src.write_bytes(b'synthetic')
         with mock.patch.object(hs.sys, 'platform', 'win32'), mock.patch.object(hs.subprocess, 'run', side_effect=AssertionError('cp is unavailable')):
-            it.clone_or_copy(src, dest)
+            hs.clone_or_copy(src, dest)
         self.assertEqual(src.read_bytes(), dest.read_bytes())
 
-    def test_05_compile_plan_producer_consumer(self):
-        path = self.root / 'commands.json'
-        path.write_text(json.dumps([dict(file='C:\\源 files\\ppc_recomp.3.cpp', directory=str(self.root),
-                        arguments=['C:\\NDK tools\\clang++.exe', '-c', 'old.cpp', '-o', 'old.o', '-MF', 'old.d', '-MT', 'old.o', '-DKEEP=1'])]))
-        with mock.patch.object(it, 'ROOT', self.root), mock.patch.object(it.subprocess, 'run', side_effect=AssertionError('no Ninja')):
-            cmd, out = it.ppc_chunk_command({'build_cwd': '.', 'ppc_compile_commands': 'commands.json'}, 3,
-                                           self.root / 'new src.cpp', self.root / 'new obj.o', self.root / 'new dep.d')
-        self.assertEqual(cmd[0], 'C:\\NDK tools\\clang++.exe')
-        self.assertEqual(cmd[cmd.index('-c')+1], str(self.root / 'new src.cpp'))
-        self.assertIn('-DKEEP=1', cmd); self.assertEqual(cmd[-4:], it.STRICT_FLAGS)
 
     def test_06_recipe_subprocess_connection(self):
         tool = self.root / 'pass.py'
@@ -148,16 +128,12 @@ class Package(unittest.TestCase):
 
     def test_13_release_payload_hash(self):
         profile = self.root / 'profile.json'; profile.write_bytes(b'{}')
-        release = dict(schema='builder-release/1', host=b.host_id(), profile='profile.json',
+        release = dict(schema='builder-release/1', host=b.host_id(), profile='profile.json', profiles={'duo': 'profile.json'},
                        files=[dict(path='profile.json', sha256=db.sha256_file(profile))])
         path = self.root / 'release.json'; path.write_text(json.dumps(release))
         b.load_release(path); profile.write_bytes(b'{"changed":true}')
         with self.assertRaisesRegex(b.Refusal, 'missing or changed'): b.load_release(path)
 
-    def test_14_windows_path_refusal(self):
-        with mock.patch.object(b.sys, 'platform', 'win32'):
-            with self.assertRaisesRegex(b.Refusal, '80 characters'):
-                b.check_paths(self.root / ('a' * 90), self.cache)
 
     def make_release(self):
         fx = fixture.Fixture(self.root / 'fixture')
@@ -167,29 +143,28 @@ class Package(unittest.TestCase):
         fx.stage('shaders')['source'] = '${repo}/pack.bin'
         fx.profile_path.write_text(json.dumps(fx.profile))
         shutil.copyfile(fx.profile_path, fx.side / 'profile.json')
-        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json',
+        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json', profiles={'duo': 'profile.json'},
                             files=[dict(path=p.relative_to(fx.side).as_posix(), sha256=db.sha256_file(p)) for p in fx.side.rglob('*') if p.is_file()],
                             estimates=dict(min_free_bytes=1, build_time='synthetic fixture only'))
         release = fx.side / 'release.json'; release.write_text(json.dumps(self.release))
         return fx, release
 
-    def test_15_frontend_build_resume_verify(self):
+    def test_15_frontend_build_resumes_and_reproduces_output(self):
         self.fetch(); (self.root / 'fixture').mkdir(); fx, release = self.make_release()
-        argv = ['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc)]
+        argv = ['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc), '--install-disc', str(fx.disc)]
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(b.main(argv), 0, out.getvalue())
-            seal = db.verify_bundle(fx.bundle())['_seal']
+            digest = db.sha256_file(fx.artifact())
             self.assertEqual(b.main(argv), 0, out.getvalue())
             self.assertEqual(fx.executed(), ['decode', 'codegen', 'link'])
-            self.assertEqual(db.verify_bundle(fx.bundle())['_seal'], seal)
-            self.assertEqual(b.main(['verify', str(fx.bundle())]), 0, out.getvalue())
+            self.assertEqual(db.sha256_file(fx.artifact()), digest)
         # Corrupt only a produced intermediate; producer rebuilds it, consumers
         # whose inputs still have identical content correctly reuse their receipts.
         (fx.work / 'decode/image.bin').write_bytes(b'corruption')
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(b.main(argv), 0, out.getvalue())
         self.assertEqual(fx.executed(), ['decode', 'codegen', 'link', 'decode'])
-        self.assertEqual(db.verify_bundle(fx.bundle())['_seal'], seal)
+        self.assertEqual(db.sha256_file(fx.artifact()), digest)
 
     def test_16_case_ambiguity_refused(self):
         folder = db.FolderDisc(self.root)
@@ -239,37 +214,16 @@ class Package(unittest.TestCase):
         with self.assertRaisesRegex(b.Refusal, 'not pinned'): b.fetch(self.release, self.cache, True, self.archive)
         self.assertFalse(self.cache.exists())
 
-    def test_21_seal_scope_negative_evidence(self):
-        # Current format binds host stage keys into the bundle. Equal component
-        # bytes alone DO NOT imply equal seals. This records an unresolved B5
-        # contract issue without removing any provenance or receipt protection.
-        a, c = self.root / 'a', self.root / 'c'; a.mkdir(); c.mkdir()
-        fa, fc = fixture.Fixture(a), fixture.Fixture(c)
+    def test_21_equal_inputs_reproduce_output_in_different_work_folders(self):
+        first, second = self.root / 'a', self.root / 'c'
+        first.mkdir(); second.mkdir()
+        a, b = fixture.Fixture(first), fixture.Fixture(second)
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(fa.run()[0], 0); self.assertEqual(fc.run()[0], 0)
-        ma, mc = db.verify_bundle(fa.bundle()), db.verify_bundle(fc.bundle())
-        self.assertEqual([(x['name'], x['sha256']) for x in ma['components']], [(x['name'], x['sha256']) for x in mc['components']])
-        self.assertNotEqual(ma['_seal'], mc['_seal'])
+            self.assertEqual(a.run()[0], 0)
+            self.assertEqual(b.run()[0], 0)
+        self.assertEqual(a.artifact().read_bytes(), b.artifact().read_bytes())
 
-    def test_22_packaged_generator_no_git(self):
-        input_path, context, switch = [self.root / x for x in ('synthetic-input', 'context.h', 'switch.toml')]
-        for p in (input_path, context, switch): p.write_bytes(b'synthetic')
-        out = self.root / 'generated'; exe = self.root / 'standin'; exe.write_bytes(b'synthetic executable identity')
-        def outputs(ppc):
-            for name in ('ppc_context.h', 'ppc_config.h'): (ppc / name).write_bytes(b'synthetic')
-            return {'chunks': [], 'generated_bytes': 18}
-        def run_logged(command, log):
-            self.assertEqual(command[-1], str(context)); log.write_bytes(b'')
-        with mock.patch.object(gen, '_tool_path', return_value=exe), mock.patch.object(gen, '_run_logged', side_effect=run_logged), \
-             mock.patch.object(gen, 'collect_outputs', side_effect=outputs), \
-             mock.patch.object(gen.subprocess, 'run', side_effect=AssertionError('Git/analyser must not run')):
-            self.assertEqual(gen.main([str(input_path), str(out), '--context', str(context), '--switch-tables', str(switch),
-                                       '--generator-revision', '1' * 40]), 0)
-        data = json.loads((out / 'manifest.json').read_text())
-        self.assertEqual(data['inputs']['generator_revision'], '1' * 40)
-        self.assertEqual(data['inputs']['ppc_context_sha256'], db.sha256_file(context))
-
-    def test_23_zipapp_build_and_verify(self):
+    def test_23_zipapp_build_delivers_stage_output(self):
         self.fetch(); (self.root / 'fixture').mkdir(); fx, release = self.make_release()
         # Rebuild zipapp from the selected overlay so mutants exercise the code
         # shipped inside the artifact, not a stale previously built archive.
@@ -279,9 +233,9 @@ class Package(unittest.TestCase):
                 z.write(SRC / 'tools/own_disc' / name, name)
             z.writestr('__main__.py', 'import builder\nraise SystemExit(builder.main())\n')
         result = subprocess.run([sys.executable, str(artifact), '--release', str(release), '--cache', str(self.cache),
-                                 'build', '--work', str(fx.work), '--play-disc', str(fx.disc)], capture_output=True, text=True)
+                                 'build', '--work', str(fx.work), '--play-disc', str(fx.disc), '--install-disc', str(fx.disc)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(db.verify_bundle(fx.bundle())['runtime_abi'], 'test-abi-1')
+        self.assertEqual(fx.artifact().read_bytes(), (fx.work / 'link/libgame.so').read_bytes())
 
     def test_24_archive_links_materialized_safely(self):
         import stat
@@ -337,41 +291,6 @@ class Package(unittest.TestCase):
             self.assertEqual(mod.main(), 0)
         self.assertEqual(json.loads(report.read_text())['generated_files'], 1)
 
-    def test_30_compile_cache_connected_header(self):
-        base = self.root / 'base'; base.mkdir()
-        attempts = self.root / 'local-analysis/attempts'; attempt = attempts / 'v1'
-        srcdir = attempt / 'src'; srcdir.mkdir(parents=True)
-        (srcdir / 'unit.cpp').write_bytes(b'synthetic source')
-        header = self.root / 'header é space.h'; header.write_bytes(b'header one')
-        plan = {'plans': [{'source': 'unit.cpp', 'spec': 'base/unit.json', 'output': 'base/unit.o'}]}
-        (base / 'plan.json').write_text(json.dumps(plan))
-        (base / 'unit.json').write_text(json.dumps({'command': ['synthetic-clang', '-c', 'unit.cpp', '-o', 'base/unit.o']}))
-        (base / 'link-plan.json').write_text(json.dumps({'inputs': {}, 'command': ['synthetic-link', str(base / 'unit.o'), '-o', 'old.so']}))
-        (attempt / 'attempt.json').write_text(json.dumps({'files': [{'name': 'unit.cpp', 'origin': 'original/unit.cpp'}]}))
-        counts = {'compile': 0, 'link': 0}
-        def process(argv, **kwargs):
-            out = Path(argv[argv.index('-o')+1])
-            if argv[0] == 'synthetic-clang':
-                counts['compile'] += 1
-                out.write_bytes(b'OBJECT:' + header.read_bytes())
-                dep = Path(argv[argv.index('-MF')+1])
-                escaped = str(header).replace(' ', '\\ ')
-                dep.write_text('unit.o: ' + escaped + '\n', encoding='utf-8')
-            else:
-                counts['link'] += 1
-                self.assertEqual(argv[0], 'synthetic-link')
-                out.write_bytes(Path(argv[1]).read_bytes())
-            return subprocess.CompletedProcess(argv, 0, stdout=b'')
-        with mock.patch.object(it, 'ROOT', self.root), mock.patch.object(it, 'ATTEMPTS', attempts), \
-             mock.patch.object(it, 'load_config', return_value={'base_build': 'base', 'build_cwd': '.'}), \
-             mock.patch.object(it.subprocess, 'run', side_effect=process), mock.patch.object(it, 'clone_or_copy', side_effect=shutil.copy2):
-            one = it.cmd_build('v1').read_bytes()
-            self.assertEqual(it.cmd_build('v1').read_bytes(), one)
-            self.assertEqual(counts['compile'], 1)
-            header.write_bytes(b'header two changed')
-            two = it.cmd_build('v1').read_bytes()
-            self.assertNotEqual(one, two)
-            self.assertEqual(counts, {'compile': 2, 'link': 3})
 
     def test_31_tree_identity_order(self):
         class CasefoldPath(type(Path())):
@@ -387,32 +306,6 @@ class Package(unittest.TestCase):
             digest, count = db.sha256_tree(self.root)
         self.assertEqual((digest, count), (expected.hexdigest(), 2))
 
-    def test_32_compile_concurrency_cap(self):
-        with mock.patch.dict(os.environ):
-            os.environ.pop('BUILDER_MAX_JOBS', None)
-            self.assertEqual(it.build_workers(99, 10), 10)      # what the attempt asks for
-            self.assertEqual(it.build_workers(2, 10), 2)        # never more than there are files
-            self.assertEqual(it.build_workers(0, 0), 1)
-            os.environ['BUILDER_MAX_JOBS'] = '4'                # a machine short of memory lowers it
-            self.assertEqual(it.build_workers(99, 10), 4)
-            self.assertEqual(it.build_workers(99, 2), 2)
-
-    def test_33_legacy_stale_path_guard(self):
-        cfg = {'build_cwd': '.'}
-        output = '/tools/clang++ -I/legacy/Documents/tree/inc -c old.cpp -o old.o -MF old.d -MT old.o\n'
-        result = subprocess.CompletedProcess(['ninja'], 0, stdout=output)
-        with mock.patch.object(it, 'ROOT', self.root), mock.patch.object(it.subprocess, 'run', return_value=result):
-            with self.assertRaisesRegex(SystemExit, 'unmapped Documents'):
-                it.ppc_chunk_command(cfg, 1, self.root/'s', self.root/'o', self.root/'d')
-            cfg['path_mappings'] = {'/legacy/Documents/tree': 'relocated tree'}
-            argv, _ = it.ppc_chunk_command(cfg, 1, self.root/'s', self.root/'o', self.root/'d')
-            self.assertIn('-I'+str(self.root/'relocated tree/inc'), argv)
-        # without a mapping of its own the ninja route maps the one old root it was made for, as it always did
-        output = f'/tools/clang++ "-I{it.DOCUMENTS_ROOT}/inc" -c old.cpp -o old.o -MF old.d -MT old.o\n'
-        result = subprocess.CompletedProcess(['ninja'], 0, stdout=output)
-        with mock.patch.object(it, 'ROOT', self.root), mock.patch.object(it.subprocess, 'run', return_value=result):
-            argv, _ = it.ppc_chunk_command({'build_cwd': '.'}, 1, self.root/'s', self.root/'o', self.root/'d')
-            self.assertIn('-I'+str(self.root/'inc'), argv)
 
     def test_34_priority_on_one_scale(self):
         # the system's own nice value here; on Windows the priority class, with "below normal" (what low_priority starts) as 10
@@ -464,7 +357,7 @@ class Package(unittest.TestCase):
         fx.stage('codegen')['argv'] += ['--play', '${disc:play}', '--install', '${disc:install}']
         fx.profile_path.write_text(json.dumps(fx.profile))
         shutil.copyfile(fx.profile_path, fx.side / 'profile.json')
-        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json',
+        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json', profiles={'duo': 'profile.json'},
                             files=[dict(path=p.relative_to(fx.side).as_posix(), sha256=db.sha256_file(p)) for p in fx.side.rglob('*') if p.is_file()],
                             estimates=dict(min_free_bytes=1, build_time='synthetic fixture only'))
         release = fx.side / 'release.json'; release.write_text(json.dumps(self.release))
@@ -490,7 +383,7 @@ class Package(unittest.TestCase):
         if change: change(fx)
         fx.profile_path.write_text(json.dumps(fx.profile))
         shutil.copyfile(fx.profile_path, fx.side / 'profile.json')
-        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json',
+        self.release.update(schema='builder-release/1', host=b.host_id(), profile='profile.json', profiles={'duo': 'profile.json'},
                             files=[dict(path=p.relative_to(fx.side).as_posix(), sha256=db.sha256_file(p)) for p in fx.side.rglob('*') if p.is_file()],
                             estimates=dict(min_free_bytes=3 << 30, build_time='synthetic fixture only'))
         release = fx.side / 'release.json'; release.write_text(json.dumps(self.release))
@@ -500,239 +393,27 @@ class Package(unittest.TestCase):
         fx, release = self.packaged()
         self.assertEqual(b.default_work(fx.side), fx.side / 'local-analysis' / 'builder' / 'work')
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', '--play-disc', str(fx.disc)]), 0, out.getvalue())
-        made = fx.side / 'local-analysis' / 'builder' / 'work' / 'out' / 'code-fixture-generic.bundle'
+            self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', '--play-disc', str(fx.disc), '--install-disc', str(fx.disc)]), 0, out.getvalue())
+        made = fx.side / 'local-analysis' / 'builder' / 'work' / 'out' / 'result.ipa'
         self.assertTrue(made.is_file())
         self.assertFalse(fx.work.exists())
         with contextlib.redirect_stdout(io.StringIO()) as out:          # and the check alone looks at the same folder
             self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'check']), 0, out.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as out:          # a folder that is named is the one used
-            self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc)]), 0, out.getvalue())
-        self.assertTrue(fx.bundle().is_file())
+            self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc), '--install-disc', str(fx.disc)]), 0, out.getvalue())
+        self.assertTrue(fx.artifact().is_file())
 
     def test_39_a_build_runs_its_long_stages_without_a_further_switch(self):
         fx, release = self.packaged(lambda fx: fx.stage('codegen').update(heavy=True))
-        argv = ['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc)]
+        argv = ['--release', str(release), '--cache', str(self.cache), 'build', '--work', str(fx.work), '--play-disc', str(fx.disc), '--install-disc', str(fx.disc)]
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(b.main(argv), 0, out.getvalue())
         self.assertEqual(fx.executed(), ['decode', 'codegen', 'link'])
         with contextlib.redirect_stdout(io.StringIO()) as out:          # the old switch is still taken
             self.assertEqual(b.main(argv + ['--allow-heavy']), 0, out.getvalue())
 
-    def test_40_started_without_a_word_it_says_what_to_do(self):
-        fx, release = self.packaged()
-        with mock.patch.dict(os.environ, {'BUILDER_PACKAGE_ROOT': str(fx.side)}), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main([]), 0)
-        said = out.getvalue()
-        for part in ('builder fetch --accept-ndk-license', 'builder build --play-disc', 'builder verify',
-                     f'{self.ndk["size"] / 1e6:.0f} MB from {self.ndk["url"]}', self.ndk['license_url'], '3 GiB of free space',
-                     str(Path('local-analysis') / 'builder' / 'work' / 'out')):
-            self.assertIn(part, said)
-        self.assertNotIn('--accept-dxc-license', said)                    # this release names no shader compiler to fetch
-        self.assertFalse((fx.side / 'local-analysis').exists())          # it only speaks
-        # without a readable inventory it still says what to do, with no numbers
-        with mock.patch.dict(os.environ, {'BUILDER_PACKAGE_ROOT': str(self.root / 'nowhere')}), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main([]), 0)
-        self.assertIn('builder build --play-disc', out.getvalue())
-        self.assertIn('from its publisher', out.getvalue())
-        # with a word it is the command line as before
-        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            b.main(['no-such-step'])
-        self.assertNotIn('builder fetch', out.getvalue())
-
 
     # The shader compiler the builder fetches from its publisher instead of carrying it (a synthetic archive here).
-    DXC_FILES = (('bin/x64/dxc.exe', 'host-tools/dxc/bin/dxc-3.7.exe', b'SYNTHETIC shader compiler, not executable'),
-                 ('bin/x64/dxcompiler.dll', 'host-tools/dxc/lib/dxcompiler.dll', b'SYNTHETIC compiler library'),
-                 ('LICENSE-MIT.txt', 'host-tools/dxc/LICENSE-MIT.txt', b'SYNTHETIC terms'))
-
-    def dxc(self, members=None, extra=()):
-        """A package root, the archive (its members named with backslashes, as the publisher's are) and the pins."""
-        root = self.root / 'package'; root.mkdir(exist_ok=True)
-        archive = self.root / 'dxc-fixture.zip'
-        with zipfile.ZipFile(archive, 'w') as z:
-            for member, _, data in (self.DXC_FILES if members is None else members) + tuple(extra):
-                z.writestr(zipfile.ZipInfo(member.replace('/', '\\')), data)
-        self.release['dxc'] = dict(url='https://github.com/microsoft/DirectXShaderCompiler/releases/download/v0.0.fixture/dxc_fixture.zip',
-                                   sha256=db.sha256_file(archive), size=archive.stat().st_size,
-                                   license_url='https://github.com/microsoft/DirectXShaderCompiler/blob/v0.0.fixture/LICENSE.TXT',
-                                   files=[dict(member=member, path=place, size=len(data), sha256=hashlib.sha256(data).hexdigest())
-                                          for member, place, data in self.DXC_FILES])
-        return root, archive
-
-    def placed(self, root):
-        return sorted(p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file())
-
-    def test_41_shader_compiler_pins_fail_closed(self):
-        root, archive = self.dxc()
-        self.assertIs(b.dxc_spec(self.release), self.release['dxc'])
-        self.assertIsNone(b.dxc_spec({'ndk': self.ndk}))                  # a release that names none: nothing to fetch, nothing to check
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.fetch_dxc({'ndk': self.ndk}, root, self.cache, False, archive); b.existing_dxc({'ndk': self.ndk}, root)
-        self.assertEqual((out.getvalue(), self.placed(root), self.cache.exists()), ('', [], False))
-        good = json.dumps(self.release['dxc'])
-        def broken(change, message):
-            d = json.loads(good); change(d)
-            with mock.patch.object(b.urllib.request, 'build_opener', side_effect=AssertionError('no network')):
-                for call in (lambda r: b.dxc_spec(r), lambda r: b.existing_dxc(r, root), lambda r: b.fetch_dxc(r, root, self.cache, True, archive)):
-                    with self.assertRaisesRegex(b.Refusal, message): call({'ndk': self.ndk, 'dxc': d})
-            self.assertEqual((self.placed(root), self.cache.exists()), ([], False))
-        broken(lambda d: d.pop('sha256'), 'SHA-256/size not pinned')
-        broken(lambda d: d.update(sha256='0' * 63), 'SHA-256/size not pinned')
-        broken(lambda d: d.update(size=0), 'SHA-256/size not pinned')
-        broken(lambda d: d.update(size=str(d['size'])), 'SHA-256/size not pinned')
-        broken(lambda d: d.update(url='https://github.com/someone-else/DirectXShaderCompiler/releases/download/v1/dxc.zip'), 'not a pinned Microsoft release file')
-        broken(lambda d: d.update(url=d['url'].replace('https://', 'http://')), 'not a pinned Microsoft release file')
-        broken(lambda d: d.update(url=d['url'] + '?x=1'), 'not a pinned Microsoft release file')
-        broken(lambda d: d.update(url='https://github.com/microsoft/DirectXShaderCompiler/releases/latest/download/dxc.zip'), 'not a pinned Microsoft release file')
-        broken(lambda d: d.pop('license_url'), 'licence link missing')
-        broken(lambda d: d.update(license_url='https://example.org/LICENSE'), 'licence link missing')
-        broken(lambda d: d.update(files=[]), 'files not listed')
-        broken(lambda d: d.pop('files'), 'files not listed')
-        broken(lambda d: d['files'][1].pop('sha256'), 'file not pinned')
-        broken(lambda d: d['files'][1].update(size=0), 'file not pinned')
-        broken(lambda d: d['files'][0].update(path='../outside.exe'), 'invalid package path')
-        broken(lambda d: d['files'][0].update(path='/absolute.exe'), 'invalid package path')
-        broken(lambda d: d['files'][0].update(member='..\\x'), 'invalid package path')
-        broken(lambda d: d['files'][1].update(path=d['files'][0]['path'].upper()), 'share a place')
-
-    def test_42_shader_compiler_fetch_asks_consent_before_any_request(self):
-        root, archive = self.dxc()
-        with mock.patch.object(b.urllib.request, 'build_opener', side_effect=AssertionError('no network')), contextlib.redirect_stdout(io.StringIO()) as out:
-            with self.assertRaisesRegex(b.Refusal, 'licence not accepted.*--accept-dxc-license'):
-                b.fetch_dxc(self.release, root, self.cache, False)
-            with self.assertRaisesRegex(b.Refusal, 'licence not accepted'):      # an archive on disk does not stand for the player's word either
-                b.fetch_dxc(self.release, root, self.cache, False, archive)
-        self.assertEqual((self.placed(root), self.cache.exists()), ([], False))
-        for part in (self.release['dxc']['url'], str(self.release['dxc']['size']), self.release['dxc']['license_url']):
-            self.assertIn(part, out.getvalue())                              # what is fetched and its terms are named first
-        # too little room is said before any request too
-        with mock.patch.object(b.shutil, 'disk_usage', return_value=mock.Mock(free=self.release['dxc']['size'] + sum(len(d) for _, _, d in self.DXC_FILES) - 1)), \
-                mock.patch.object(b.urllib.request, 'build_opener', side_effect=AssertionError('no network')), contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(b.Refusal, 'not enough disk'):
-                b.fetch_dxc(self.release, root, self.cache, True)
-        self.assertEqual(self.placed(root), [])
-
-    def test_43_shader_compiler_archive_checked_before_anything_is_placed(self):
-        root, archive = self.dxc()
-        pins = self.release['dxc']
-        def refused(message, source=None):
-            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(b.Refusal, message):
-                b.fetch_dxc(self.release, root, self.cache, True, source or archive)
-            self.assertEqual(self.placed(root), [])
-        right = pins['sha256']; pins['sha256'] = '0' * 64
-        refused('archive hash/size mismatch'); pins['sha256'] = right
-        pins['size'] -= 1
-        refused('archive exceeds pinned size'); pins['size'] += 2
-        refused('archive hash/size mismatch'); pins['size'] -= 1
-        # the archive is the pinned one, a file inside is not the pinned file: none of the files is placed
-        last = pins['files'][2]
-        was = dict(last); last['sha256'] = hashlib.sha256(b'another text').hexdigest()
-        refused('LICENSE-MIT.txt is not the pinned file'); last.update(was)
-        last['size'] += 1
-        refused('archive lacks LICENSE-MIT.txt as pinned'); last.update(was)
-        last['member'] = 'LICENSE-OTHER.txt'
-        refused('archive lacks LICENSE-OTHER.txt as pinned'); last.update(was)
-        with contextlib.redirect_stdout(io.StringIO()):
-            b.fetch_dxc(self.release, root, self.cache, True, archive)      # and with the pins as they were it goes through
-        self.assertEqual(len(self.placed(root)), 3)
-
-    def test_44_shader_compiler_fetch_to_its_places(self):
-        root, archive = self.dxc(extra=(('bin/arm64/dxc.exe', None, b'not asked for'),))
-        with self.assertRaisesRegex(b.Refusal, 'shader compiler missing.*--accept-dxc-license'): b.existing_dxc(self.release, root)
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.fetch_dxc(self.release, root, self.cache, True, archive)
-        self.assertEqual(self.placed(root), sorted(place for _, place, _ in self.DXC_FILES))      # the listed files and no other
-        for _, place, data in self.DXC_FILES:
-            self.assertEqual((root / place).read_bytes(), data)
-        self.assertIn('3 of 3 files put below', out.getvalue())
-        b.existing_dxc(self.release, root)
-        stamps = [(root / place).stat().st_mtime_ns for _, place, _ in self.DXC_FILES]
-        # a second fetch finds them, opens nothing and needs no further word
-        with mock.patch.object(b.urllib.request, 'build_opener', side_effect=AssertionError('no network')), contextlib.redirect_stdout(io.StringIO()) as out:
-            b.fetch_dxc(self.release, root, self.cache, False)
-            b.fetch_dxc(self.release, root, self.cache, False, self.root / 'no-such-archive.zip')      # nor is an archive opened
-        self.assertIn('already verified', out.getvalue())
-        self.assertEqual([(root / place).stat().st_mtime_ns for _, place, _ in self.DXC_FILES], stamps)
-        (root / self.DXC_FILES[1][1]).write_bytes(b'changed')
-        with self.assertRaisesRegex(b.Refusal, 'shader compiler file changed: host-tools/dxc/lib/dxcompiler.dll'): b.existing_dxc(self.release, root)
-
-    def test_45_shader_compiler_fetch_writes_over_nothing(self):
-        root, archive = self.dxc()
-        first, second, third = (root / place for _, place, _ in self.DXC_FILES)
-        first.parent.mkdir(parents=True); first.write_bytes(self.DXC_FILES[0][2])       # one file is there already, the pinned one
-        stamp = first.stat().st_mtime_ns
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.fetch_dxc(self.release, root, self.cache, True, archive)
-        self.assertIn('2 of 3 files put below', out.getvalue())
-        self.assertEqual(first.stat().st_mtime_ns, stamp)
-        b.existing_dxc(self.release, root)
-        # another file at a place: refused before any request, it stays as it is and nothing else is placed
-        third.unlink(); second.write_bytes(b'the player\'s own file')
-        with mock.patch.object(b.urllib.request, 'build_opener', side_effect=AssertionError('no network')), contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(b.Refusal, 'another file lies where the shader compiler goes: host-tools/dxc/lib/dxcompiler.dll; nothing is written over'):
-                b.fetch_dxc(self.release, root, self.cache, True)
-        self.assertEqual(second.read_bytes(), b'the player\'s own file'); self.assertFalse(third.exists())
-        second.unlink(); second.mkdir()
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(b.Refusal, 'something that is no file lies where the shader compiler goes'):
-            b.fetch_dxc(self.release, root, self.cache, True, archive)
-        self.assertFalse(third.exists())
-        # a file that appears at a place while the archive is being fetched is not written over either
-        second.rmdir()
-        def opener(url, timeout):
-            second.write_bytes(b'appeared meanwhile'); return archive.open('rb')
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(b.Refusal, 'a file appeared where the shader compiler goes: host-tools/dxc/lib/dxcompiler.dll; nothing is written over'):
-            b.fetch_dxc(self.release, root, self.cache, True, opener=opener)
-        self.assertEqual(second.read_bytes(), b'appeared meanwhile')
-
-    def test_46_shader_compiler_comes_from_its_publisher_only(self):
-        root, archive = self.dxc()
-        asked = []
-        def opener(url, timeout):
-            asked.append((url, timeout)); return archive.open('rb')
-        with contextlib.redirect_stdout(io.StringIO()):
-            b.fetch_dxc(self.release, root, self.cache, True, opener=opener)
-        self.assertEqual(asked, [(self.release['dxc']['url'], 60)])
-        self.assertEqual(len(self.placed(root)), 3)
-        handler = b.PublisherOnlyRedirect()
-        request = b.urllib.request.Request(self.release['dxc']['url'])
-        for elsewhere in ('https://example.org/dxc.zip', 'http://objects.githubusercontent.com/x', 'https://github.com/someone-else/DirectXShaderCompiler/x',
-                          'https://objects.githubusercontent.com.example.org/x'):
-            with self.assertRaisesRegex(b.Refusal, 'left the publisher'): handler.redirect_request(request, None, 302, 'Found', {}, elsewhere)
-        for own in ('https://objects.githubusercontent.com/github-production-release-asset/x', 'https://release-assets.githubusercontent.com/x',
-                    'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v0.0.fixture/dxc_fixture.zip'):
-            self.assertEqual(handler.redirect_request(request, None, 302, 'Found', {}, own).full_url, own)
-
-    def test_47_front_end_fetches_checks_and_names_the_shader_compiler(self):
-        fx, release = self.packaged()
-        root, archive = self.dxc()
-        release.write_text(json.dumps(self.release))
-        base = ['--release', str(release), '--cache', str(self.cache)]
-        places = [fx.side / place for _, place, _ in self.DXC_FILES]
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # a build is refused while the pinned compiler is not there
-            self.assertEqual(b.main(base + ['build', '--play-disc', str(fx.disc)]), 2)
-        self.assertIn('REFUSED: shader compiler missing; read its terms and run builder fetch --accept-dxc-license', out.getvalue())
-        self.assertFalse((fx.side / 'local-analysis').exists())
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # the compiler's switch alone does not stand for this one
-            self.assertEqual(b.main(base + ['fetch', '--accept-ndk-license', '--archive', str(self.archive), '--dxc-archive', str(archive)]), 2)
-        self.assertIn('--accept-dxc-license', out.getvalue()); self.assertFalse(any(p.exists() for p in places))
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main(base + ['fetch', '--accept-ndk-license', '--archive', str(self.archive), '--accept-dxc-license', '--dxc-archive', str(archive)]), 0, out.getvalue())
-        self.assertEqual([p.read_bytes() for p in places], [data for _, _, data in self.DXC_FILES])      # below the package root, not below this test's other folder
-        self.assertEqual(self.placed(root), [])
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main(base + ['build', '--play-disc', str(fx.disc)]), 0, out.getvalue())
-        places[0].write_bytes(b'changed')
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main(base + ['check']), 2)
-        self.assertIn('shader compiler file changed: host-tools/dxc/bin/dxc-3.7.exe', out.getvalue())
-        # started without a word it names both fetches, both switches and both sets of terms
-        with mock.patch.dict(os.environ, {'BUILDER_PACKAGE_ROOT': str(fx.side)}), contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main([]), 0)
-        pins = self.release['dxc']
-        for part in ('builder fetch --accept-ndk-license --accept-dxc-license', 'each switch says you accept the one', self.ndk['license_url'],
-                     f'DirectX Shader Compiler, {pins["size"] / 1e6:.0f} MB from {pins["url"]}', f'its terms: {pins["license_url"]}'):
-            self.assertIn(part, out.getvalue())
 
     def make_dmg(self, build):
         """a synthetic macOS NDK disk image (hdiutil, offline): build(folder) fills AndroidNDK1.app/Contents/NDK"""
@@ -778,95 +459,6 @@ class Package(unittest.TestCase):
         mounted = subprocess.run(['/usr/bin/hdiutil', 'info'], capture_output=True, text=True).stdout
         self.assertNotIn(str(self.cache), mounted, 'every image was detached')
 
-    def test_50_an_ios_target_takes_its_own_profile_and_the_player_s_bundle_id(self):
-        fx, release = self.packaged()
-        ios = json.loads(fx.profile_path.read_text())
-        ios['stages'][[s['id'] for s in ios['stages']].index('codegen')]['argv'] += ['--bundle-id', '${bundleid}']
-        (fx.side / 'profile-ios.json').write_text(json.dumps(ios))
-        self.release.update(profiles={'ios': 'profile-ios.json'},
-                            files=[dict(path=p.relative_to(fx.side).as_posix(), sha256=db.sha256_file(p)) for p in fx.side.rglob('*')
-                                   if p.is_file() and p.name != 'release.json'])
-        release.write_text(json.dumps(self.release))
-        base = ['--release', str(release), '--cache', str(self.cache)]
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # a malformed id: the profile's variable refuses it
-            self.assertEqual(b.main(base + ['build', '--ios', '--bundle-id', 'no dots', '--work', str(fx.work), '--play-disc', str(fx.disc)]),
-                             db.EXIT_USAGE, out.getvalue())
-        self.assertIn('bundle id missing or malformed', out.getvalue())
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # the default target is unaffected
-            self.assertEqual(b.main(base + ['check']), 0, out.getvalue())
-        self.release['profile'] = 'profile-ios.json'                         # a release whose default is the iOS target
-        release.write_text(json.dumps(self.release))
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # check plans it with a stand-in id, writes no settings
-            self.assertEqual(b.main(base + ['check']), 0, out.getvalue())
-        self.assertFalse((fx.side / 'local-analysis' / 'builder' / b.SETTINGS_NAME).exists())
-        self.release['profile'] = 'profile.json'; release.write_text(json.dumps(self.release))
-        with contextlib.redirect_stdout(io.StringIO()) as out:              # a target the release does not make
-            self.assertEqual(b.main(base + ['build', '--duo', '--bundle-id', 'com.example.x', '--play-disc', str(fx.disc)]), 2, out.getvalue())
-        self.assertIn('makes no duo app', out.getvalue())
-        self.release['profiles'] = {'ios': 'not-listed.json'}               # a target profile outside the inventory
-        release.write_text(json.dumps(self.release))
-        with self.assertRaisesRegex(b.Refusal, 'target profile is not hash-bound'):
-            b.load_release(release)
-
-    def test_52_a_player_keeps_one_generated_bundle_id_per_target(self):
-        one, two = self.root / 'one' / 'work', self.root / 'two' / 'work'
-        first = b.bundle_id_for('ios', one)
-        self.assertRegex(first, r'^com\.fivepocket\.[0-9a-f]{8}\.ios$')
-        self.assertEqual(b.bundle_id_for('ios', one), first)                           # the same on every later build
-        self.assertEqual(b.bundle_id_for('duo', one), first[:-len('ios')] + 'duo')     # one player key for both apps
-        self.assertTrue((one.parent / b.SETTINGS_NAME).is_file())
-        self.assertFalse(one.exists())                                                  # next to the work folder, not in it
-        self.assertNotEqual(b.bundle_id_for('ios', two), first)                         # another settings folder: another id
-        self.assertEqual(b.bundle_id_for('ios', one, 'com.example.mine'), 'com.example.mine')
-        self.assertEqual(b.bundle_id_for('ios', one), first)                            # an override is not stored
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.say_bundle_id(first, 'ios')
-        self.assertIn(first, out.getvalue()); self.assertIn('ALWAYS SIGN WITH THIS IDENTIFIER', out.getvalue())
-
-    def test_53_a_release_whose_default_is_an_ios_target_explains_the_ios_steps(self):
-        rel = self.root / 'release.json'
-        rel.write_text(json.dumps({'profile': 'p.json', 'profiles': {'ios': 'p.json', 'duo': 'd.json'},
-                                   'ndk': dict(self.ndk), 'estimates': {'min_free_bytes': 16 << 30}}))
-        text = b.how_to(rel)
-        self.assertIn('iPhone and iPad (duo, ios)', text)
-        self.assertIn('./builder build --duo or --ios', text)
-        self.assertIn('ALWAYS SIGN WITH THAT IDENTIFIER', text)
-        self.assertNotIn('code bundle for the phone app', text)
-
-    def test_54_an_android_target_builds_its_bundle_without_a_bundle_id(self):
-        fx, release = self.packaged()
-        shutil.copyfile(fx.side / 'profile.json', fx.side / 'profile-thor.json')
-        self.release.update(profiles={'thor': 'profile-thor.json'},
-                            files=[dict(path=p.relative_to(fx.side).as_posix(), sha256=db.sha256_file(p)) for p in fx.side.rglob('*')
-                                   if p.is_file() and p.name != 'release.json'])
-        release.write_text(json.dumps(self.release))
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', '--thor', '--work', str(fx.work),
-                                     '--play-disc', str(fx.disc)]), 0, out.getvalue())
-        self.assertTrue(fx.bundle().is_file())
-        self.assertNotIn('Bundle identifier', out.getvalue())
-        self.assertFalse((fx.work.parent / b.SETTINGS_NAME).exists())
-        rel = self.root / 'r.json'
-        rel.write_text(json.dumps({'profile': 'p.json', 'profiles': {'ios': 'p.json', 'thor': 't.json', 'fold': 'f.json'},
-                                   'ndk': dict(self.ndk), 'estimates': {'min_free_bytes': 16 << 30}}))
-        text = b.how_to(rel)
-        self.assertIn('./builder build --thor', text); self.assertIn('./builder build --fold', text); self.assertIn('./builder build --ios', text)
-
-    def test_55_an_ios_release_without_android_packs_names_the_windows_builder(self):
-        fx, release = self.packaged()
-        self.release.update(profiles={'ios': 'profile.json'})
-        release.write_text(json.dumps(self.release))
-        for target in ('--thor', '--fold'):
-            with contextlib.redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(b.main(['--release', str(release), '--cache', str(self.cache), 'build', target, '--work', str(fx.work),
-                                         '--play-disc', str(fx.disc)]), 2)
-            self.assertEqual(out.getvalue(), b.ANDROID_ELSEWHERE + '\n')
-        self.assertFalse(fx.bundle().exists())
-        self.assertFalse((fx.work.parent / b.SETTINGS_NAME).exists())
-        rel = self.root / 'r.json'
-        rel.write_text(json.dumps({'profile': 'p.json', 'profiles': {'ios': 'p.json', 'duo': 'd.json'},
-                                   'ndk': dict(self.ndk), 'estimates': {'min_free_bytes': 16 << 30}}))
-        self.assertIn(b.ANDROID_ELSEWHERE, b.how_to(rel))
 
     def test_51_sign_unpacks_signs_and_writes_a_new_ipa(self):
         app = self.root / 'Payload' / 'FivePocket.app'; app.mkdir(parents=True)
